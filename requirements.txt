@@ -1,0 +1,5 @@
+torch
+torchvision
+clip-by-openai
+tqdm
+numpy
