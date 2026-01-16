@@ -1,0 +1,1 @@
+../../Label-free-CBM/data/cifar10_classes.txt

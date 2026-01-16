@@ -52,10 +52,13 @@ logs/
 outputs/
 runs/
 
-# Data files (but allow Python files in data/)
-data/*
-!data/*.py
-!data/__init__.py
+# Data files - match Label-free-CBM pattern
+data/places365
+data/resnet18_places365.pth.tar
+data/CUB
+data/imagenet_val
+data/ImageNet_val
+data/places365.zip
 *.npy
 *.npz
 
