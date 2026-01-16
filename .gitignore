@@ -52,8 +52,10 @@ logs/
 outputs/
 runs/
 
-# Data
-data/
+# Data files (but allow Python files in data/)
+data/*
+!data/*.py
+!data/__init__.py
 *.npy
 *.npz
 
