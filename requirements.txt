@@ -1,5 +1,18 @@
-torch
-torchvision
+# Core PyTorch
+torch>=2.0.0
+torchvision>=0.15.0
+
+# CLIP for text/image embeddings
 clip-by-openai
-tqdm
-numpy
+ftfy>=6.1.1
+regex>=2022.10.31
+
+# Utilities
+tqdm>=4.64.1
+numpy>=1.21.0
+
+# For Label-free-CBM backbones (resnet18_cub, etc.)
+pytorchcv>=0.0.67
+
+# Optional but recommended for data handling
+pandas>=1.5.3

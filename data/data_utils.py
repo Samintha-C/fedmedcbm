@@ -5,8 +5,12 @@ from torch.utils.data import Subset, random_split
 from torchvision import datasets, transforms, models
 import clip
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../Label-free-CBM'))
-import data_utils as lf_cbm_data_utils
+lf_cbm_path = os.path.join(os.path.dirname(__file__), '../../Label-free-CBM')
+if os.path.exists(lf_cbm_path):
+    sys.path.insert(0, lf_cbm_path)
+    import data_utils as lf_cbm_data_utils
+else:
+    raise ImportError(f"Label-free-CBM not found at {lf_cbm_path}. Please ensure Label-free-CBM is in the parent directory.")
 
 def get_data(dataset_name, preprocess=None, root=None):
     return lf_cbm_data_utils.get_data(dataset_name, preprocess)
@@ -15,16 +19,20 @@ def get_target_model(target_name, device):
     return lf_cbm_data_utils.get_target_model(target_name, device)
 
 def get_classes(dataset_name):
-    label_file = lf_cbm_data_utils.LABEL_FILES.get(dataset_name)
-    if label_file is None:
-        if dataset_name == "cifar10":
-            label_file = lf_cbm_data_utils.LABEL_FILES["cifar10"]
-        elif dataset_name == "cifar100":
-            label_file = lf_cbm_data_utils.LABEL_FILES["cifar100"]
-        elif dataset_name == "imagenet":
-            label_file = lf_cbm_data_utils.LABEL_FILES["imagenet"]
-        else:
-            raise ValueError(f"Unknown dataset: {dataset_name}")
+    local_label_file = os.path.join(os.path.dirname(__file__), f"{dataset_name}_classes.txt")
+    if os.path.exists(local_label_file):
+        label_file = local_label_file
+    else:
+        label_file = lf_cbm_data_utils.LABEL_FILES.get(dataset_name)
+        if label_file is None:
+            if dataset_name == "cifar10":
+                label_file = lf_cbm_data_utils.LABEL_FILES["cifar10"]
+            elif dataset_name == "cifar100":
+                label_file = lf_cbm_data_utils.LABEL_FILES["cifar100"]
+            elif dataset_name == "imagenet":
+                label_file = lf_cbm_data_utils.LABEL_FILES["imagenet"]
+            else:
+                raise ValueError(f"Unknown dataset: {dataset_name}")
     
     with open(label_file, "r") as f:
         classes = [line.strip() for line in f.readlines() if line.strip()]

@@ -24,9 +24,29 @@ fed_lfc_cbm/
 
 ## Installation
 
+### Local Setup
+
 ```bash
 pip install -r requirements.txt
 ```
+
+### Nautilus Setup
+
+1. Deploy the pod:
+```bash
+kubectl apply -f naut/medcbm.yaml
+kubectl exec -it medcbm -n wenglab-interpretable-ai -- bash
+```
+
+2. Inside the pod, clone and setup:
+```bash
+cd /sc-cbint-vol
+git clone <repo-url> fed_lfc_cbm
+cd fed_lfc_cbm
+bash setup_nautilus.sh
+```
+
+**Note**: Ensure `Label-free-CBM` is cloned in the same parent directory as `fed_lfc_cbm` for the symlinks to work.
 
 ## Usage
 

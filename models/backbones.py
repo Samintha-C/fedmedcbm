@@ -3,8 +3,12 @@ import sys
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../Label-free-CBM'))
-from data_utils import get_target_model
+lf_cbm_path = os.path.join(os.path.dirname(__file__), '../../Label-free-CBM')
+if os.path.exists(lf_cbm_path):
+    sys.path.insert(0, lf_cbm_path)
+    from data_utils import get_target_model
+else:
+    raise ImportError(f"Label-free-CBM not found at {lf_cbm_path}. Please ensure Label-free-CBM is in the parent directory.")
 
 
 class ResNet50Backbone(nn.Module):

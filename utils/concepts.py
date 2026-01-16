@@ -6,9 +6,13 @@ import json
 
 def load_concepts_from_file(concept_file):
     if not os.path.isabs(concept_file) and not os.path.exists(concept_file):
-        lf_cbm_path = os.path.join(os.path.dirname(__file__), '../../Label-free-CBM/data/concept_sets', concept_file)
-        if os.path.exists(lf_cbm_path):
-            concept_file = lf_cbm_path
+        local_path = os.path.join(os.path.dirname(__file__), '../data/concept_sets', concept_file)
+        if os.path.exists(local_path):
+            concept_file = local_path
+        else:
+            lf_cbm_path = os.path.join(os.path.dirname(__file__), '../../Label-free-CBM/data/concept_sets', concept_file)
+            if os.path.exists(lf_cbm_path):
+                concept_file = lf_cbm_path
     
     with open(concept_file, 'r') as f:
         concepts = [line.strip() for line in f.readlines() if line.strip()]
