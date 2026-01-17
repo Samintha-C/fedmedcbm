@@ -10,25 +10,44 @@ from torch.utils.data import DataLoader, TensorDataset, Subset
 from tqdm import tqdm
 
 import clip
-try:
-    from models.fed_lfc import FedLFC_CBM
-    from utils.concepts import load_concepts_from_file, load_or_generate_concept_embeddings
-    from utils.losses import cosine_similarity_cubed_loss, L1SparsityLoss
-    from data.data_utils import (
-        get_data, get_classes, get_resnet_preprocess, get_clip_preprocess,
-        split_dataset_for_federated
-    )
-except ImportError:
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from models.fed_lfc import FedLFC_CBM
-    from utils.concepts import load_concepts_from_file, load_or_generate_concept_embeddings
-    from utils.losses import cosine_similarity_cubed_loss, L1SparsityLoss
-    from data.data_utils import (
-        get_data, get_classes, get_resnet_preprocess, get_clip_preprocess,
-        split_dataset_for_federated
-    )
+import sys
+import importlib.util
+
+# Add current directory to path FIRST, before any other imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+# Import local utils modules directly from files to avoid conflicts with Label-free-CBM's utils.py
+utils_concepts_path = os.path.join(current_dir, 'utils', 'concepts.py')
+utils_losses_path = os.path.join(current_dir, 'utils', 'losses.py')
+data_utils_path = os.path.join(current_dir, 'data', 'data_utils.py')
+
+spec_concepts = importlib.util.spec_from_file_location("fed_utils_concepts", utils_concepts_path)
+spec_losses = importlib.util.spec_from_file_location("fed_utils_losses", utils_losses_path)
+spec_data = importlib.util.spec_from_file_location("fed_data_utils", data_utils_path)
+
+fed_utils_concepts = importlib.util.module_from_spec(spec_concepts)
+fed_utils_losses = importlib.util.module_from_spec(spec_losses)
+fed_data_utils = importlib.util.module_from_spec(spec_data)
+
+spec_concepts.loader.exec_module(fed_utils_concepts)
+spec_losses.loader.exec_module(fed_utils_losses)
+spec_data.loader.exec_module(fed_data_utils)
+
+# Now import models (which may add Label-free-CBM to path)
+from models.fed_lfc import FedLFC_CBM
+
+# Import functions with unique names to avoid conflicts
+load_concepts_from_file = fed_utils_concepts.load_concepts_from_file
+load_or_generate_concept_embeddings = fed_utils_concepts.load_or_generate_concept_embeddings
+cosine_similarity_cubed_loss = fed_utils_losses.cosine_similarity_cubed_loss
+L1SparsityLoss = fed_utils_losses.L1SparsityLoss
+get_data = fed_data_utils.get_data
+get_classes = fed_data_utils.get_classes
+get_resnet_preprocess = fed_data_utils.get_resnet_preprocess
+get_clip_preprocess = fed_data_utils.get_clip_preprocess
+split_dataset_for_federated = fed_data_utils.split_dataset_for_federated
 
 
 def set_seed(seed):
@@ -45,9 +64,17 @@ def federated_averaging(models, client_weights=None):
     
     global_state = {}
     for key in models[0].state_dict().keys():
-        global_state[key] = torch.zeros_like(models[0].state_dict()[key])
-        for i, model in enumerate(models):
-            global_state[key] += client_weights[i] * model.state_dict()[key]
+        param = models[0].state_dict()[key]
+        
+        # Only average float parameters (weights, biases)
+        # For non-float parameters (Long tensors like batch norm counts), copy from first model
+        if param.dtype.is_floating_point:
+            global_state[key] = torch.zeros_like(param)
+            for i, model in enumerate(models):
+                global_state[key] += client_weights[i] * model.state_dict()[key]
+        else:
+            # For non-float parameters, just copy from first model
+            global_state[key] = param.clone()
     
     return global_state
 
@@ -76,6 +103,7 @@ def train_client_local(
             with torch.no_grad():
                 image_features = model.backbone(images)
                 clip_image_features = clip_model.encode_image(images)
+                clip_image_features = clip_image_features.float()  # Convert to float32
                 clip_image_features = clip_image_features / clip_image_features.norm(dim=-1, keepdim=True)
                 clip_targets = clip_image_features @ concept_embeddings.T
             
