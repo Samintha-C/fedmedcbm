@@ -187,9 +187,6 @@ def simulate_federated_training(args):
     )
     os.makedirs(save_dir, exist_ok=True)
     
-    with open(os.path.join(save_dir, "args.txt"), "w") as f:
-        json.dump(vars(args), f, indent=2)
-    
     concepts = load_concepts_from_file(args.concept_file)
     concept_embeddings = load_or_generate_concept_embeddings(
         concepts,
@@ -205,6 +202,18 @@ def simulate_federated_training(args):
     
     classes = get_classes(args.dataset)
     num_classes = len(classes)
+    
+    args.num_concepts = num_concepts
+    args.num_classes = num_classes
+    
+    with open(os.path.join(save_dir, "args.txt"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+    
+    with open(os.path.join(save_dir, "concepts.txt"), "w") as f:
+        if concepts:
+            f.write(concepts[0])
+            for concept in concepts[1:]:
+                f.write('\n' + concept)
     print(f"Dataset: {args.dataset}, Classes: {num_classes}")
     
     if args.backbone.startswith("clip_"):
