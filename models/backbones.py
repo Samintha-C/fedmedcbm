@@ -32,6 +32,23 @@ class ResNet50Backbone(nn.Module):
         return x
 
 
+class ResNet18CUBBackbone(nn.Module):
+    def __init__(self, device="cuda", pretrained=True):
+        super().__init__()
+        target_model, preprocess = get_target_model("resnet18_cub", device=device)
+        
+        self.backbone = lambda x: target_model.features(x)
+        self.preprocess = preprocess
+        self.output_dim = 512
+        self.eval()
+        
+    def forward(self, x):
+        x = self.backbone(x)
+        if len(x.shape) > 2:
+            x = torch.flatten(x, 1)
+        return x
+
+
 class CLIPViTBackbone(nn.Module):
     def __init__(self, clip_name="ViT-B/16", device="cuda", use_penultimate=False):
         super().__init__()

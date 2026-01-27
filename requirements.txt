@@ -17,3 +17,7 @@ pytorchcv>=0.0.67
 
 # Optional but recommended for data handling
 pandas>=1.5.3
+
+# Visualization
+matplotlib>=3.5.0
+Pillow>=9.0.0

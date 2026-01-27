@@ -2,6 +2,9 @@ import torch
 import clip
 import os
 import json
+import tempfile
+import fcntl
+import time
 
 
 def load_concepts_from_file(concept_file):

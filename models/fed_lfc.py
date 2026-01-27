@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .backbones import ResNet50Backbone, CLIPViTBackbone
+from .backbones import ResNet50Backbone, ResNet18CUBBackbone, CLIPViTBackbone
 
 
 class ProjectionLayer(nn.Module):
@@ -57,6 +57,9 @@ class FedLFC_CBM(nn.Module):
         
         if backbone_type == "resnet50":
             self.backbone = ResNet50Backbone(device=device)
+            backbone_dim = self.backbone.output_dim
+        elif backbone_type == "resnet18_cub":
+            self.backbone = ResNet18CUBBackbone(device=device)
             backbone_dim = self.backbone.output_dim
         elif backbone_type.startswith("clip_"):
             clip_model_name = backbone_type[5:] if backbone_type.startswith("clip_") else clip_name

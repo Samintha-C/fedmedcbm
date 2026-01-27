@@ -48,6 +48,7 @@ get_classes = fed_data_utils.get_classes
 get_resnet_preprocess = fed_data_utils.get_resnet_preprocess
 get_clip_preprocess = fed_data_utils.get_clip_preprocess
 split_dataset_for_federated = fed_data_utils.split_dataset_for_federated
+print_client_distribution = fed_data_utils.print_client_distribution
 
 
 def set_seed(seed):
@@ -218,6 +219,8 @@ def simulate_federated_training(args):
     
     if args.backbone.startswith("clip_"):
         preprocess = get_clip_preprocess()
+    elif args.backbone == "resnet18_cub":
+        preprocess = get_resnet_preprocess()
     else:
         preprocess = get_resnet_preprocess()
     
@@ -226,10 +229,19 @@ def simulate_federated_training(args):
     
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size: {len(val_dataset)}")
-    
+
+    # Partition data among clients
+    if args.iid:
+        print(f"\nUsing IID data distribution")
+    else:
+        print(f"\nUsing Non-IID data distribution (Dirichlet alpha={args.alpha})")
+
     client_indices = split_dataset_for_federated(
-        train_dataset, args.num_clients, iid=args.iid, seed=args.seed
+        train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
     )
+
+    # Print client data distribution for debugging
+    print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
     
     global_model = FedLFC_CBM(
         backbone_type=args.backbone,
@@ -281,10 +293,17 @@ def simulate_federated_training(args):
     
     print("\n=== Phase 1: Training Projection Layer ===")
     best_proj_loss = float('inf')
+    projection_metrics = {
+        "rounds": [],
+        "client_losses": [],
+        "avg_client_loss": [],
+        "best_proj_loss": []
+    }
     
     for round_num in range(args.num_rounds):
         print(f"\n=== Federated Round {round_num + 1}/{args.num_rounds} ===")
         
+        round_client_losses = []
         for client_id in range(args.num_clients):
             client_models[client_id].load_state_dict(global_model.state_dict())
             
@@ -300,14 +319,22 @@ def simulate_federated_training(args):
                 device=device
             )
             
+            round_client_losses.append(train_loss)
             print(f"Client {client_id}: Train Loss = {train_loss:.4f}")
         
         global_state = federated_averaging(client_models, client_weights)
         global_model.load_state_dict(global_state)
         
-        if train_loss < best_proj_loss:
-            best_proj_loss = train_loss
+        avg_loss = sum(round_client_losses) / len(round_client_losses)
+        projection_metrics["rounds"].append(round_num + 1)
+        projection_metrics["client_losses"].append(round_client_losses)
+        projection_metrics["avg_client_loss"].append(avg_loss)
+        
+        if avg_loss < best_proj_loss:
+            best_proj_loss = avg_loss
             torch.save(global_model.state_dict(), os.path.join(save_dir, "best_projection.pt"))
+        
+        projection_metrics["best_proj_loss"].append(best_proj_loss)
     
     print("\n=== Phase 2: Computing Normalization Statistics ===")
     with torch.no_grad():
@@ -333,10 +360,18 @@ def simulate_federated_training(args):
     
     print("\n=== Phase 3: Training Final Layer ===")
     best_accuracy = 0.0
+    final_layer_metrics = {
+        "rounds": [],
+        "client_losses": [],
+        "avg_client_loss": [],
+        "global_accuracy": [],
+        "best_accuracy": []
+    }
     
     for round_num in range(args.final_rounds):
         print(f"\n=== Final Layer Round {round_num + 1}/{args.final_rounds} ===")
         
+        round_client_losses = []
         for client_id in range(args.num_clients):
             client_models[client_id].load_state_dict(global_model.state_dict())
             
@@ -348,6 +383,7 @@ def simulate_federated_training(args):
                 device=device
             )
             
+            round_client_losses.append(train_loss)
             print(f"Client {client_id}: Final Layer Loss = {train_loss:.4f}")
         
         global_state = federated_averaging(client_models, client_weights)
@@ -356,18 +392,42 @@ def simulate_federated_training(args):
         accuracy = evaluate_model(global_model, global_test_loader, device)
         print(f"Global Test Accuracy: {accuracy:.4f}")
         
+        avg_loss = sum(round_client_losses) / len(round_client_losses)
+        final_layer_metrics["rounds"].append(round_num + 1)
+        final_layer_metrics["client_losses"].append(round_client_losses)
+        final_layer_metrics["avg_client_loss"].append(avg_loss)
+        final_layer_metrics["global_accuracy"].append(float(accuracy))
+        
         if accuracy > best_accuracy:
             best_accuracy = accuracy
             torch.save(global_model.state_dict(), os.path.join(save_dir, "best_model.pt"))
+        
+        final_layer_metrics["best_accuracy"].append(float(best_accuracy))
     
     print(f"\nBest Accuracy: {best_accuracy:.4f}")
     torch.save(global_model.state_dict(), os.path.join(save_dir, "final_model.pt"))
+    
+    training_metrics = {
+        "projection_phase": projection_metrics,
+        "final_layer_phase": final_layer_metrics,
+        "num_clients": args.num_clients,
+        "client_data_sizes": client_data_sizes,
+        "client_weights": client_weights,
+        "iid": args.iid,
+        "alpha": args.alpha if not args.iid else None,
+        "best_final_accuracy": float(best_accuracy)
+    }
+    
+    with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
+        json.dump(training_metrics, f, indent=2)
+    
+    print(f"\nTraining metrics saved to {os.path.join(save_dir, 'training_metrics.json')}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Federated Label-Free Concept Bottleneck Model")
     
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet"], help="Dataset name")
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet", "cub"], help="Dataset name")
     parser.add_argument("--concept_file", type=str, required=True, help="Path to concept file")
     parser.add_argument("--backbone", type=str, default="resnet50", help="Backbone type: resnet50 or clip_ViT-B/16")
     parser.add_argument("--clip_name", type=str, default="ViT-B/16", help="CLIP model name")
@@ -376,7 +436,9 @@ def main():
     parser.add_argument("--num_clients", type=int, default=5, help="Number of federated clients")
     parser.add_argument("--num_rounds", type=int, default=10, help="Number of federated rounds")
     parser.add_argument("--local_epochs", type=int, default=5, help="Local training epochs per round")
-    parser.add_argument("--iid", action="store_true", default=True, help="Use IID data distribution (default: True)")
+    parser.add_argument("--iid", action="store_true", help="Use IID data distribution")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha for non-IID partitioning (smaller = more heterogeneous). "
+                        "Only used when --iid is not set. Typical values: 0.1 (extreme), 0.5 (moderate), 1.0 (mild), 100 (near-IID)")
     
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
