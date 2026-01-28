@@ -472,8 +472,7 @@ def simulate_federated_training_vlg(args):
     global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
     global_model.to(device)
 
-    train_dataset = get_data(f"{args.dataset}_train", preprocess=preprocess)
-    val_dataset = get_data(f"{args.dataset}_val", preprocess=preprocess)
+    train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
     client_indices = split_dataset_for_federated(
         train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
     )
