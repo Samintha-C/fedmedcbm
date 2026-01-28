@@ -1,10 +1,18 @@
 import os
 import sys
+from typing import List, Optional
 import torch
 import numpy as np
 from torch.utils.data import Subset, random_split
 from torchvision import datasets, transforms, models
 import clip
+
+BACKBONE_ENCODING_DIMENSION = {
+    "resnet18_cub": 512,
+    "clip_RN50": 1024,
+    "clip_RN50_penultimate": 2048,
+    "resnet50": 2048,
+}
 
 lf_cbm_path = os.path.join(os.path.dirname(__file__), '../../Label-free-CBM')
 if os.path.exists(lf_cbm_path):
@@ -12,6 +20,33 @@ if os.path.exists(lf_cbm_path):
     import data_utils as lf_cbm_data_utils
 else:
     raise ImportError(f"Label-free-CBM not found at {lf_cbm_path}. Please ensure Label-free-CBM is in the parent directory.")
+
+
+def format_concept(s: str) -> str:
+    s = s.lower()
+    s = s.replace("-", " ").replace(",", " ").replace(".", " ").replace("(", " ").replace(")", " ")
+    if s.startswith("a "):
+        s = s[2:]
+    elif s.startswith("an "):
+        s = s[3:]
+    return " ".join(s.split())
+
+
+def get_concepts(concept_file: str, filter_file: Optional[str] = None) -> List[str]:
+    if not os.path.isabs(concept_file):
+        for base in [os.path.dirname(os.path.dirname(__file__)), os.getcwd()]:
+            p = os.path.join(base, concept_file)
+            if os.path.exists(p):
+                concept_file = p
+                break
+    with open(concept_file) as f:
+        concepts = [line.strip() for line in f if line.strip()]
+    concepts = list(dict.fromkeys([format_concept(c) for c in concepts]))
+    if filter_file and os.path.exists(filter_file):
+        with open(filter_file) as f:
+            to_filter = set(format_concept(line.strip()) for line in f if line.strip())
+        concepts = [c for c in concepts if c not in to_filter]
+    return concepts
 
 def get_data(dataset_name, preprocess=None, root=None):
     return lf_cbm_data_utils.get_data(dataset_name, preprocess)

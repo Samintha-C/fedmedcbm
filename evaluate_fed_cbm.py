@@ -33,7 +33,47 @@ get_classes = fed_data_utils.get_classes
 get_target_model = fed_data_utils.get_target_model
 
 
+def _is_vlg_checkpoint(load_dir):
+    return (os.path.exists(os.path.join(load_dir, "cbl.pt")) and
+            os.path.exists(os.path.join(load_dir, "final.pt")))
+
+
+def load_fed_vlg_cbm(load_dir, device):
+    from models.fed_vlgcbm import (
+        Backbone, BackboneCLIP, ConceptLayer, NormalizationLayer, FinalLayer, FedVLGCBM,
+    )
+    with open(os.path.join(load_dir, "args.txt"), "r") as f:
+        args = json.load(f)
+    backbone_name = args["backbone"]
+    if backbone_name.startswith("clip_"):
+        backbone = BackboneCLIP(backbone_name, use_penultimate=args.get("use_clip_penultimate", True), device=str(device))
+    else:
+        backbone = Backbone(backbone_name, args.get("feature_layer", "layer4"), str(device))
+    num_concepts = args.get("num_concepts")
+    num_classes = args.get("num_classes")
+    if num_concepts is None or num_classes is None:
+        final_sd = torch.load(os.path.join(load_dir, "final.pt"), map_location=device)
+        w = final_sd.get("weight", final_sd.get("linear.weight"))
+        if w is None:
+            w = list(final_sd.values())[0]
+        num_classes, num_concepts = w.shape[0], w.shape[1]
+        args["num_concepts"] = num_concepts
+        args["num_classes"] = num_classes
+    cbl = ConceptLayer(backbone.output_dim, num_concepts, num_hidden=args.get("cbl_hidden_layers", 0), bias=True, device=str(device))
+    cbl.load_state_dict(torch.load(os.path.join(load_dir, "cbl.pt"), map_location=device))
+    backbone.backbone.load_state_dict(torch.load(os.path.join(load_dir, "backbone.pt"), map_location=device))
+    norm_layer = NormalizationLayer.from_pretrained(load_dir, device=str(device))
+    final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+    final_layer.load_state_dict(torch.load(os.path.join(load_dir, "final.pt"), map_location=device))
+    model = FedVLGCBM(backbone, cbl, norm_layer, final_layer)
+    model.to(device)
+    model.eval()
+    return model, args
+
+
 def load_fed_cbm(load_dir, device):
+    if _is_vlg_checkpoint(load_dir):
+        return load_fed_vlg_cbm(load_dir, device)
     with open(os.path.join(load_dir, "args.txt"), "r") as f:
         args = json.load(f)
     
@@ -103,6 +143,36 @@ def get_accuracy_cbm(model, dataset, device, batch_size=250, num_workers=2):
             correct += torch.sum(pred.cpu() == labels)
             total += len(labels)
     return correct / total
+
+
+def get_per_class_accuracy_vlg(model, dataset, device, classes, batch_size=250, num_workers=2):
+    correct = torch.zeros(len(classes)).to(device)
+    total = torch.zeros(len(classes)).to(device)
+    model.eval()
+    for images, labels in tqdm(DataLoader(dataset, batch_size, num_workers=num_workers, pin_memory=True)):
+        images, labels = images.to(device), labels.to(device)
+        with torch.no_grad():
+            logits = model(images)
+            preds = logits.argmax(dim=1)
+        for p, t in zip(preds, labels):
+            total[t] += 1
+            if p == t:
+                correct[t] += 1
+    pca = (correct / total).nan_to_num_(nan=0.0)
+    tot = total.sum()
+    overall = (correct.sum() / tot).item() * 100.0 if tot.item() > 0 else 0.0
+    return {
+        "Per class accuracy": {classes[i]: f"{pca[i].item()*100.0:.2f}" for i in range(len(classes))},
+        "Overall accuracy": f"{overall:.2f}",
+        "Datapoints": f"{tot.item()}",
+    }
+
+
+def get_sparsity_vlg(final_layer):
+    w = final_layer.weight.data.cpu()
+    nnz = (w.abs() > 1e-5).sum().item()
+    n = w.numel()
+    return {"Non-zero weights": nnz, "Total weights": n, "Percentage non-zero": nnz / n}
 
 
 def get_preds_cbm(model, dataset, device, batch_size=250, num_workers=2):
@@ -187,8 +257,9 @@ def get_detailed_concept_metrics(model, dataset, device, batch_size=250, num_wor
 
 
 def get_weight_statistics(model, concepts, classes):
-    weights = model.final_layer.linear.weight.data.cpu()
-    bias = model.final_layer.linear.bias.data.cpu()
+    fl = getattr(model.final_layer, "linear", model.final_layer)
+    weights = fl.weight.data.cpu()
+    bias = fl.bias.data.cpu()
     
     num_classes, num_concepts = weights.shape
     
@@ -331,23 +402,53 @@ def main():
             raise FileNotFoundError(f"Concept file not found at {concept_file}. Please ensure concepts.txt exists in {args.load_dir} or retrain the model.")
     classes = get_classes(dataset_name)
     
-    _, target_preprocess = get_target_model(saved_args["backbone"], device)
-    
-    val_d_probe = dataset_name + "_val"
-    val_data_t = get_data(val_d_probe, preprocess=target_preprocess)
-    
+    if hasattr(model, "backbone") and hasattr(model.backbone, "preprocess"):
+        target_preprocess = model.backbone.preprocess
+    else:
+        _, target_preprocess = get_target_model(saved_args["backbone"], device)
+
+    if _is_vlg_checkpoint(args.load_dir):
+        try:
+            eval_d_probe = dataset_name + "_test"
+            eval_data_t = get_data(eval_d_probe, preprocess=target_preprocess)
+        except Exception:
+            eval_d_probe = dataset_name + "_val"
+            eval_data_t = get_data(eval_d_probe, preprocess=target_preprocess)
+        print(f"VLG checkpoint: using {eval_d_probe} for metrics (matches VLG test accuracy when test exists)")
+    else:
+        eval_d_probe = dataset_name + "_val"
+        eval_data_t = get_data(eval_d_probe, preprocess=target_preprocess)
+
     print("\n=== Measuring Accuracy ===")
-    accuracy = get_accuracy_cbm(model, val_data_t, device, batch_size=args.batch_size, num_workers=args.num_workers)
+    accuracy = get_accuracy_cbm(model, eval_data_t, device, batch_size=args.batch_size, num_workers=args.num_workers)
     print(f"Accuracy: {accuracy*100:.2f}%")
+
+    per_class_accuracies = None
+    sparsity_vlg = None
+    if _is_vlg_checkpoint(args.load_dir):
+        print("\n=== Per-class accuracy (VLG format) ===")
+        per_class_accuracies = get_per_class_accuracy_vlg(model, eval_data_t, device, classes, batch_size=args.batch_size, num_workers=args.num_workers)
+        sparsity_vlg = get_sparsity_vlg(model.final_layer)
+        print(f"Overall: {per_class_accuracies['Overall accuracy']}%")
+        metrics_txt_path = os.path.join(args.load_dir, "metrics.txt")
+        if not os.path.exists(metrics_txt_path):
+            vlg_metrics = {
+                "per_class_accuracies": per_class_accuracies,
+                "lam": -1.0, "lr": -1.0, "alpha": -1.0, "time": -1.0,
+                "metrics": {"test_accuracy": float(accuracy)},
+                "sparsity": sparsity_vlg,
+            }
+            with open(metrics_txt_path, "w") as f:
+                json.dump(vlg_metrics, f, indent=2)
     
     print("\n=== Computing Detailed Concept Metrics ===")
-    concept_metrics = get_detailed_concept_metrics(model, val_data_t, device, batch_size=args.batch_size, num_workers=args.num_workers)
-    
+    concept_metrics = get_detailed_concept_metrics(model, eval_data_t, device, batch_size=args.batch_size, num_workers=args.num_workers)
+
     print("\n=== Computing Weight Statistics ===")
     weight_metrics = get_weight_statistics(model, concepts, classes)
-    
+
     print("\n=== Computing Concept Confusion Analysis ===")
-    confusion_metrics = get_concept_confusion_analysis(model, val_data_t, device, concepts, classes, batch_size=args.batch_size, num_workers=args.num_workers)
+    confusion_metrics = get_concept_confusion_analysis(model, eval_data_t, device, concepts, classes, batch_size=args.batch_size, num_workers=args.num_workers)
     
     results = {
         "model_dir": args.load_dir,
@@ -362,10 +463,14 @@ def main():
         "weight_metrics": weight_metrics,
         "confusion_metrics": confusion_metrics
     }
+    if per_class_accuracies is not None:
+        results["per_class_accuracies"] = per_class_accuracies
+    if sparsity_vlg is not None:
+        results["sparsity"] = sparsity_vlg
     
     if args.show_weights:
         print("\n=== Final Layer Weights ===")
-        final_weights = model.final_layer.linear.weight.data
+        final_weights = getattr(model.final_layer, "linear", model.final_layer).weight.data
         
         to_show = random.choices([i for i in range(len(classes))], k=min(3, len(classes)))
         for i in to_show:
@@ -382,16 +487,16 @@ def main():
     
     if args.show_sparsity:
         print("\n=== Sparsity Statistics ===")
-        final_weights = model.final_layer.linear.weight.data
+        final_weights = getattr(model.final_layer, "linear", model.final_layer).weight.data
         weight_contribs = torch.sum(torch.abs(final_weights), dim=0)
         num_concepts_used = torch.sum(weight_contribs > 1e-5).item()
         print(f"Num concepts with outgoing weights: {num_concepts_used}/{len(weight_contribs)}")
-        
-        results["sparsity"] = {
-            "num_concepts_used": int(num_concepts_used),
-            "total_concepts": int(len(weight_contribs)),
-            "sparsity_ratio": float(num_concepts_used / len(weight_contribs))
-        }
+        if sparsity_vlg is None:
+            results["sparsity"] = {
+                "num_concepts_used": int(num_concepts_used),
+                "total_concepts": int(len(weight_contribs)),
+                "sparsity_ratio": float(num_concepts_used / len(weight_contribs))
+            }
         
         top_weights, top_weight_ids = torch.topk(final_weights, k=5, dim=1)
         bottom_weights, bottom_weight_ids = torch.topk(final_weights, k=5, dim=1, largest=False)

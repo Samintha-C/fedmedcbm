@@ -424,6 +424,220 @@ def simulate_federated_training(args):
     print(f"\nTraining metrics saved to {os.path.join(save_dir, 'training_metrics.json')}")
 
 
+def simulate_federated_training_vlg(args):
+    import copy
+    _loss_vlg_spec = importlib.util.spec_from_file_location("fed_loss_vlg", os.path.join(current_dir, "utils", "loss_vlg.py"))
+    _loss_vlg_mod = importlib.util.module_from_spec(_loss_vlg_spec)
+    _loss_vlg_spec.loader.exec_module(_loss_vlg_mod)
+    get_loss_vlg = _loss_vlg_mod.get_loss
+    from data import data_utils
+    from data.concept_dataset_vlg import AllOneConceptDataset, get_concept_dataloader
+    from models.fed_vlgcbm import (
+        Backbone, BackboneCLIP, ConceptLayer, NormalizationLayer, FinalLayer, FedVLGCBM,
+        train_cbl, validate_cbl, get_final_layer_dataset, train_sparse_final, train_dense_final, test_model, per_class_accuracy,
+    )
+
+    set_seed(args.seed)
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    save_dir = os.path.join(
+        args.save_dir,
+        f"fed_vlg_{args.dataset}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+    )
+    os.makedirs(save_dir, exist_ok=True)
+
+    concepts = data_utils.get_concepts(args.concept_file, getattr(args, "filter_set", None))
+    num_concepts = len(concepts)
+    classes = get_classes(args.dataset)
+    num_classes = len(classes)
+    args.num_concepts = num_concepts
+    args.num_classes = num_classes
+
+    with open(os.path.join(save_dir, "args.txt"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+    with open(os.path.join(save_dir, "concepts.txt"), "w") as f:
+        f.write("\n".join(concepts))
+
+    if args.backbone.startswith("clip_"):
+        preprocess = get_clip_preprocess()
+        backbone = BackboneCLIP(args.backbone, use_penultimate=getattr(args, "use_clip_penultimate", True), device=str(device))
+    else:
+        preprocess = get_resnet_preprocess()
+        backbone = Backbone(args.backbone, getattr(args, "feature_layer", "layer4"), str(device))
+
+    cbl = ConceptLayer(
+        backbone.output_dim, num_concepts,
+        num_hidden=getattr(args, "cbl_hidden_layers", 0),
+        bias=True, device=str(device)
+    )
+    global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
+    global_model.to(device)
+
+    train_dataset = get_data(f"{args.dataset}_train", preprocess=preprocess)
+    val_dataset = get_data(f"{args.dataset}_val", preprocess=preprocess)
+    client_indices = split_dataset_for_federated(
+        train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
+    )
+    print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
+
+    base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
+    val_cbl_loader = get_concept_dataloader(
+        args.dataset, "val", concepts, preprocess=preprocess,
+        val_split=getattr(args, "val_split", 0.1),
+        batch_size=getattr(args, "cbl_batch_size", 32),
+        num_workers=args.num_workers, shuffle=False, use_allones=True, seed=args.seed
+    )
+    client_train_loaders = []
+    client_data_sizes = []
+    for i in range(args.num_clients):
+        sub = Subset(base_cbl_dataset, client_indices[i])
+        client_train_loaders.append(DataLoader(
+            sub, batch_size=getattr(args, "cbl_batch_size", 32),
+            shuffle=True, num_workers=args.num_workers, pin_memory=True
+        ))
+        client_data_sizes.append(len(sub))
+    total_samples = sum(client_data_sizes)
+    client_weights = [n / total_samples for n in client_data_sizes]
+
+    test_loader = get_concept_dataloader(
+        args.dataset, "test", concepts, preprocess=preprocess, use_allones=True,
+        batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
+    )
+
+    num_train = len(base_cbl_dataset)
+    concept_counts = [num_train // num_classes] * num_concepts
+    loss_fn = get_loss_vlg(
+        getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
+        getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
+        tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
+    )
+
+    client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+    for m in client_models:
+        m.to(device)
+
+    print("\n=== Phase 1: Federated CBL training ===")
+    projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
+    best_val_loss = float("inf")
+    for round_num in range(args.num_rounds):
+        round_losses = []
+        for i in range(args.num_clients):
+            client_models[i].load_state_dict(global_model.state_dict())
+            _, _ = train_cbl(
+                client_models[i].backbone, client_models[i].cbl,
+                client_train_loaders[i], val_cbl_loader,
+                epochs=getattr(args, "cbl_epochs", args.local_epochs),
+                loss_fn=loss_fn, lr=getattr(args, "cbl_lr", args.lr),
+                weight_decay=args.weight_decay, device=str(device),
+                finetune=getattr(args, "cbl_finetune", False),
+                optimizer_name=getattr(args, "cbl_optimizer", "adam"),
+                backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
+            )
+            vl = validate_cbl(client_models[i].backbone, client_models[i].cbl, val_cbl_loader, loss_fn, str(device))
+            round_losses.append(vl)
+        global_state = federated_averaging(client_models, client_weights)
+        global_model.load_state_dict(global_state)
+        avg_loss = sum(round_losses) / len(round_losses)
+        projection_metrics["rounds"].append(round_num + 1)
+        projection_metrics["client_losses"].append(round_losses)
+        projection_metrics["avg_client_loss"].append(avg_loss)
+        if avg_loss < best_val_loss:
+            best_val_loss = avg_loss
+        projection_metrics["best_val_loss"].append(best_val_loss)
+        print(f"Round {round_num + 1} avg val loss: {avg_loss:.4f}")
+
+    full_train_cbl_loader = DataLoader(
+        base_cbl_dataset, batch_size=getattr(args, "saga_batch_size", 512),
+        shuffle=True, num_workers=args.num_workers
+    )
+    print("\n=== Phase 2: Final-layer dataset and normalization ===")
+    train_concept_loader, val_concept_loader, norm_layer = get_final_layer_dataset(
+        global_model.backbone, global_model.cbl,
+        full_train_cbl_loader, val_cbl_loader,
+        save_dir, load_dir=None, batch_size=getattr(args, "saga_batch_size", 512), device=str(device)
+    )
+    global_model.normalization = norm_layer
+
+    print("\n=== Phase 3: Final layer (sparse GLM-SAGA or dense) ===")
+    final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+    if getattr(args, "dense", False):
+        out = train_dense_final(
+            final_layer, train_concept_loader, val_concept_loader,
+            n_iters=getattr(args, "saga_n_iters", 2000), lr=getattr(args, "dense_lr", 0.001), device=str(device)
+        )
+    else:
+        out = train_sparse_final(
+            final_layer, train_concept_loader, val_concept_loader,
+            n_iters=getattr(args, "saga_n_iters", 2000), lam=getattr(args, "saga_lam", 0.0007),
+            step_size=getattr(args, "saga_step_size", 0.1), device=str(device)
+        )
+    w = out["path"][0]["weight"] if out.get("path") else out.get("best", {}).get("weight")
+    b = out["path"][0]["bias"] if out.get("path") else out.get("best", {}).get("bias")
+    if w is not None:
+        final_layer.weight.data.copy_(w.to(device))
+    if b is not None:
+        final_layer.bias.data.copy_(b.to(device))
+    global_model.final_layer = final_layer
+
+    test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
+    print(f"Test accuracy: {test_acc:.4f}")
+
+    global_model.backbone.save_model(save_dir)
+    global_model.cbl.save_model(save_dir)
+    global_model.normalization.save_model(save_dir)
+    global_model.final_layer.save_model(save_dir)
+
+    pca = per_class_accuracy(global_model, test_loader, classes, str(device))
+    sparsity_vlg = {"Non-zero weights": (global_model.final_layer.weight.data.abs() > 1e-5).sum().item(), "Total weights": global_model.final_layer.weight.data.numel(), "Percentage non-zero": (global_model.final_layer.weight.data.abs() > 1e-5).float().mean().item()}
+    with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
+        json.dump({"per_class_accuracies": pca, "lam": getattr(args, "saga_lam", -1.0), "lr": getattr(args, "dense_lr", -1.0), "alpha": -1.0, "time": -1.0, "metrics": {"test_accuracy": float(test_acc)}, "sparsity": sparsity_vlg}, f, indent=2)
+
+    if getattr(args, "run_nec_eval", True) and not getattr(args, "dense", False):
+        print("\n=== Phase 4: NEC evaluation ===")
+        import pandas as pd
+        from evaluations.sparse_utils import measure_acc
+        test_feats, test_labels = [], []
+        with torch.no_grad():
+            for features, _, labels in tqdm(test_loader):
+                features = features.to(device)
+                logits = global_model.normalization(global_model.cbl(global_model.backbone(features)))
+                test_feats.append(logits.cpu())
+                test_labels.append(labels)
+        test_feats = torch.cat(test_feats, dim=0)
+        test_labels = torch.cat(test_labels, dim=0)
+        test_concept_loader = DataLoader(
+            TensorDataset(test_feats, test_labels),
+            batch_size=getattr(args, "saga_batch_size", 512),
+            shuffle=False,
+        )
+        nec_measure_level = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
+        path, truncated_weights, _ = measure_acc(
+            num_concepts, num_classes, len(train_concept_loader.dataset),
+            train_concept_loader, val_concept_loader, test_concept_loader,
+            saga_step_size=getattr(args, "saga_step_size", 0.1),
+            saga_n_iters=getattr(args, "saga_n_iters", 2000),
+            device=str(device),
+            max_lam=getattr(args, "nec_lam_max", 0.01),
+            measure_level=nec_measure_level,
+        )
+        sparsity_list = [(p["weight"].abs() > 1e-5).float().mean().item() for p in path]
+        nec_col = [num_concepts * s for s in sparsity_list]
+        acc_col = [p["metrics"]["acc_test"] for p in path]
+        pd.DataFrame({"NEC": nec_col, "Accuracy": acc_col}).to_csv(os.path.join(save_dir, "metrics.csv"), index=False)
+        for nec_val, (W, b) in truncated_weights.items():
+            torch.save(W, os.path.join(save_dir, f"W_g@NEC={nec_val:d}.pt"))
+            torch.save(b, os.path.join(save_dir, f"b_g@NEC={nec_val:d}.pt"))
+
+    training_metrics = {
+        "projection_phase": projection_metrics,
+        "num_clients": args.num_clients, "client_data_sizes": client_data_sizes, "client_weights": client_weights,
+        "iid": args.iid, "alpha": args.alpha if not args.iid else None,
+        "best_final_accuracy": float(test_acc),
+    }
+    with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
+        json.dump(training_metrics, f, indent=2)
+    print(f"Saved to {save_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Federated Label-Free Concept Bottleneck Model")
     
@@ -432,6 +646,7 @@ def main():
     parser.add_argument("--backbone", type=str, default="resnet50", help="Backbone type: resnet50 or clip_ViT-B/16")
     parser.add_argument("--clip_name", type=str, default="ViT-B/16", help="CLIP model name")
     parser.add_argument("--use_clip_penultimate", action="store_true", help="Use CLIP penultimate layer")
+    parser.add_argument("--use_vlg", action="store_true", help="Use VLG-CBM training (AllOne concepts, BCE/TwoWay loss, SAGA final layer)")
     
     parser.add_argument("--num_clients", type=int, default=5, help="Number of federated clients")
     parser.add_argument("--num_rounds", type=int, default=10, help="Number of federated rounds")
@@ -455,8 +670,44 @@ def main():
     parser.add_argument("--save_dir", type=str, default="saved_models", help="Save directory")
     parser.add_argument("--cache_dir", type=str, default=None, help="Cache directory for embeddings")
     
-    args = parser.parse_args()
-    simulate_federated_training(args)
+    parser.add_argument("--val_split", type=float, default=0.1, help="Validation split (VLG)")
+    parser.add_argument("--feature_layer", type=str, default="layer4", help="Backbone feature layer (VLG, non-CLIP)")
+    parser.add_argument("--cbl_loss_type", type=str, default="bce", choices=["bce", "twoway"], help="CBL loss (VLG)")
+    parser.add_argument("--cbl_lr", type=float, default=5e-4, help="CBL learning rate (VLG)")
+    parser.add_argument("--cbl_epochs", type=int, default=20, help="CBL epochs per client round (VLG)")
+    parser.add_argument("--cbl_batch_size", type=int, default=32, help="CBL batch size (VLG)")
+    parser.add_argument("--cbl_optimizer", type=str, default="adam", choices=["adam", "sgd"], help="CBL optimizer (VLG)")
+    parser.add_argument("--cbl_hidden_layers", type=int, default=0, help="CBL hidden layers (VLG)")
+    parser.add_argument("--cbl_pos_weight", type=float, default=0.2, help="BCE positive weight (VLG)")
+    parser.add_argument("--no_cbl_auto_weight", action="store_true", help="Disable BCE auto positive weighting (VLG)")
+    parser.add_argument("--cbl_twoway_tp", type=float, default=4.0, help="TwoWay loss Tp (VLG)")
+    parser.add_argument("--cbl_finetune", action="store_true", help="Finetune backbone in CBL (VLG)")
+    parser.add_argument("--cbl_bb_lr_rate", type=float, default=1.0, help="Backbone LR scale in CBL (VLG)")
+    parser.add_argument("--saga_lam", type=float, default=0.0007, help="SAGA sparsity lambda (VLG)")
+    parser.add_argument("--saga_n_iters", type=int, default=2000, help="SAGA iterations (VLG)")
+    parser.add_argument("--saga_step_size", type=float, default=0.1, help="SAGA step size (VLG)")
+    parser.add_argument("--saga_batch_size", type=int, default=512, help="SAGA batch size (VLG)")
+    parser.add_argument("--no_nec_eval", action="store_true", help="Skip NEC evaluation (Phase 4)")
+    parser.add_argument("--nec_lam_max", type=float, default=0.01, help="NEC path max lambda (VLG)")
+    parser.add_argument("--nec_measure_level", type=str, default="5,10,15,20,25,30", help="NEC levels, comma-separated (VLG)")
+    parser.add_argument("--dense", action="store_true", help="Train dense final layer (VLG)")
+    parser.add_argument("--dense_lr", type=float, default=0.001, help="Learning rate for dense final layer (VLG)")
+    
+    config_parser = argparse.ArgumentParser()
+    config_parser.add_argument("--config", type=str, default=None)
+    config_pre, remaining = config_parser.parse_known_args()
+    if config_pre.config is not None:
+        with open(config_pre.config, "r") as f:
+            parser.set_defaults(**json.load(f))
+    
+    args = parser.parse_args(remaining)
+    args.run_nec_eval = not getattr(args, "no_nec_eval", False)
+    nm = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
+    args.nec_measure_level = tuple(int(x) for x in (nm.split(",") if isinstance(nm, str) else nm))
+    if getattr(args, "use_vlg", False):
+        simulate_federated_training_vlg(args)
+    else:
+        simulate_federated_training(args)
 
 
 if __name__ == "__main__":
