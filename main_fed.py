@@ -472,18 +472,28 @@ def simulate_federated_training_vlg(args):
     global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
     global_model.to(device)
 
-    train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
+    full_train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
+    
+    val_split = getattr(args, "val_split", 0.1)
+    n_val = int(val_split * len(full_train_dataset))
+    n_train = len(full_train_dataset) - n_val
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
+    )
+    print(f"Split full train dataset: {len(train_dataset)} train, {len(val_dataset)} val (val_split={val_split})")
+    
     client_indices = split_dataset_for_federated(
         train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
     )
     print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
 
     base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
-    val_cbl_loader = get_concept_dataloader(
-        args.dataset, "val", concepts, preprocess=preprocess,
-        val_split=getattr(args, "val_split", 0.1),
+    val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
+    val_cbl_loader = DataLoader(
+        val_cbl_dataset,
         batch_size=getattr(args, "cbl_batch_size", 32),
-        num_workers=args.num_workers, shuffle=False, use_allones=True, seed=args.seed
+        num_workers=args.num_workers,
+        shuffle=False
     )
     client_train_loaders = []
     client_data_sizes = []
