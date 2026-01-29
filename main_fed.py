@@ -184,7 +184,7 @@ def simulate_federated_training(args):
     
     save_dir = os.path.join(
         args.save_dir,
-        f"fed_lfc_{args.dataset}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        f"fed_lfc_{args.dataset}_c{args.num_clients}_r{args.num_rounds}_fr{args.final_rounds}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
     )
     os.makedirs(save_dir, exist_ok=True)
     
@@ -411,6 +411,8 @@ def simulate_federated_training(args):
         "projection_phase": projection_metrics,
         "final_layer_phase": final_layer_metrics,
         "num_clients": args.num_clients,
+        "num_rounds": args.num_rounds,
+        "final_rounds": args.final_rounds,
         "client_data_sizes": client_data_sizes,
         "client_weights": client_weights,
         "iid": args.iid,
@@ -441,7 +443,7 @@ def simulate_federated_training_vlg(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     save_dir = os.path.join(
         args.save_dir,
-        f"fed_vlg_{args.dataset}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        f"fed_vlg_{args.dataset}_c{args.num_clients}_r{args.num_rounds}_saga{getattr(args, 'saga_n_iters', 2000)}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
     )
     os.makedirs(save_dir, exist_ok=True)
 
@@ -655,8 +657,12 @@ def simulate_federated_training_vlg(args):
 
     training_metrics = {
         "projection_phase": projection_metrics,
-        "num_clients": args.num_clients, "client_data_sizes": client_data_sizes, "client_weights": client_weights,
-        "iid": args.iid, "alpha": args.alpha if not args.iid else None,
+        "num_clients": args.num_clients,
+        "num_rounds": args.num_rounds,
+        "client_data_sizes": client_data_sizes,
+        "client_weights": client_weights,
+        "iid": args.iid,
+        "alpha": args.alpha if not args.iid else None,
         "best_final_accuracy": float(test_acc),
     }
     with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
