@@ -590,51 +590,68 @@ def simulate_federated_training_vlg(args):
     test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
     print(f"Test accuracy: {test_acc:.4f}")
 
+    # Save model immediately after final layer training completes
+    print(f"\nSaving model to {save_dir}...")
     global_model.backbone.save_model(save_dir)
     global_model.cbl.save_model(save_dir)
     global_model.normalization.save_model(save_dir)
     global_model.final_layer.save_model(save_dir)
+    print("Model saved successfully!")
 
-    pca = per_class_accuracy(global_model, test_loader, classes, str(device))
+    # Try to compute per-class accuracy, but don't fail if it errors
+    pca = None
+    try:
+        pca = per_class_accuracy(global_model, test_loader, classes, str(device))
+    except Exception as e:
+        print(f"Warning: Failed to compute per-class accuracy: {e}")
+    
     sparsity_vlg = {"Non-zero weights": (global_model.final_layer.weight.data.abs() > 1e-5).sum().item(), "Total weights": global_model.final_layer.weight.data.numel(), "Percentage non-zero": (global_model.final_layer.weight.data.abs() > 1e-5).float().mean().item()}
-    with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
-        json.dump({"per_class_accuracies": pca, "lam": getattr(args, "saga_lam", -1.0), "lr": getattr(args, "dense_lr", -1.0), "alpha": -1.0, "time": -1.0, "metrics": {"test_accuracy": float(test_acc)}, "sparsity": sparsity_vlg}, f, indent=2)
+    try:
+        with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
+            json.dump({"per_class_accuracies": pca, "lam": getattr(args, "saga_lam", -1.0), "lr": getattr(args, "dense_lr", -1.0), "alpha": -1.0, "time": -1.0, "metrics": {"test_accuracy": float(test_acc)}, "sparsity": sparsity_vlg}, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to save metrics.txt: {e}")
 
+    # Wrap NEC evaluation in try-except so it doesn't prevent model saving
     if getattr(args, "run_nec_eval", True) and not getattr(args, "dense", False):
-        print("\n=== Phase 4: NEC evaluation ===")
-        import pandas as pd
-        from evaluations.sparse_utils import measure_acc
-        test_feats, test_labels = [], []
-        with torch.no_grad():
-            for features, _, labels in tqdm(test_loader):
-                features = features.to(device)
-                logits = global_model.normalization(global_model.cbl(global_model.backbone(features)))
-                test_feats.append(logits.cpu())
-                test_labels.append(labels)
-        test_feats = torch.cat(test_feats, dim=0)
-        test_labels = torch.cat(test_labels, dim=0)
-        test_concept_loader = DataLoader(
-            TensorDataset(test_feats, test_labels),
-            batch_size=getattr(args, "saga_batch_size", 512),
-            shuffle=False,
-        )
-        nec_measure_level = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
-        path, truncated_weights, _ = measure_acc(
-            num_concepts, num_classes, len(train_concept_loader.dataset),
-            train_concept_loader, val_concept_loader, test_concept_loader,
-            saga_step_size=getattr(args, "saga_step_size", 0.1),
-            saga_n_iters=getattr(args, "saga_n_iters", 2000),
-            device=str(device),
-            max_lam=getattr(args, "nec_lam_max", 0.01),
-            measure_level=nec_measure_level,
-        )
-        sparsity_list = [(p["weight"].abs() > 1e-5).float().mean().item() for p in path]
-        nec_col = [num_concepts * s for s in sparsity_list]
-        acc_col = [p["metrics"]["acc_test"] for p in path]
-        pd.DataFrame({"NEC": nec_col, "Accuracy": acc_col}).to_csv(os.path.join(save_dir, "metrics.csv"), index=False)
-        for nec_val, (W, b) in truncated_weights.items():
-            torch.save(W, os.path.join(save_dir, f"W_g@NEC={nec_val:d}.pt"))
-            torch.save(b, os.path.join(save_dir, f"b_g@NEC={nec_val:d}.pt"))
+        try:
+            print("\n=== Phase 4: NEC evaluation ===")
+            import pandas as pd
+            from evaluations.sparse_utils import measure_acc
+            test_feats, test_labels = [], []
+            with torch.no_grad():
+                for features, _, labels in tqdm(test_loader):
+                    features = features.to(device)
+                    logits = global_model.normalization(global_model.cbl(global_model.backbone(features)))
+                    test_feats.append(logits.cpu())
+                    test_labels.append(labels)
+            test_feats = torch.cat(test_feats, dim=0)
+            test_labels = torch.cat(test_labels, dim=0)
+            test_concept_loader = DataLoader(
+                TensorDataset(test_feats, test_labels),
+                batch_size=getattr(args, "saga_batch_size", 512),
+                shuffle=False,
+            )
+            nec_measure_level = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
+            path, truncated_weights, _ = measure_acc(
+                num_concepts, num_classes, len(train_concept_loader.dataset),
+                train_concept_loader, val_concept_loader, test_concept_loader,
+                saga_step_size=getattr(args, "saga_step_size", 0.1),
+                saga_n_iters=getattr(args, "saga_n_iters", 2000),
+                device=str(device),
+                max_lam=getattr(args, "nec_lam_max", 0.01),
+                measure_level=nec_measure_level,
+            )
+            sparsity_list = [(p["weight"].abs() > 1e-5).float().mean().item() for p in path]
+            nec_col = [num_concepts * s for s in sparsity_list]
+            acc_col = [p["metrics"]["acc_test"] for p in path]
+            pd.DataFrame({"NEC": nec_col, "Accuracy": acc_col}).to_csv(os.path.join(save_dir, "metrics.csv"), index=False)
+            for nec_val, (W, b) in truncated_weights.items():
+                torch.save(W, os.path.join(save_dir, f"W_g@NEC={nec_val:d}.pt"))
+                torch.save(b, os.path.join(save_dir, f"b_g@NEC={nec_val:d}.pt"))
+        except Exception as e:
+            print(f"Warning: NEC evaluation failed: {e}")
+            print("Model has already been saved. Continuing...")
 
     training_metrics = {
         "projection_phase": projection_metrics,
