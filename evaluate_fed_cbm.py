@@ -463,6 +463,15 @@ def main():
         "weight_metrics": weight_metrics,
         "confusion_metrics": confusion_metrics
     }
+    # Include training config when present (from new naming / args.txt)
+    if "num_clients" in saved_args:
+        results["num_clients"] = saved_args["num_clients"]
+    if "num_rounds" in saved_args:
+        results["num_rounds"] = saved_args["num_rounds"]
+    if "saga_n_iters" in saved_args:
+        results["saga_n_iters"] = saved_args["saga_n_iters"]
+    if "final_rounds" in saved_args:
+        results["final_rounds"] = saved_args["final_rounds"]
     if per_class_accuracies is not None:
         results["per_class_accuracies"] = per_class_accuracies
     if sparsity_vlg is not None:
