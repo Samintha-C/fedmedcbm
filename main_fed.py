@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset, Subset
+
+from glm_saga.elasticnet import soft_threshold, IndexedTensorDataset, glm_saga
 from tqdm import tqdm
 
 import clip
@@ -358,55 +360,185 @@ def simulate_federated_training(args):
         torch.save(proj_mean, os.path.join(save_dir, "proj_mean.pt"))
         torch.save(proj_std, os.path.join(save_dir, "proj_std.pt"))
     
-    print("\n=== Phase 3: Training Final Layer ===")
-    best_accuracy = 0.0
-    final_layer_metrics = {
-        "rounds": [],
-        "client_losses": [],
-        "avg_client_loss": [],
-        "global_accuracy": [],
-        "best_accuracy": []
-    }
-    
-    for round_num in range(args.final_rounds):
-        print(f"\n=== Final Layer Round {round_num + 1}/{args.final_rounds} ===")
-        
-        round_client_losses = []
-        for client_id in range(args.num_clients):
-            client_models[client_id].load_state_dict(global_model.state_dict())
-            
-            train_loss = train_final_layer_local(
-                client_models[client_id],
-                client_train_loaders[client_id],
-                epochs=args.final_epochs,
-                lr=args.final_lr,
-                device=device
-            )
-            
-            round_client_losses.append(train_loss)
-            print(f"Client {client_id}: Final Layer Loss = {train_loss:.4f}")
-        
-        global_state = federated_averaging(client_models, client_weights)
-        global_model.load_state_dict(global_state)
-        
-        accuracy = evaluate_model(global_model, global_test_loader, device)
-        print(f"Global Test Accuracy: {accuracy:.4f}")
-        
-        avg_loss = sum(round_client_losses) / len(round_client_losses)
-        final_layer_metrics["rounds"].append(round_num + 1)
-        final_layer_metrics["client_losses"].append(round_client_losses)
-        final_layer_metrics["avg_client_loss"].append(avg_loss)
-        final_layer_metrics["global_accuracy"].append(float(accuracy))
-        
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            torch.save(global_model.state_dict(), os.path.join(save_dir, "best_model.pt"))
-        
-        final_layer_metrics["best_accuracy"].append(float(best_accuracy))
-    
+    final_layer_method = getattr(args, 'final_layer_method', 'fedavg')
+
+    if final_layer_method == "hybrid_saga":
+        print("\n=== Phase 3: Hybrid Sparse Final Layer (GLM-SAGA) ===")
+        # Extract normalized concept features from all clients
+        all_concept_features = []
+        all_labels = []
+        global_model.eval()
+        with torch.no_grad():
+            for client_loader in client_train_loaders:
+                for images, labels in client_loader:
+                    images = images.to(device)
+                    features = global_model.backbone(images)
+                    concepts = global_model.projection(features)
+                    concepts_norm = global_model.normalization(concepts)
+                    all_concept_features.append(concepts_norm.cpu())
+                    all_labels.append(labels)
+        all_concept_features = torch.cat(all_concept_features, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        # Val concept features
+        val_concept_features = []
+        val_labels_list = []
+        val_loader_temp = DataLoader(val_dataset, batch_size=args.batch_size,
+                                     shuffle=False, num_workers=args.num_workers)
+        with torch.no_grad():
+            for images, labels in val_loader_temp:
+                images = images.to(device)
+                features = global_model.backbone(images)
+                concepts = global_model.projection(features)
+                concepts_norm = global_model.normalization(concepts)
+                val_concept_features.append(concepts_norm.cpu())
+                val_labels_list.append(labels)
+        val_concept_features = torch.cat(val_concept_features, dim=0)
+        val_labels_all = torch.cat(val_labels_list, dim=0)
+
+        # Create SAGA-compatible data loaders
+        saga_batch_size = getattr(args, 'saga_batch_size', 512)
+        train_ds = IndexedTensorDataset(all_concept_features, all_labels)
+        train_loader_saga = DataLoader(train_ds, batch_size=saga_batch_size, shuffle=True)
+        val_ds = TensorDataset(val_concept_features, val_labels_all)
+        val_loader_saga = DataLoader(val_ds, batch_size=saga_batch_size, shuffle=False)
+
+        # Train sparse final layer with GLM-SAGA
+        final_linear = nn.Linear(num_concepts, num_classes).to(device)
+        final_linear.weight.data.zero_()
+        final_linear.bias.data.zero_()
+
+        saga_lam = getattr(args, 'saga_lam', 0.0007)
+        metadata = {"max_reg": {"nongrouped": saga_lam}}
+        out = glm_saga(
+            final_linear, train_loader_saga,
+            getattr(args, 'saga_step_size', 0.1),
+            getattr(args, 'saga_n_iters', 2000),
+            0.99,
+            epsilon=1, k=1,
+            val_loader=val_loader_saga,
+            do_zero=False,
+            metadata=metadata,
+            n_ex=len(all_concept_features),
+            n_classes=num_classes,
+        )
+
+        # Load sparse weights into the model
+        w = out["path"][0]["weight"]
+        b = out["path"][0]["bias"]
+        global_model.final_layer.linear.weight.data.copy_(w.to(device))
+        global_model.final_layer.linear.bias.data.copy_(b.to(device))
+
+        best_accuracy = evaluate_model(global_model, global_test_loader, device)
+        print(f"Hybrid SAGA Test Accuracy: {best_accuracy:.4f}")
+
+        # Report sparsity
+        nnz = (global_model.final_layer.linear.weight.data.abs() > 1e-5).sum().item()
+        total = global_model.final_layer.linear.weight.data.numel()
+        print(f"Final layer sparsity: {nnz}/{total} non-zero ({nnz/total:.4f})")
+
+        torch.save(global_model.state_dict(), os.path.join(save_dir, "best_model.pt"))
+        final_layer_metrics = {"method": "hybrid_saga", "accuracy": float(best_accuracy),
+                               "sparsity_nnz": nnz, "sparsity_total": total}
+
+    else:
+        # FedAvg or FedAvg-Thresh path
+        print(f"\n=== Phase 3: Training Final Layer ({final_layer_method}) ===")
+        best_accuracy = 0.0
+        final_layer_metrics = {
+            "rounds": [],
+            "client_losses": [],
+            "avg_client_loss": [],
+            "global_accuracy": [],
+            "best_accuracy": [],
+            "method": final_layer_method,
+        }
+        if final_layer_method == "fedavg_thresh":
+            final_layer_metrics["threshold_lam"] = []
+
+        for round_num in range(args.final_rounds):
+            print(f"\n=== Final Layer Round {round_num + 1}/{args.final_rounds} ===")
+
+            round_client_losses = []
+            for client_id in range(args.num_clients):
+                client_models[client_id].load_state_dict(global_model.state_dict())
+
+                train_loss = train_final_layer_local(
+                    client_models[client_id],
+                    client_train_loaders[client_id],
+                    epochs=args.final_epochs,
+                    lr=args.final_lr,
+                    device=device
+                )
+
+                round_client_losses.append(train_loss)
+                print(f"Client {client_id}: Final Layer Loss = {train_loss:.4f}")
+
+            global_state = federated_averaging(client_models, client_weights)
+
+            # Server-side soft thresholding for fedavg_thresh
+            if final_layer_method == "fedavg_thresh":
+                progress = round_num / max(args.final_rounds - 1, 1)
+                lam = args.thresh_lam_start + progress * (args.thresh_lam_end - args.thresh_lam_start)
+                for key in global_state:
+                    if "final_layer" in key and "weight" in key:
+                        global_state[key] = soft_threshold(global_state[key], lam)
+                print(f"  Applied soft_threshold with lam={lam:.6f}")
+                final_layer_metrics["threshold_lam"].append(float(lam))
+
+            global_model.load_state_dict(global_state)
+
+            accuracy = evaluate_model(global_model, global_test_loader, device)
+            print(f"Global Test Accuracy: {accuracy:.4f}")
+
+            avg_loss = sum(round_client_losses) / len(round_client_losses)
+            final_layer_metrics["rounds"].append(round_num + 1)
+            final_layer_metrics["client_losses"].append(round_client_losses)
+            final_layer_metrics["avg_client_loss"].append(avg_loss)
+            final_layer_metrics["global_accuracy"].append(float(accuracy))
+
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                torch.save(global_model.state_dict(), os.path.join(save_dir, "best_model.pt"))
+
+            final_layer_metrics["best_accuracy"].append(float(best_accuracy))
+
+        # Report sparsity for thresh method
+        if final_layer_method == "fedavg_thresh":
+            nnz = (global_model.final_layer.linear.weight.data.abs() > 1e-5).sum().item()
+            total = global_model.final_layer.linear.weight.data.numel()
+            print(f"Final layer sparsity: {nnz}/{total} non-zero ({nnz/total:.4f})")
+            final_layer_metrics["sparsity_nnz"] = nnz
+            final_layer_metrics["sparsity_total"] = total
+            final_layer_metrics["sparsity_pct_nonzero"] = nnz / total
+
     print(f"\nBest Accuracy: {best_accuracy:.4f}")
     torch.save(global_model.state_dict(), os.path.join(save_dir, "final_model.pt"))
-    
+
+    # Save metrics.txt (consistent with VLG format)
+    weight_data = global_model.final_layer.linear.weight.data
+    sparsity_lfc = {
+        "Non-zero weights": int((weight_data.abs() > 1e-5).sum().item()),
+        "Total weights": int(weight_data.numel()),
+        "Percentage non-zero": float((weight_data.abs() > 1e-5).float().mean().item()),
+    }
+    lfc_metrics_txt = {
+        "final_layer_method": final_layer_method,
+        "metrics": {"test_accuracy": float(best_accuracy)},
+        "sparsity": sparsity_lfc,
+    }
+    if final_layer_method == "hybrid_saga":
+        lfc_metrics_txt["saga_lam"] = getattr(args, "saga_lam", 0.0007)
+    elif final_layer_method == "fedavg_thresh":
+        lfc_metrics_txt["thresh_lam_start"] = args.thresh_lam_start
+        lfc_metrics_txt["thresh_lam_end"] = args.thresh_lam_end
+    lfc_metrics_txt["lr"] = args.final_lr
+    try:
+        with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
+            json.dump(lfc_metrics_txt, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to save metrics.txt: {e}")
+
     training_metrics = {
         "projection_phase": projection_metrics,
         "final_layer_phase": final_layer_metrics,
@@ -417,7 +549,8 @@ def simulate_federated_training(args):
         "client_weights": client_weights,
         "iid": args.iid,
         "alpha": args.alpha if not args.iid else None,
-        "best_final_accuracy": float(best_accuracy)
+        "best_final_accuracy": float(best_accuracy),
+        "final_layer_method": final_layer_method,
     }
     
     with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
@@ -556,9 +689,10 @@ def simulate_federated_training_vlg(args):
         projection_metrics["best_val_loss"].append(best_val_loss)
         print(f"Round {round_num + 1} avg val loss: {avg_loss:.4f}")
 
+    # Use num_workers=0 for Phase 2 to avoid OOM (worker processes duplicate dataset in memory)
     full_train_cbl_loader = DataLoader(
         base_cbl_dataset, batch_size=getattr(args, "saga_batch_size", 512),
-        shuffle=True, num_workers=args.num_workers
+        shuffle=True, num_workers=0
     )
     print("\n=== Phase 2: Final-layer dataset and normalization ===")
     train_concept_loader, val_concept_loader, norm_layer = get_final_layer_dataset(
@@ -568,26 +702,170 @@ def simulate_federated_training_vlg(args):
     )
     global_model.normalization = norm_layer
 
-    print("\n=== Phase 3: Final layer (sparse GLM-SAGA or dense) ===")
-    final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
-    if getattr(args, "dense", False):
-        out = train_dense_final(
-            final_layer, train_concept_loader, val_concept_loader,
-            n_iters=getattr(args, "saga_n_iters", 2000), lr=getattr(args, "dense_lr", 0.001), device=str(device)
+    vlg_final_method = args.final_layer_method
+    if vlg_final_method in ("hybrid_saga", "fedavg"):
+        print(f"\n=== Phase 3: Final layer (sparse GLM-SAGA or dense) ===")
+        final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+        if getattr(args, "dense", False) or vlg_final_method == "fedavg":
+            out = train_dense_final(
+                final_layer, train_concept_loader, val_concept_loader,
+                n_iters=getattr(args, "saga_n_iters", 2000), lr=getattr(args, "dense_lr", 0.001), device=str(device)
+            )
+        else:
+            out = train_sparse_final(
+                final_layer, train_concept_loader, val_concept_loader,
+                n_iters=getattr(args, "saga_n_iters", 2000), lam=getattr(args, "saga_lam", 0.0007),
+                step_size=getattr(args, "saga_step_size", 0.1), device=str(device)
+            )
+        w = out["path"][0]["weight"] if out.get("path") else out.get("best", {}).get("weight")
+        b = out["path"][0]["bias"] if out.get("path") else out.get("best", {}).get("bias")
+        if w is not None:
+            final_layer.weight.data.copy_(w.to(device))
+        if b is not None:
+            final_layer.bias.data.copy_(b.to(device))
+        global_model.final_layer = final_layer
+
+        # Record final layer phase metrics for centralized methods
+        nnz_central = int((final_layer.weight.data.abs() > 1e-5).sum().item())
+        total_central = int(final_layer.weight.data.numel())
+        vlg_central_metrics = {
+            "method": vlg_final_method,
+            "sparsity_nnz": nnz_central,
+            "sparsity_total": total_central,
+            "sparsity_pct_nonzero": nnz_central / total_central,
+        }
+        if vlg_final_method == "hybrid_saga":
+            vlg_central_metrics["saga_lam"] = getattr(args, "saga_lam", 0.0007)
+            vlg_central_metrics["saga_n_iters"] = getattr(args, "saga_n_iters", 2000)
+        else:
+            vlg_central_metrics["dense_lr"] = getattr(args, "dense_lr", 0.001)
+        # Extract val accuracy from SAGA output if available
+        if out.get("path") and out["path"][0].get("metrics"):
+            vlg_central_metrics["val_metrics"] = {
+                k: float(v) if isinstance(v, (int, float)) else v
+                for k, v in out["path"][0]["metrics"].items()
+            }
+        print(f"Final layer sparsity: {nnz_central}/{total_central} non-zero ({nnz_central/total_central:.4f})")
+
+    elif vlg_final_method == "fedavg_thresh":
+        print("\n=== Phase 3: Federated Final Layer with Thresholding (VLG) ===")
+        # Extract per-client normalized concept features
+        client_concept_loaders = []
+        for i in range(args.num_clients):
+            client_feats, client_labels = [], []
+            with torch.no_grad():
+                for features, _, labels in client_train_loaders[i]:
+                    features = features.to(device)
+                    logits = norm_layer(global_model.cbl(global_model.backbone(features)))
+                    client_feats.append(logits.cpu())
+                    client_labels.append(labels)
+            client_feats = torch.cat(client_feats, dim=0)
+            client_labels = torch.cat(client_labels, dim=0)
+            client_concept_loaders.append(DataLoader(
+                TensorDataset(client_feats, client_labels),
+                batch_size=getattr(args, "saga_batch_size", 512), shuffle=True
+            ))
+
+        # Val concept features for evaluation
+        val_feats, val_labels_list = [], []
+        with torch.no_grad():
+            for features, _, labels in val_cbl_loader:
+                features = features.to(device)
+                logits = norm_layer(global_model.cbl(global_model.backbone(features)))
+                val_feats.append(logits.cpu())
+                val_labels_list.append(labels)
+        val_feats = torch.cat(val_feats, dim=0)
+        val_labels_all = torch.cat(val_labels_list, dim=0)
+        vlg_val_loader = DataLoader(
+            TensorDataset(val_feats, val_labels_all),
+            batch_size=getattr(args, "saga_batch_size", 512), shuffle=False
         )
-    else:
-        out = train_sparse_final(
-            final_layer, train_concept_loader, val_concept_loader,
-            n_iters=getattr(args, "saga_n_iters", 2000), lam=getattr(args, "saga_lam", 0.0007),
-            step_size=getattr(args, "saga_step_size", 0.1), device=str(device)
-        )
-    w = out["path"][0]["weight"] if out.get("path") else out.get("best", {}).get("weight")
-    b = out["path"][0]["bias"] if out.get("path") else out.get("best", {}).get("bias")
-    if w is not None:
-        final_layer.weight.data.copy_(w.to(device))
-    if b is not None:
-        final_layer.bias.data.copy_(b.to(device))
-    global_model.final_layer = final_layer
+
+        # Initialize global and client final layers
+        final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+        client_final_layers = [FinalLayer(num_concepts, num_classes, device=str(device))
+                               for _ in range(args.num_clients)]
+        ce_loss = nn.CrossEntropyLoss()
+
+        final_rounds = getattr(args, "final_rounds", 5)
+        final_epochs = getattr(args, "final_epochs", 3)
+        final_lr = getattr(args, "final_lr", 1e-3)
+
+        thresh_metrics = {
+            "rounds": [], "client_losses": [], "avg_client_loss": [],
+            "val_accuracy": [], "best_val_accuracy": [], "threshold_lam": [],
+        }
+        best_val_acc = 0.0
+        for round_num in range(final_rounds):
+            print(f"\n=== VLG Final Layer Round {round_num + 1}/{final_rounds} ===")
+            round_losses = []
+            for i in range(args.num_clients):
+                # Sync client with global
+                client_final_layers[i].load_state_dict(final_layer.state_dict())
+                client_final_layers[i].train()
+                opt = torch.optim.Adam(client_final_layers[i].parameters(), lr=final_lr)
+                epoch_loss = 0.0
+                n_batches = 0
+                for epoch in range(final_epochs):
+                    for feats, labels in client_concept_loaders[i]:
+                        feats, labels = feats.to(device), labels.to(device)
+                        loss = ce_loss(client_final_layers[i](feats), labels)
+                        opt.zero_grad()
+                        loss.backward()
+                        opt.step()
+                        epoch_loss += loss.item()
+                        n_batches += 1
+                round_losses.append(epoch_loss / max(n_batches, 1))
+                print(f"  Client {i}: Loss = {round_losses[-1]:.4f}")
+
+            # Aggregate final layers
+            global_fl_state = {}
+            for key in final_layer.state_dict().keys():
+                param = client_final_layers[0].state_dict()[key]
+                if param.dtype.is_floating_point:
+                    global_fl_state[key] = torch.zeros_like(param)
+                    for i in range(args.num_clients):
+                        global_fl_state[key] += client_weights[i] * client_final_layers[i].state_dict()[key]
+                else:
+                    global_fl_state[key] = param.clone()
+
+            # Server-side soft thresholding
+            progress = round_num / max(final_rounds - 1, 1)
+            lam = args.thresh_lam_start + progress * (args.thresh_lam_end - args.thresh_lam_start)
+            for key in global_fl_state:
+                if "weight" in key:
+                    global_fl_state[key] = soft_threshold(global_fl_state[key], lam)
+            print(f"  Applied soft_threshold with lam={lam:.6f}")
+
+            final_layer.load_state_dict(global_fl_state)
+
+            # Evaluate
+            final_layer.eval()
+            correct, total_eval = 0, 0
+            with torch.no_grad():
+                for feats, labels in vlg_val_loader:
+                    feats, labels = feats.to(device), labels.to(device)
+                    preds = final_layer(feats).argmax(dim=1)
+                    correct += (preds == labels).sum().item()
+                    total_eval += labels.size(0)
+            val_acc = correct / total_eval
+            print(f"  Val Accuracy: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+
+            thresh_metrics["rounds"].append(round_num + 1)
+            thresh_metrics["client_losses"].append(round_losses)
+            thresh_metrics["avg_client_loss"].append(sum(round_losses) / len(round_losses))
+            thresh_metrics["val_accuracy"].append(float(val_acc))
+            thresh_metrics["best_val_accuracy"].append(float(best_val_acc))
+            thresh_metrics["threshold_lam"].append(float(lam))
+
+        global_model.final_layer = final_layer
+
+        # Report sparsity
+        nnz = (final_layer.weight.data.abs() > 1e-5).sum().item()
+        total_w = final_layer.weight.data.numel()
+        print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
     test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
     print(f"Test accuracy: {test_acc:.4f}")
@@ -607,10 +885,30 @@ def simulate_federated_training_vlg(args):
     except Exception as e:
         print(f"Warning: Failed to compute per-class accuracy: {e}")
     
-    sparsity_vlg = {"Non-zero weights": (global_model.final_layer.weight.data.abs() > 1e-5).sum().item(), "Total weights": global_model.final_layer.weight.data.numel(), "Percentage non-zero": (global_model.final_layer.weight.data.abs() > 1e-5).float().mean().item()}
+    sparsity_vlg = {
+        "Non-zero weights": int((global_model.final_layer.weight.data.abs() > 1e-5).sum().item()),
+        "Total weights": int(global_model.final_layer.weight.data.numel()),
+        "Percentage non-zero": float((global_model.final_layer.weight.data.abs() > 1e-5).float().mean().item()),
+    }
+    metrics_txt_data = {
+        "final_layer_method": vlg_final_method,
+        "per_class_accuracies": pca,
+        "metrics": {"test_accuracy": float(test_acc)},
+        "sparsity": sparsity_vlg,
+    }
+    if vlg_final_method == "hybrid_saga":
+        metrics_txt_data["saga_lam"] = getattr(args, "saga_lam", 0.0007)
+        metrics_txt_data["saga_n_iters"] = getattr(args, "saga_n_iters", 2000)
+    elif vlg_final_method == "fedavg":
+        metrics_txt_data["dense_lr"] = getattr(args, "dense_lr", 0.001)
+    elif vlg_final_method == "fedavg_thresh":
+        metrics_txt_data["thresh_lam_start"] = args.thresh_lam_start
+        metrics_txt_data["thresh_lam_end"] = args.thresh_lam_end
+        metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
+        metrics_txt_data["final_lr"] = getattr(args, "final_lr", 1e-3)
     try:
         with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
-            json.dump({"per_class_accuracies": pca, "lam": getattr(args, "saga_lam", -1.0), "lr": getattr(args, "dense_lr", -1.0), "alpha": -1.0, "time": -1.0, "metrics": {"test_accuracy": float(test_acc)}, "sparsity": sparsity_vlg}, f, indent=2)
+            json.dump(metrics_txt_data, f, indent=2)
     except Exception as e:
         print(f"Warning: Failed to save metrics.txt: {e}")
 
@@ -659,12 +957,19 @@ def simulate_federated_training_vlg(args):
         "projection_phase": projection_metrics,
         "num_clients": args.num_clients,
         "num_rounds": args.num_rounds,
+        "final_rounds": getattr(args, "final_rounds", None),
+        "final_epochs": getattr(args, "final_epochs", None),
         "client_data_sizes": client_data_sizes,
         "client_weights": client_weights,
         "iid": args.iid,
         "alpha": args.alpha if not args.iid else None,
         "best_final_accuracy": float(test_acc),
+        "final_layer_method": vlg_final_method,
     }
+    if vlg_final_method == "fedavg_thresh":
+        training_metrics["final_layer_phase"] = thresh_metrics
+    elif vlg_final_method in ("hybrid_saga", "fedavg"):
+        training_metrics["final_layer_phase"] = vlg_central_metrics
     with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
         json.dump(training_metrics, f, indent=2)
     print(f"Saved to {save_dir}")
@@ -696,6 +1001,16 @@ def main():
     parser.add_argument("--proj_hidden_layers", type=int, default=0, help="Hidden layers in projection")
     parser.add_argument("--final_rounds", type=int, default=5, help="Number of rounds for final layer training")
     parser.add_argument("--final_epochs", type=int, default=3, help="Epochs per round for final layer training")
+    parser.add_argument("--final_layer_method", type=str, default=None,
+        choices=["fedavg", "fedavg_thresh", "hybrid_saga"],
+        help="Final layer training method: fedavg (dense FedAvg for LFC, dense centralized for VLG), "
+             "fedavg_thresh (FedAvg + server-side thresholding), "
+             "hybrid_saga (federated feature extraction + centralized GLM-SAGA). "
+             "Default: fedavg for LFC, hybrid_saga for VLG")
+    parser.add_argument("--thresh_lam_start", type=float, default=1e-4,
+        help="Starting threshold for fedavg_thresh (small = less pruning)")
+    parser.add_argument("--thresh_lam_end", type=float, default=1e-2,
+        help="Ending threshold for fedavg_thresh (large = more pruning)")
     
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -736,6 +1051,9 @@ def main():
     args.run_nec_eval = not getattr(args, "no_nec_eval", False)
     nm = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
     args.nec_measure_level = tuple(int(x) for x in (nm.split(",") if isinstance(nm, str) else nm))
+    # Set default final_layer_method based on variant
+    if args.final_layer_method is None:
+        args.final_layer_method = "hybrid_saga" if getattr(args, "use_vlg", False) else "fedavg"
     if getattr(args, "use_vlg", False):
         simulate_federated_training_vlg(args)
     else:
