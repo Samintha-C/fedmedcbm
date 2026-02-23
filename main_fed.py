@@ -661,6 +661,11 @@ def simulate_federated_training_vlg(args):
     concept_counts = []
     for c in range(num_classes):
         concept_counts.extend([class_counts[c]] * per_class_concepts)
+    # Pad orphan concepts (when num_concepts % num_classes != 0) with the
+    # uniform-approximation count so pos_weight length matches num_concepts.
+    orphan_count = num_train // num_classes
+    while len(concept_counts) < num_concepts:
+        concept_counts.append(orphan_count)
     loss_fn = get_loss_vlg(
         getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
         getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),

@@ -163,6 +163,11 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
                 with torch.no_grad():
                     embeddings = backbone(features)
             concept_logits = cbl(embeddings)
+            if concept_logits.shape[1] != concept_one_hot.shape[1]:
+                raise RuntimeError(
+                    f"CBL output size ({concept_logits.shape[1]}) must match concept target size ({concept_one_hot.shape[1]}). "
+                    "Ensure num_concepts = len(concepts) when building the CBL and the same concept list is used for the dataset."
+                )
             loss = loss_fn(concept_logits, concept_one_hot)
             opt.zero_grad()
             loss.backward()
