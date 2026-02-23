@@ -61,14 +61,19 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def federated_averaging(models, client_weights=None):
+def federated_averaging(models, client_weights=None, exclude_prefixes=None):
     if client_weights is None:
         client_weights = [1.0 / len(models)] * len(models)
-    
+
     global_state = {}
     for key in models[0].state_dict().keys():
         param = models[0].state_dict()[key]
-        
+
+        # Skip frozen parameters (e.g. backbone) — just copy from first model
+        if exclude_prefixes and any(key.startswith(p) for p in exclude_prefixes):
+            global_state[key] = param.clone()
+            continue
+
         # Only average float parameters (weights, biases)
         # For non-float parameters (Long tensors like batch norm counts), copy from first model
         if param.dtype.is_floating_point:
@@ -78,7 +83,7 @@ def federated_averaging(models, client_weights=None):
         else:
             # For non-float parameters, just copy from first model
             global_state[key] = param.clone()
-    
+
     return global_state
 
 
@@ -324,9 +329,9 @@ def simulate_federated_training(args):
             round_client_losses.append(train_loss)
             print(f"Client {client_id}: Train Loss = {train_loss:.4f}")
         
-        global_state = federated_averaging(client_models, client_weights)
+        global_state = federated_averaging(client_models, client_weights, exclude_prefixes=["backbone."])
         global_model.load_state_dict(global_state)
-        
+
         avg_loss = sum(round_client_losses) / len(round_client_losses)
         projection_metrics["rounds"].append(round_num + 1)
         projection_metrics["client_losses"].append(round_client_losses)
@@ -474,7 +479,7 @@ def simulate_federated_training(args):
                 round_client_losses.append(train_loss)
                 print(f"Client {client_id}: Final Layer Loss = {train_loss:.4f}")
 
-            global_state = federated_averaging(client_models, client_weights)
+            global_state = federated_averaging(client_models, client_weights, exclude_prefixes=["backbone."])
 
             # Server-side soft thresholding for fedavg_thresh
             if final_layer_method == "fedavg_thresh":
@@ -648,7 +653,14 @@ def simulate_federated_training_vlg(args):
     )
 
     num_train = len(base_cbl_dataset)
-    concept_counts = [num_train // num_classes] * num_concepts
+    per_class_concepts = num_concepts // num_classes
+    class_counts = [0] * num_classes
+    for idx in range(len(train_dataset)):
+        _, label = train_dataset[idx]
+        class_counts[label] += 1
+    concept_counts = []
+    for c in range(num_classes):
+        concept_counts.extend([class_counts[c]] * per_class_concepts)
     loss_fn = get_loss_vlg(
         getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
         getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
@@ -662,45 +674,119 @@ def simulate_federated_training_vlg(args):
     print("\n=== Phase 1: Federated CBL training ===")
     projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
     best_val_loss = float("inf")
+    best_cbl_state = None
+    cbl_finetune = getattr(args, "cbl_finetune", False)
+    # Only exclude backbone from aggregation when it is frozen (not being finetuned).
+    # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
+    cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
     for round_num in range(args.num_rounds):
         round_losses = []
         for i in range(args.num_clients):
             client_models[i].load_state_dict(global_model.state_dict())
-            _, _ = train_cbl(
+            client_train_loss = train_cbl(
                 client_models[i].backbone, client_models[i].cbl,
-                client_train_loaders[i], val_cbl_loader,
+                client_train_loaders[i],
                 epochs=getattr(args, "cbl_epochs", args.local_epochs),
                 loss_fn=loss_fn, lr=getattr(args, "cbl_lr", args.lr),
                 weight_decay=args.weight_decay, device=str(device),
-                finetune=getattr(args, "cbl_finetune", False),
+                finetune=cbl_finetune,
                 optimizer_name=getattr(args, "cbl_optimizer", "adam"),
                 backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
             )
-            vl = validate_cbl(client_models[i].backbone, client_models[i].cbl, val_cbl_loader, loss_fn, str(device))
-            round_losses.append(vl)
-        global_state = federated_averaging(client_models, client_weights)
+            round_losses.append(client_train_loss)
+        global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
         global_model.load_state_dict(global_state)
-        avg_loss = sum(round_losses) / len(round_losses)
+        avg_train_loss = sum(round_losses) / len(round_losses)
+        # Server-side validation on aggregated model
+        server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
         projection_metrics["rounds"].append(round_num + 1)
         projection_metrics["client_losses"].append(round_losses)
-        projection_metrics["avg_client_loss"].append(avg_loss)
-        if avg_loss < best_val_loss:
-            best_val_loss = avg_loss
+        projection_metrics["avg_client_loss"].append(avg_train_loss)
+        if server_val_loss < best_val_loss:
+            best_val_loss = server_val_loss
+            best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
         projection_metrics["best_val_loss"].append(best_val_loss)
-        print(f"Round {round_num + 1} avg val loss: {avg_loss:.4f}")
+        print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
 
-    # Use num_workers=0 for Phase 2 to avoid OOM (worker processes duplicate dataset in memory)
-    full_train_cbl_loader = DataLoader(
-        base_cbl_dataset, batch_size=getattr(args, "saga_batch_size", 512),
-        shuffle=True, num_workers=0
-    )
-    print("\n=== Phase 2: Final-layer dataset and normalization ===")
-    train_concept_loader, val_concept_loader, norm_layer = get_final_layer_dataset(
-        global_model.backbone, global_model.cbl,
-        full_train_cbl_loader, val_cbl_loader,
-        save_dir, load_dir=None, batch_size=getattr(args, "saga_batch_size", 512), device=str(device)
-    )
+    # Restore the best CBL checkpoint (by server val loss) before Phase 2
+    if best_cbl_state is not None:
+        global_model.load_state_dict(best_cbl_state)
+        print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
+
+    print("\n=== Phase 2: Federated normalization and concept feature extraction ===")
+    saga_bs = getattr(args, "saga_batch_size", 512)
+
+    # Step 2a: Each client computes local concept feature statistics (mean, var, count)
+    # Server aggregates via parallel statistics formula — no raw data leaves clients
+    client_sums = []
+    client_sq_sums = []
+    client_counts = []
+    global_model.eval()
+    with torch.no_grad():
+        for i in range(args.num_clients):
+            local_sum = torch.zeros(num_concepts)
+            local_sq_sum = torch.zeros(num_concepts)
+            local_n = 0
+            for features, _, _ in client_train_loaders[i]:
+                features = features.to(device)
+                logits = global_model.cbl(global_model.backbone(features)).cpu()
+                local_sum += logits.sum(dim=0)
+                local_sq_sum += (logits ** 2).sum(dim=0)
+                local_n += logits.size(0)
+            client_sums.append(local_sum)
+            client_sq_sums.append(local_sq_sum)
+            client_counts.append(local_n)
+
+    # Server aggregates statistics
+    total_n = sum(client_counts)
+    global_sum = sum(client_sums)
+    global_sq_sum = sum(client_sq_sums)
+    global_mean = global_sum / total_n
+    global_var = (global_sq_sum / total_n) - (global_mean ** 2)
+    global_std = global_var.clamp(min=1e-8).sqrt()
+
+    norm_layer = NormalizationLayer(global_mean, global_std, device=str(device))
     global_model.normalization = norm_layer
+
+    # Step 2b: Extract normalized concept features for centralized methods and NEC eval
+    # (hybrid_saga/fedavg need pooled features; fedavg_thresh extracts per-client features in Phase 3)
+    all_train_feats, all_train_labels = [], []
+    with torch.no_grad():
+        for i in range(args.num_clients):
+            for features, _, labels in client_train_loaders[i]:
+                features = features.to(device)
+                logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+                all_train_feats.append(logits)
+                all_train_labels.append(labels)
+    all_train_feats = torch.cat(all_train_feats, dim=0)
+    all_train_labels = torch.cat(all_train_labels, dim=0)
+
+    val_feats, val_labels_all = [], []
+    with torch.no_grad():
+        for features, _, labels in val_cbl_loader:
+            features = features.to(device)
+            logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+            val_feats.append(logits)
+            val_labels_all.append(labels)
+    val_feats = torch.cat(val_feats, dim=0)
+    val_labels_all = torch.cat(val_labels_all, dim=0)
+
+    # Save concept features for reproducibility
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(all_train_feats, os.path.join(save_dir, "train_concept_features.pt"))
+    torch.save(all_train_labels, os.path.join(save_dir, "train_concept_labels.pt"))
+    torch.save(val_feats, os.path.join(save_dir, "val_concept_features.pt"))
+    torch.save(val_labels_all, os.path.join(save_dir, "val_concept_labels.pt"))
+    norm_layer.save_model(save_dir)
+
+    train_concept_loader = DataLoader(
+        IndexedTensorDataset(all_train_feats, all_train_labels),
+        batch_size=saga_bs, shuffle=True
+    )
+    val_concept_loader = DataLoader(
+        TensorDataset(val_feats, val_labels_all),
+        batch_size=saga_bs, shuffle=False
+    )
 
     vlg_final_method = args.final_layer_method
     if vlg_final_method in ("hybrid_saga", "fedavg"):
@@ -766,20 +852,30 @@ def simulate_federated_training_vlg(args):
                 batch_size=getattr(args, "saga_batch_size", 512), shuffle=True
             ))
 
-        # Val concept features for evaluation
-        val_feats, val_labels_list = [], []
-        with torch.no_grad():
-            for features, _, labels in val_cbl_loader:
-                features = features.to(device)
-                logits = norm_layer(global_model.cbl(global_model.backbone(features)))
-                val_feats.append(logits.cpu())
-                val_labels_list.append(labels)
-        val_feats = torch.cat(val_feats, dim=0)
-        val_labels_all = torch.cat(val_labels_list, dim=0)
-        vlg_val_loader = DataLoader(
-            TensorDataset(val_feats, val_labels_all),
-            batch_size=getattr(args, "saga_batch_size", 512), shuffle=False
+        # Per-client val concept features (federated — each client validates on its own split)
+        val_indices = split_dataset_for_federated(
+            val_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
         )
+        client_val_concept_loaders = []
+        client_val_sizes = []
+        for i in range(args.num_clients):
+            val_sub = Subset(val_cbl_dataset, val_indices[i])
+            v_feats, v_labels = [], []
+            with torch.no_grad():
+                for features, _, labels in DataLoader(val_sub, batch_size=saga_bs, shuffle=False):
+                    features = features.to(device)
+                    logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+                    v_feats.append(logits)
+                    v_labels.append(labels)
+            v_feats = torch.cat(v_feats, dim=0)
+            v_labels = torch.cat(v_labels, dim=0)
+            client_val_concept_loaders.append(DataLoader(
+                TensorDataset(v_feats, v_labels),
+                batch_size=saga_bs, shuffle=False
+            ))
+            client_val_sizes.append(len(val_sub))
+        total_val = sum(client_val_sizes)
+        client_val_weights = [n / total_val for n in client_val_sizes]
 
         # Initialize global and client final layers
         final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
@@ -796,6 +892,7 @@ def simulate_federated_training_vlg(args):
             "val_accuracy": [], "best_val_accuracy": [], "threshold_lam": [],
         }
         best_val_acc = 0.0
+        best_fl_state = None
         for round_num in range(final_rounds):
             print(f"\n=== VLG Final Layer Round {round_num + 1}/{final_rounds} ===")
             round_losses = []
@@ -839,19 +936,22 @@ def simulate_federated_training_vlg(args):
 
             final_layer.load_state_dict(global_fl_state)
 
-            # Evaluate
+            # Federated evaluation: each client evaluates on its own val split
             final_layer.eval()
-            correct, total_eval = 0, 0
+            val_acc = 0.0
             with torch.no_grad():
-                for feats, labels in vlg_val_loader:
-                    feats, labels = feats.to(device), labels.to(device)
-                    preds = final_layer(feats).argmax(dim=1)
-                    correct += (preds == labels).sum().item()
-                    total_eval += labels.size(0)
-            val_acc = correct / total_eval
+                for i in range(args.num_clients):
+                    client_correct, client_total = 0, 0
+                    for feats, labels in client_val_concept_loaders[i]:
+                        feats, labels = feats.to(device), labels.to(device)
+                        preds = final_layer(feats).argmax(dim=1)
+                        client_correct += (preds == labels).sum().item()
+                        client_total += labels.size(0)
+                    val_acc += client_val_weights[i] * (client_correct / max(client_total, 1))
             print(f"  Val Accuracy: {val_acc:.4f}")
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                best_fl_state = {k: v.clone() for k, v in final_layer.state_dict().items()}
 
             thresh_metrics["rounds"].append(round_num + 1)
             thresh_metrics["client_losses"].append(round_losses)
@@ -860,6 +960,8 @@ def simulate_federated_training_vlg(args):
             thresh_metrics["best_val_accuracy"].append(float(best_val_acc))
             thresh_metrics["threshold_lam"].append(float(lam))
 
+        if best_fl_state is not None:
+            final_layer.load_state_dict(best_fl_state)
         global_model.final_layer = final_layer
 
         # Report sparsity
