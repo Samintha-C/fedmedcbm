@@ -840,45 +840,37 @@ def simulate_federated_training_vlg(args):
 
     elif vlg_final_method == "fedavg_thresh":
         print("\n=== Phase 3: Federated Final Layer with Thresholding (VLG) ===")
-        # Extract per-client normalized concept features
+        # Reuse the normalized concept features already extracted in Phase 2.
+        # all_train_feats was built by iterating clients in order 0..N, so slicing
+        # by client_data_sizes recovers each client's block without a second backbone pass.
         client_concept_loaders = []
+        offset = 0
         for i in range(args.num_clients):
-            client_feats, client_labels = [], []
-            with torch.no_grad():
-                for features, _, labels in client_train_loaders[i]:
-                    features = features.to(device)
-                    logits = norm_layer(global_model.cbl(global_model.backbone(features)))
-                    client_feats.append(logits.cpu())
-                    client_labels.append(labels)
-            client_feats = torch.cat(client_feats, dim=0)
-            client_labels = torch.cat(client_labels, dim=0)
+            n = client_data_sizes[i]
+            c_feats = all_train_feats[offset:offset + n]
+            c_labels = all_train_labels[offset:offset + n]
+            offset += n
             client_concept_loaders.append(DataLoader(
-                TensorDataset(client_feats, client_labels),
-                batch_size=getattr(args, "saga_batch_size", 512), shuffle=True
+                TensorDataset(c_feats, c_labels),
+                batch_size=saga_bs, shuffle=True
             ))
 
-        # Per-client val concept features (federated — each client validates on its own split)
+        # Per-client val concept features: index into the already-extracted val_feats
+        # using the same federated split indices — no second backbone pass needed.
         val_indices = split_dataset_for_federated(
             val_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
         )
         client_val_concept_loaders = []
         client_val_sizes = []
         for i in range(args.num_clients):
-            val_sub = Subset(val_cbl_dataset, val_indices[i])
-            v_feats, v_labels = [], []
-            with torch.no_grad():
-                for features, _, labels in DataLoader(val_sub, batch_size=saga_bs, shuffle=False):
-                    features = features.to(device)
-                    logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
-                    v_feats.append(logits)
-                    v_labels.append(labels)
-            v_feats = torch.cat(v_feats, dim=0)
-            v_labels = torch.cat(v_labels, dim=0)
+            idx = torch.tensor(val_indices[i], dtype=torch.long)
+            v_feats = val_feats[idx]
+            v_labels = val_labels_all[idx]
             client_val_concept_loaders.append(DataLoader(
                 TensorDataset(v_feats, v_labels),
                 batch_size=saga_bs, shuffle=False
             ))
-            client_val_sizes.append(len(val_sub))
+            client_val_sizes.append(len(idx))
         total_val = sum(client_val_sizes)
         client_val_weights = [n / total_val for n in client_val_sizes]
 
