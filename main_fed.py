@@ -566,6 +566,7 @@ def simulate_federated_training(args):
 
 def simulate_federated_training_vlg(args):
     import copy
+    import gc
     _loss_vlg_spec = importlib.util.spec_from_file_location("fed_loss_vlg", os.path.join(current_dir, "utils", "loss_vlg.py"))
     _loss_vlg_mod = importlib.util.module_from_spec(_loss_vlg_spec)
     _loss_vlg_spec.loader.exec_module(_loss_vlg_mod)
@@ -576,6 +577,14 @@ def simulate_federated_training_vlg(args):
         Backbone, BackboneCLIP, ConceptLayer, NormalizationLayer, FinalLayer, FedVLGCBM,
         train_cbl, validate_cbl, get_final_layer_dataset, train_sparse_final, train_dense_final, test_model, per_class_accuracy,
     )
+
+    def _save_progress(save_path, metrics_dict):
+        """Incrementally save training metrics so progress survives crashes."""
+        try:
+            with open(os.path.join(save_path, "training_metrics_progress.json"), "w") as _f:
+                json.dump(metrics_dict, _f, indent=2)
+        except Exception:
+            pass  # best-effort; don't crash training for a log write
 
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -712,6 +721,7 @@ def simulate_federated_training_vlg(args):
             best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
         projection_metrics["best_val_loss"].append(best_val_loss)
         print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
+        _save_progress(save_dir, {"phase": "cbl_training", "projection_phase": projection_metrics})
 
     # Restore the best CBL checkpoint (by server val loss) before Phase 2
     if best_cbl_state is not None:
@@ -792,6 +802,16 @@ def simulate_federated_training_vlg(args):
         TensorDataset(val_feats, val_labels_all),
         batch_size=saga_bs, shuffle=False
     )
+
+    # Free objects no longer needed after feature extraction.
+    # The backbone, client models, and raw image datasets/loaders were only required for
+    # Phases 1-2.  Releasing them before Phase 3 prevents OOM during final layer training.
+    del client_models, client_train_loaders, base_cbl_dataset, val_cbl_dataset, val_cbl_loader
+    del full_train_dataset, train_dataset, val_dataset
+    global_model.backbone.cpu()          # move backbone off GPU — only needed again for test_model at the end
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Freed backbone / raw-image objects before Phase 3")
 
     vlg_final_method = args.final_layer_method
     if vlg_final_method in ("hybrid_saga", "fedavg"):
@@ -956,6 +976,11 @@ def simulate_federated_training_vlg(args):
             thresh_metrics["val_accuracy"].append(float(val_acc))
             thresh_metrics["best_val_accuracy"].append(float(best_val_acc))
             thresh_metrics["threshold_lam"].append(float(lam))
+            _save_progress(save_dir, {
+                "phase": "final_layer_fedavg_thresh",
+                "projection_phase": projection_metrics,
+                "final_layer_phase": thresh_metrics,
+            })
 
         if best_fl_state is not None:
             final_layer.load_state_dict(best_fl_state)
@@ -966,6 +991,7 @@ def simulate_federated_training_vlg(args):
         total_w = final_layer.weight.data.numel()
         print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
+    global_model.backbone.to(device)     # move backbone back to GPU for evaluation
     test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
     print(f"Test accuracy: {test_acc:.4f}")
 
