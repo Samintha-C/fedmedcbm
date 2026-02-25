@@ -578,13 +578,43 @@ def simulate_federated_training_vlg(args):
         train_cbl, validate_cbl, get_final_layer_dataset, train_sparse_final, train_dense_final, test_model, per_class_accuracy,
     )
 
-    def _save_progress(save_path, metrics_dict):
-        """Incrementally save training metrics so progress survives crashes."""
+    def _build_run_name(a):
+        """Build a run name like 'p1-c5r10-vlg-cifar100-feb25-14:30'."""
+        now = datetime.datetime.now()
+        date_tag = now.strftime("%b%d-%H:%M").lower()
+        method = (getattr(a, "final_layer_method", None) or "hybrid_saga").replace("_", "")
+        if getattr(a, "phase1_only", False):
+            return f"p1-c{a.num_clients}r{a.num_rounds}-vlg-{a.dataset}-{date_tag}"
+        elif getattr(a, "load_cbl_dir", None) or getattr(a, "load_pretrained_vlg", None):
+            r = getattr(a, "final_rounds", a.num_rounds)
+            return f"c{a.num_clients}r{r}-vlg-{a.dataset}-{method}-{date_tag}"
+        else:
+            return f"c{a.num_clients}r{a.num_rounds}-vlg-{a.dataset}-{method}-{date_tag}"
+
+    def _init_log(log_dir, run_name, is_phase1):
+        """Create structured log file at job start. Returns path or None."""
+        if log_dir is None:
+            return None
+        phase_subdir = "p1" if is_phase1 else "p2"
+        log_path = os.path.join(log_dir, phase_subdir, f"{run_name}.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
         try:
-            with open(os.path.join(save_path, "training_metrics_progress.json"), "w") as _f:
-                json.dump(metrics_dict, _f, indent=2)
+            with open(log_path, "w") as f:
+                json.dump({"run_name": run_name, "started_at": datetime.datetime.now().isoformat(),
+                           "status": "started"}, f, indent=2)
         except Exception:
-            pass  # best-effort; don't crash training for a log write
+            pass
+        return log_path
+
+    def _update_log(log_path, metrics_dict):
+        """Overwrite the structured log file with current metrics."""
+        if log_path is None:
+            return
+        try:
+            with open(log_path, "w") as f:
+                json.dump(metrics_dict, f, indent=2)
+        except Exception:
+            pass
 
     def _log_mem(tag: str = ""):
         """Print GPU and CPU memory usage at the current point in training."""
@@ -605,20 +635,16 @@ def simulate_federated_training_vlg(args):
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     _log_mem("training start")
-    if getattr(args, "phase1_only", False):
-        _run_tag = "cbl"
-        _rounds = args.num_rounds
-    elif getattr(args, "load_cbl_dir", None) or getattr(args, "load_pretrained_vlg", None):
-        _run_tag = getattr(args, "final_layer_method", None) or "hybrid_saga"
-        _rounds = getattr(args, "final_rounds", args.num_rounds)
+    _run_name = _build_run_name(args)
+    _is_phase1 = getattr(args, "phase1_only", False)
+    if _is_phase1:
+        save_dir = os.path.join(args.save_dir, "projection_layers", _run_name)
     else:
-        _run_tag = getattr(args, "final_layer_method", None) or "hybrid_saga"
-        _rounds = args.num_rounds
-    save_dir = os.path.join(
-        args.save_dir,
-        f"c{args.num_clients}r{_rounds}{args.dataset}{_run_tag}"
-    )
+        save_dir = os.path.join(args.save_dir, "fully_trained", _run_name)
     os.makedirs(save_dir, exist_ok=True)
+    _log_path = _init_log(getattr(args, "log_dir", None), _run_name, _is_phase1)
+    print(f"RUN_NAME={_run_name}")
+    print(f"SAVE_DIR={save_dir}")
 
     concepts = data_utils.get_concepts(args.concept_file, getattr(args, "filter_set", None))
     num_concepts = len(concepts)
@@ -819,7 +845,10 @@ def simulate_federated_training_vlg(args):
                     best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
                 projection_metrics["best_val_loss"].append(best_val_loss)
                 print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
-                _save_progress(save_dir, {"phase": "cbl_training", "projection_phase": projection_metrics})
+                _update_log(_log_path, {"status": "in_progress", "phase": "cbl_training",
+                                        "round": round_num + 1, "total_rounds": args.num_rounds,
+                                        "avg_train_loss": avg_train_loss, "server_val_loss": server_val_loss,
+                                        "best_val_loss": best_val_loss})
 
             # Restore the best CBL checkpoint (by server val loss) before Phase 2
             if best_cbl_state is not None:
@@ -834,6 +863,10 @@ def simulate_federated_training_vlg(args):
                 with open(os.path.join(save_dir, "metrics.txt"), "w") as _f:
                     json.dump({"phase1_only": True, "best_val_loss": float(best_val_loss),
                                "num_rounds": args.num_rounds, "num_clients": args.num_clients}, _f, indent=2)
+                _update_log(_log_path, {"status": "completed", "phase": "cbl_training",
+                                        "best_val_loss": float(best_val_loss),
+                                        "num_rounds": args.num_rounds, "num_clients": args.num_clients,
+                                        "completed_at": datetime.datetime.now().isoformat()})
                 print("Phase 1 complete.")
                 return
 
@@ -1133,11 +1166,10 @@ def simulate_federated_training_vlg(args):
             thresh_metrics["val_accuracy"].append(float(val_acc))
             thresh_metrics["best_val_accuracy"].append(float(best_val_acc))
             thresh_metrics["threshold_lam"].append(float(lam))
-            _save_progress(save_dir, {
-                "phase": "final_layer_fedavg_thresh",
-                "projection_phase": projection_metrics,
-                "final_layer_phase": thresh_metrics,
-            })
+            _update_log(_log_path, {"status": "in_progress", "phase": "final_layer_fedavg_thresh",
+                                    "round": round_num + 1, "total_rounds": getattr(args, "final_rounds", 5),
+                                    "val_accuracy": float(val_acc), "best_val_accuracy": float(best_val_acc),
+                                    "threshold_lam": float(lam)})
 
         if best_fl_state is not None:
             final_layer.load_state_dict(best_fl_state)
@@ -1255,6 +1287,10 @@ def simulate_federated_training_vlg(args):
         training_metrics["final_layer_phase"] = vlg_central_metrics
     with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
         json.dump(training_metrics, f, indent=2)
+    _update_log(_log_path, {"status": "completed", "phase": "fully_trained",
+                            "test_accuracy": float(test_acc),
+                            "final_layer_method": vlg_final_method,
+                            "completed_at": datetime.datetime.now().isoformat()})
     print(f"Saved to {save_dir}")
 
 
@@ -1298,6 +1334,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--save_dir", type=str, default="saved_models", help="Save directory")
+    parser.add_argument("--log_dir", type=str, default=None,
+        help="Directory for structured log files (creates p1/ and p2/ subdirs)")
     parser.add_argument("--cache_dir", type=str, default=None, help="Cache directory for embeddings")
     
     parser.add_argument("--val_split", type=float, default=0.1, help="Validation split (VLG)")
