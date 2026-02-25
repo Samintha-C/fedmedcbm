@@ -737,85 +737,119 @@ def simulate_federated_training_vlg(args):
         total_samples = sum(client_data_sizes)
         client_weights = [n / total_samples for n in client_data_sizes]
 
-        num_train = len(base_cbl_dataset)
-        per_class_concepts = num_concepts // num_classes
-        class_counts = [0] * num_classes
-        for idx in range(len(train_dataset)):
-            _, label = train_dataset[idx]
-            class_counts[label] += 1
-        concept_counts = []
-        for c in range(num_classes):
-            concept_counts.extend([class_counts[c]] * per_class_concepts)
-        # Pad orphan concepts (when num_concepts % num_classes != 0) with the
-        # uniform-approximation count so pos_weight length matches num_concepts.
-        orphan_count = num_train // num_classes
-        while len(concept_counts) < num_concepts:
-            concept_counts.append(orphan_count)
-        loss_fn = get_loss_vlg(
-            getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
-            getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
-            tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
-        )
+        _cbl_dir = getattr(args, "load_cbl_dir", None)
+        if _cbl_dir is not None:
+            # Load a Phase-1-only checkpoint; skip CBL training entirely.
+            global_model.backbone.backbone.load_state_dict(
+                torch.load(os.path.join(_cbl_dir, "backbone.pt"), map_location=str(device))
+            )
+            global_model.cbl.load_state_dict(
+                torch.load(os.path.join(_cbl_dir, "cbl.pt"), map_location=str(device))
+            )
+            print(f"Loaded CBL weights from {_cbl_dir}, skipping Phase 1")
+            projection_metrics = {}
+        else:
+            num_train = len(base_cbl_dataset)
+            per_class_concepts = num_concepts // num_classes
+            class_counts = [0] * num_classes
+            for idx in range(len(train_dataset)):
+                _, label = train_dataset[idx]
+                class_counts[label] += 1
+            concept_counts = []
+            for c in range(num_classes):
+                concept_counts.extend([class_counts[c]] * per_class_concepts)
+            # Pad orphan concepts (when num_concepts % num_classes != 0) with the
+            # uniform-approximation count so pos_weight length matches num_concepts.
+            orphan_count = num_train // num_classes
+            while len(concept_counts) < num_concepts:
+                concept_counts.append(orphan_count)
+            loss_fn = get_loss_vlg(
+                getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
+                getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
+                tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
+            )
 
-        client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
-        for m in client_models:
-            m.to(device)
-        _log_mem("after Phase 1 client model init")
+            client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+            for m in client_models:
+                m.to(device)
+            _log_mem("after Phase 1 client model init")
 
-        print("\n=== Phase 1: Federated CBL training ===")
-        projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
-        best_val_loss = float("inf")
-        best_cbl_state = None
-        cbl_finetune = getattr(args, "cbl_finetune", False)
-        # Only exclude backbone from aggregation when it is frozen (not being finetuned).
-        # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
-        cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
-        for round_num in range(args.num_rounds):
-            round_losses = []
-            for i in range(args.num_clients):
-                client_models[i].load_state_dict(global_model.state_dict())
-                client_train_loss = train_cbl(
-                    client_models[i].backbone, client_models[i].cbl,
-                    client_train_loaders[i],
-                    epochs=getattr(args, "cbl_epochs", args.local_epochs),
-                    loss_fn=loss_fn, lr=getattr(args, "cbl_lr", args.lr),
-                    weight_decay=args.weight_decay, device=str(device),
-                    finetune=cbl_finetune,
-                    optimizer_name=getattr(args, "cbl_optimizer", "adam"),
-                    backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
-                )
-                round_losses.append(client_train_loss)
-            global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
-            global_model.load_state_dict(global_state)
-            avg_train_loss = sum(round_losses) / len(round_losses)
-            # Server-side validation on aggregated model
-            server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
-            projection_metrics["rounds"].append(round_num + 1)
-            projection_metrics["client_losses"].append(round_losses)
-            projection_metrics["avg_client_loss"].append(avg_train_loss)
-            if server_val_loss < best_val_loss:
-                best_val_loss = server_val_loss
-                best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
-            projection_metrics["best_val_loss"].append(best_val_loss)
-            print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
-            _save_progress(save_dir, {"phase": "cbl_training", "projection_phase": projection_metrics})
+            print("\n=== Phase 1: Federated CBL training ===")
+            projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
+            best_val_loss = float("inf")
+            best_cbl_state = None
+            cbl_finetune = getattr(args, "cbl_finetune", False)
+            # Only exclude backbone from aggregation when it is frozen (not being finetuned).
+            # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
+            cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
+            for round_num in range(args.num_rounds):
+                round_losses = []
+                for i in range(args.num_clients):
+                    client_models[i].load_state_dict(global_model.state_dict())
+                    client_train_loss = train_cbl(
+                        client_models[i].backbone, client_models[i].cbl,
+                        client_train_loaders[i],
+                        epochs=getattr(args, "cbl_epochs", args.local_epochs),
+                        loss_fn=loss_fn, lr=getattr(args, "cbl_lr", args.lr),
+                        weight_decay=args.weight_decay, device=str(device),
+                        finetune=cbl_finetune,
+                        optimizer_name=getattr(args, "cbl_optimizer", "adam"),
+                        backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
+                    )
+                    round_losses.append(client_train_loss)
+                global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
+                global_model.load_state_dict(global_state)
+                avg_train_loss = sum(round_losses) / len(round_losses)
+                # Server-side validation on aggregated model
+                server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
+                projection_metrics["rounds"].append(round_num + 1)
+                projection_metrics["client_losses"].append(round_losses)
+                projection_metrics["avg_client_loss"].append(avg_train_loss)
+                if server_val_loss < best_val_loss:
+                    best_val_loss = server_val_loss
+                    best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
+                projection_metrics["best_val_loss"].append(best_val_loss)
+                print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
+                _save_progress(save_dir, {"phase": "cbl_training", "projection_phase": projection_metrics})
 
-        # Restore the best CBL checkpoint (by server val loss) before Phase 2
-        if best_cbl_state is not None:
-            global_model.load_state_dict(best_cbl_state)
-            print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
+            # Restore the best CBL checkpoint (by server val loss) before Phase 2
+            if best_cbl_state is not None:
+                global_model.load_state_dict(best_cbl_state)
+                print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
 
-        # Free Phase 1 objects: N client model copies are the dominant GPU consumer.
-        # best_cbl_state holds an extra full state-dict copy — release it too.
-        _log_mem("before Phase 1 cleanup")
-        del client_models, best_cbl_state
-        gc.collect()
-        torch.cuda.empty_cache()
-        _log_mem("after Phase 1 cleanup")
-        print("Freed client models before Phase 2")
+            # --phase1_only: save CBL and exit so Phase 2+3 can run in a separate job
+            if getattr(args, "phase1_only", False):
+                print(f"\nPhase 1 only mode — saving model to {save_dir}")
+                global_model.backbone.save_model(save_dir)
+                global_model.cbl.save_model(save_dir)
+                with open(os.path.join(save_dir, "metrics.txt"), "w") as _f:
+                    json.dump({"phase1_only": True, "best_val_loss": float(best_val_loss),
+                               "num_rounds": args.num_rounds, "num_clients": args.num_clients}, _f, indent=2)
+                print("Phase 1 complete.")
+                return
+
+            # Free Phase 1 objects: N client model copies are the dominant GPU consumer.
+            # best_cbl_state holds an extra full state-dict copy — release it too.
+            _log_mem("before Phase 1 cleanup")
+            del client_models, best_cbl_state
+            gc.collect()
+            torch.cuda.empty_cache()
+            _log_mem("after Phase 1 cleanup")
+            print("Freed client models before Phase 2")
 
         print("\n=== Phase 2: Federated normalization and concept feature extraction ===")
         saga_bs = getattr(args, "saga_batch_size", 512)
+
+        # Phase 2 is GPU-bound (backbone inference), not I/O-bound.
+        # Rebuild loaders with num_workers=0 so no worker processes are forked.
+        # Worker forks each inherit the parent RSS (~1.5GB), causing CPU OOM on 8Gi nodes.
+        p2_bs = getattr(args, "cbl_batch_size", 32)
+        phase2_loaders = [
+            DataLoader(client_train_loaders[i].dataset, batch_size=p2_bs, shuffle=False, num_workers=0)
+            for i in range(args.num_clients)
+        ]
+        phase2_val_loader = DataLoader(val_cbl_loader.dataset, batch_size=p2_bs, shuffle=False, num_workers=0)
+        _log_mem("Phase 2 start (num_workers=0 loaders ready)")
 
         # Step 2a: Each client computes local concept feature statistics (mean, var, count)
         # Server aggregates via parallel statistics formula — no raw data leaves clients
@@ -828,7 +862,7 @@ def simulate_federated_training_vlg(args):
                 local_sum = torch.zeros(num_concepts)
                 local_sq_sum = torch.zeros(num_concepts)
                 local_n = 0
-                for features, _, _ in client_train_loaders[i]:
+                for features, _, _ in phase2_loaders[i]:
                     features = features.to(device)
                     logits = global_model.cbl(global_model.backbone(features)).cpu()
                     local_sum += logits.sum(dim=0)
@@ -854,7 +888,7 @@ def simulate_federated_training_vlg(args):
         all_train_feats, all_train_labels = [], []
         with torch.no_grad():
             for i in range(args.num_clients):
-                for features, _, labels in client_train_loaders[i]:
+                for features, _, labels in phase2_loaders[i]:
                     features = features.to(device)
                     logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
                     all_train_feats.append(logits)
@@ -865,7 +899,7 @@ def simulate_federated_training_vlg(args):
 
         val_feats, val_labels_all = [], []
         with torch.no_grad():
-            for features, _, labels in val_cbl_loader:
+            for features, _, labels in phase2_val_loader:
                 features = features.to(device)
                 logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
                 val_feats.append(logits)
@@ -1274,6 +1308,12 @@ def main():
     parser.add_argument("--saga_n_iters", type=int, default=2000, help="SAGA iterations (VLG)")
     parser.add_argument("--saga_step_size", type=float, default=0.1, help="SAGA step size (VLG)")
     parser.add_argument("--saga_batch_size", type=int, default=512, help="SAGA batch size (VLG)")
+    parser.add_argument("--phase1_only", action="store_true",
+        help="Run only Phase 1 (CBL training), save backbone+CBL, then exit. "
+             "Use --load_cbl_dir in a subsequent job to run Phase 2+3.")
+    parser.add_argument("--load_cbl_dir", type=str, default=None,
+        help="Path to a Phase-1-only checkpoint directory containing backbone.pt and cbl.pt. "
+             "When set, skips Phase 1 and runs Phase 2+3 directly.")
     parser.add_argument("--load_pretrained_vlg", type=str, default=None,
         help="Path to a pretrained VLG directory (e.g. saved_models/fed_vlg_cifar100_...) containing "
              "pre-extracted concept features (train_concept_features.pt, train_concept_labels.pt, "
