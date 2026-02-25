@@ -605,9 +605,18 @@ def simulate_federated_training_vlg(args):
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     _log_mem("training start")
+    if getattr(args, "phase1_only", False):
+        _run_tag = "cbl"
+        _rounds = args.num_rounds
+    elif getattr(args, "load_cbl_dir", None) or getattr(args, "load_pretrained_vlg", None):
+        _run_tag = getattr(args, "final_layer_method", None) or "hybrid_saga"
+        _rounds = getattr(args, "final_rounds", args.num_rounds)
+    else:
+        _run_tag = getattr(args, "final_layer_method", None) or "hybrid_saga"
+        _rounds = args.num_rounds
     save_dir = os.path.join(
         args.save_dir,
-        f"fed_vlg_{args.dataset}_c{args.num_clients}_r{args.num_rounds}_saga{getattr(args, 'saga_n_iters', 2000)}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        f"c{args.num_clients}r{_rounds}{args.dataset}{_run_tag}"
     )
     os.makedirs(save_dir, exist_ok=True)
 
