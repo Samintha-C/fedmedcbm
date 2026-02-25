@@ -586,8 +586,25 @@ def simulate_federated_training_vlg(args):
         except Exception:
             pass  # best-effort; don't crash training for a log write
 
+    def _log_mem(tag: str = ""):
+        """Print GPU and CPU memory usage at the current point in training."""
+        msg = f"[MEM] {tag}"
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024 ** 3
+            reserved = torch.cuda.memory_reserved() / 1024 ** 3
+            msg += f"  GPU alloc={alloc:.2f}GB reserved={reserved:.2f}GB"
+        try:
+            import psutil, os as _os
+            proc = psutil.Process(_os.getpid())
+            rss = proc.memory_info().rss / 1024 ** 3
+            msg += f"  CPU RSS={rss:.2f}GB"
+        except Exception:
+            pass
+        print(msg)
+
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    _log_mem("training start")
     save_dir = os.path.join(
         args.save_dir,
         f"fed_vlg_{args.dataset}_c{args.num_clients}_r{args.num_rounds}_saga{getattr(args, 'saga_n_iters', 2000)}_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
@@ -743,6 +760,7 @@ def simulate_federated_training_vlg(args):
         client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
         for m in client_models:
             m.to(device)
+        _log_mem("after Phase 1 client model init")
 
         print("\n=== Phase 1: Federated CBL training ===")
         projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
@@ -786,6 +804,15 @@ def simulate_federated_training_vlg(args):
         if best_cbl_state is not None:
             global_model.load_state_dict(best_cbl_state)
             print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
+
+        # Free Phase 1 objects: N client model copies are the dominant GPU consumer.
+        # best_cbl_state holds an extra full state-dict copy — release it too.
+        _log_mem("before Phase 1 cleanup")
+        del client_models, best_cbl_state
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log_mem("after Phase 1 cleanup")
+        print("Freed client models before Phase 2")
 
         print("\n=== Phase 2: Federated normalization and concept feature extraction ===")
         saga_bs = getattr(args, "saga_batch_size", 512)
@@ -834,6 +861,7 @@ def simulate_federated_training_vlg(args):
                     all_train_labels.append(labels)
         all_train_feats = torch.cat(all_train_feats, dim=0)
         all_train_labels = torch.cat(all_train_labels, dim=0)
+        _log_mem(f"after Phase 2 train feat extraction ({all_train_feats.shape[0]} samples, {all_train_feats.element_size() * all_train_feats.nelement() / 1024**3:.2f}GB tensor)")
 
         val_feats, val_labels_all = [], []
         with torch.no_grad():
@@ -868,14 +896,14 @@ def simulate_federated_training_vlg(args):
             val_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
         )
 
-        # Free objects no longer needed after feature extraction.
-        # The backbone, client models, and raw image datasets/loaders were only required for
-        # Phases 1-2.  Releasing them before Phase 3 prevents OOM during final layer training.
-        del client_models, client_train_loaders, base_cbl_dataset, val_cbl_dataset, val_cbl_loader
+        # Free raw image datasets/loaders — no longer needed after feature extraction.
+        _log_mem("before Phase 2 cleanup")
+        del client_train_loaders, base_cbl_dataset, val_cbl_dataset, val_cbl_loader
         del full_train_dataset, train_dataset, val_dataset
         global_model.backbone.cpu()          # move backbone off GPU — only needed again for test_model at the end
         gc.collect()
         torch.cuda.empty_cache()
+        _log_mem("after Phase 2 cleanup (backbone on CPU)")
         print("Freed backbone / raw-image objects before Phase 3")
 
     test_loader = get_concept_dataloader(
@@ -884,6 +912,7 @@ def simulate_federated_training_vlg(args):
     )
 
     vlg_final_method = args.final_layer_method
+    _log_mem("start of Phase 3")
     if vlg_final_method in ("hybrid_saga", "fedavg"):
         print(f"\n=== Phase 3: Final layer (sparse GLM-SAGA or dense) ===")
         final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
@@ -1077,6 +1106,7 @@ def simulate_federated_training_vlg(args):
         print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
     global_model.backbone.to(device)     # move backbone back to GPU for evaluation
+    _log_mem("before test evaluation (backbone back on GPU)")
     test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
     print(f"Test accuracy: {test_acc:.4f}")
 
