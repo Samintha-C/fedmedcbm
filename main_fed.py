@@ -606,212 +606,282 @@ def simulate_federated_training_vlg(args):
     with open(os.path.join(save_dir, "concepts.txt"), "w") as f:
         f.write("\n".join(concepts))
 
-    if args.backbone.startswith("clip_"):
-        preprocess = get_clip_preprocess()
-        backbone = BackboneCLIP(args.backbone, use_penultimate=getattr(args, "use_clip_penultimate", True), device=str(device))
+    load_dir = getattr(args, "load_pretrained_vlg", None)
+    _pretrained_mode = load_dir is not None
+
+    if _pretrained_mode:
+        print(f"\n=== Pretrained VLG mode: loading pre-extracted features from {load_dir} ===")
+        if args.backbone.startswith("clip_"):
+            preprocess = get_clip_preprocess()
+            backbone = BackboneCLIP(args.backbone, use_penultimate=getattr(args, "use_clip_penultimate", True), device="cpu")
+        else:
+            preprocess = get_resnet_preprocess()
+            backbone = Backbone(args.backbone, getattr(args, "feature_layer", "layer4"), "cpu")
+        all_train_feats = torch.load(
+            os.path.join(load_dir, "train_concept_features.pt"), map_location="cpu"
+        )
+        all_train_labels = torch.load(
+            os.path.join(load_dir, "train_concept_labels.pt"), map_location="cpu"
+        )
+        val_feats = torch.load(
+            os.path.join(load_dir, "val_concept_features.pt"), map_location="cpu"
+        )
+        val_labels_all = torch.load(
+            os.path.join(load_dir, "val_concept_labels.pt"), map_location="cpu"
+        )
+        num_concepts = all_train_feats.shape[1]
+        args.num_concepts = num_concepts
+        num_train = all_train_feats.shape[0]
+        print(f"Loaded features: {num_train} train, {val_feats.shape[0]} val, {num_concepts} concepts")
+
+        cbl = ConceptLayer(
+            backbone.output_dim, num_concepts,
+            num_hidden=getattr(args, "cbl_hidden_layers", 0),
+            bias=True, device="cpu"
+        )
+        backbone.backbone.load_state_dict(
+            torch.load(os.path.join(load_dir, "backbone.pt"), map_location="cpu")
+        )
+        cbl.load_state_dict(
+            torch.load(os.path.join(load_dir, "cbl.pt"), map_location="cpu")
+        )
+        norm_layer = NormalizationLayer.from_pretrained(load_dir, device=str(device))
+        print("Loaded backbone, CBL, and normalization from pretrained dir")
+
+        global_model = FedVLGCBM(backbone, cbl, normalization=norm_layer, final_layer=None)
+        global_model.cbl.to(device)
+        # backbone stays on CPU; will be moved to device only for final evaluation
+
+        # Uniform client split of pre-extracted train features
+        base = num_train // args.num_clients
+        rem = num_train % args.num_clients
+        client_data_sizes = [base + (1 if i < rem else 0) for i in range(args.num_clients)]
+        total_samples = sum(client_data_sizes)
+        client_weights = [n / total_samples for n in client_data_sizes]
+
+        saga_bs = getattr(args, "saga_batch_size", 512)
+        train_concept_loader = DataLoader(
+            IndexedTensorDataset(all_train_feats, all_train_labels),
+            batch_size=saga_bs, shuffle=True
+        )
+        val_concept_loader = DataLoader(
+            TensorDataset(val_feats, val_labels_all),
+            batch_size=saga_bs, shuffle=False
+        )
+        projection_metrics = {}
     else:
-        preprocess = get_resnet_preprocess()
-        backbone = Backbone(args.backbone, getattr(args, "feature_layer", "layer4"), str(device))
+        if args.backbone.startswith("clip_"):
+            preprocess = get_clip_preprocess()
+            backbone = BackboneCLIP(args.backbone, use_penultimate=getattr(args, "use_clip_penultimate", True), device=str(device))
+        else:
+            preprocess = get_resnet_preprocess()
+            backbone = Backbone(args.backbone, getattr(args, "feature_layer", "layer4"), str(device))
 
-    cbl = ConceptLayer(
-        backbone.output_dim, num_concepts,
-        num_hidden=getattr(args, "cbl_hidden_layers", 0),
-        bias=True, device=str(device)
-    )
-    global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
-    global_model.to(device)
+        cbl = ConceptLayer(
+            backbone.output_dim, num_concepts,
+            num_hidden=getattr(args, "cbl_hidden_layers", 0),
+            bias=True, device=str(device)
+        )
+        global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
+        global_model.to(device)
 
-    full_train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
-    
-    val_split = getattr(args, "val_split", 0.1)
-    n_val = int(val_split * len(full_train_dataset))
-    n_train = len(full_train_dataset) - n_val
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_train_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
-    )
-    print(f"Split full train dataset: {len(train_dataset)} train, {len(val_dataset)} val (val_split={val_split})")
-    
-    client_indices = split_dataset_for_federated(
-        train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
-    )
-    print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
+        full_train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
 
-    base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
-    val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
-    val_cbl_loader = DataLoader(
-        val_cbl_dataset,
-        batch_size=getattr(args, "cbl_batch_size", 32),
-        num_workers=args.num_workers,
-        shuffle=False
-    )
-    client_train_loaders = []
-    client_data_sizes = []
-    for i in range(args.num_clients):
-        sub = Subset(base_cbl_dataset, client_indices[i])
-        client_train_loaders.append(DataLoader(
-            sub, batch_size=getattr(args, "cbl_batch_size", 32),
-            shuffle=True, num_workers=args.num_workers, pin_memory=True
-        ))
-        client_data_sizes.append(len(sub))
-    total_samples = sum(client_data_sizes)
-    client_weights = [n / total_samples for n in client_data_sizes]
+        val_split = getattr(args, "val_split", 0.1)
+        n_val = int(val_split * len(full_train_dataset))
+        n_train = len(full_train_dataset) - n_val
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_train_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
+        )
+        print(f"Split full train dataset: {len(train_dataset)} train, {len(val_dataset)} val (val_split={val_split})")
+
+        client_indices = split_dataset_for_federated(
+            train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
+        )
+        print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
+
+        base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
+        val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
+        val_cbl_loader = DataLoader(
+            val_cbl_dataset,
+            batch_size=getattr(args, "cbl_batch_size", 32),
+            num_workers=args.num_workers,
+            shuffle=False
+        )
+        client_train_loaders = []
+        client_data_sizes = []
+        for i in range(args.num_clients):
+            sub = Subset(base_cbl_dataset, client_indices[i])
+            client_train_loaders.append(DataLoader(
+                sub, batch_size=getattr(args, "cbl_batch_size", 32),
+                shuffle=True, num_workers=args.num_workers, pin_memory=True
+            ))
+            client_data_sizes.append(len(sub))
+        total_samples = sum(client_data_sizes)
+        client_weights = [n / total_samples for n in client_data_sizes]
+
+        num_train = len(base_cbl_dataset)
+        per_class_concepts = num_concepts // num_classes
+        class_counts = [0] * num_classes
+        for idx in range(len(train_dataset)):
+            _, label = train_dataset[idx]
+            class_counts[label] += 1
+        concept_counts = []
+        for c in range(num_classes):
+            concept_counts.extend([class_counts[c]] * per_class_concepts)
+        # Pad orphan concepts (when num_concepts % num_classes != 0) with the
+        # uniform-approximation count so pos_weight length matches num_concepts.
+        orphan_count = num_train // num_classes
+        while len(concept_counts) < num_concepts:
+            concept_counts.append(orphan_count)
+        loss_fn = get_loss_vlg(
+            getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
+            getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
+            tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
+        )
+
+        client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+        for m in client_models:
+            m.to(device)
+
+        print("\n=== Phase 1: Federated CBL training ===")
+        projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
+        best_val_loss = float("inf")
+        best_cbl_state = None
+        cbl_finetune = getattr(args, "cbl_finetune", False)
+        # Only exclude backbone from aggregation when it is frozen (not being finetuned).
+        # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
+        cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
+        for round_num in range(args.num_rounds):
+            round_losses = []
+            for i in range(args.num_clients):
+                client_models[i].load_state_dict(global_model.state_dict())
+                client_train_loss = train_cbl(
+                    client_models[i].backbone, client_models[i].cbl,
+                    client_train_loaders[i],
+                    epochs=getattr(args, "cbl_epochs", args.local_epochs),
+                    loss_fn=loss_fn, lr=getattr(args, "cbl_lr", args.lr),
+                    weight_decay=args.weight_decay, device=str(device),
+                    finetune=cbl_finetune,
+                    optimizer_name=getattr(args, "cbl_optimizer", "adam"),
+                    backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
+                )
+                round_losses.append(client_train_loss)
+            global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
+            global_model.load_state_dict(global_state)
+            avg_train_loss = sum(round_losses) / len(round_losses)
+            # Server-side validation on aggregated model
+            server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
+            projection_metrics["rounds"].append(round_num + 1)
+            projection_metrics["client_losses"].append(round_losses)
+            projection_metrics["avg_client_loss"].append(avg_train_loss)
+            if server_val_loss < best_val_loss:
+                best_val_loss = server_val_loss
+                best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
+            projection_metrics["best_val_loss"].append(best_val_loss)
+            print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
+            _save_progress(save_dir, {"phase": "cbl_training", "projection_phase": projection_metrics})
+
+        # Restore the best CBL checkpoint (by server val loss) before Phase 2
+        if best_cbl_state is not None:
+            global_model.load_state_dict(best_cbl_state)
+            print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
+
+        print("\n=== Phase 2: Federated normalization and concept feature extraction ===")
+        saga_bs = getattr(args, "saga_batch_size", 512)
+
+        # Step 2a: Each client computes local concept feature statistics (mean, var, count)
+        # Server aggregates via parallel statistics formula — no raw data leaves clients
+        client_sums = []
+        client_sq_sums = []
+        client_counts = []
+        global_model.eval()
+        with torch.no_grad():
+            for i in range(args.num_clients):
+                local_sum = torch.zeros(num_concepts)
+                local_sq_sum = torch.zeros(num_concepts)
+                local_n = 0
+                for features, _, _ in client_train_loaders[i]:
+                    features = features.to(device)
+                    logits = global_model.cbl(global_model.backbone(features)).cpu()
+                    local_sum += logits.sum(dim=0)
+                    local_sq_sum += (logits ** 2).sum(dim=0)
+                    local_n += logits.size(0)
+                client_sums.append(local_sum)
+                client_sq_sums.append(local_sq_sum)
+                client_counts.append(local_n)
+
+        # Server aggregates statistics
+        total_n = sum(client_counts)
+        global_sum = sum(client_sums)
+        global_sq_sum = sum(client_sq_sums)
+        global_mean = global_sum / total_n
+        global_var = (global_sq_sum / total_n) - (global_mean ** 2)
+        global_std = global_var.clamp(min=1e-8).sqrt()
+
+        norm_layer = NormalizationLayer(global_mean, global_std, device=str(device))
+        global_model.normalization = norm_layer
+
+        # Step 2b: Extract normalized concept features for centralized methods and NEC eval
+        # (hybrid_saga/fedavg need pooled features; fedavg_thresh extracts per-client features in Phase 3)
+        all_train_feats, all_train_labels = [], []
+        with torch.no_grad():
+            for i in range(args.num_clients):
+                for features, _, labels in client_train_loaders[i]:
+                    features = features.to(device)
+                    logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+                    all_train_feats.append(logits)
+                    all_train_labels.append(labels)
+        all_train_feats = torch.cat(all_train_feats, dim=0)
+        all_train_labels = torch.cat(all_train_labels, dim=0)
+
+        val_feats, val_labels_all = [], []
+        with torch.no_grad():
+            for features, _, labels in val_cbl_loader:
+                features = features.to(device)
+                logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+                val_feats.append(logits)
+                val_labels_all.append(labels)
+        val_feats = torch.cat(val_feats, dim=0)
+        val_labels_all = torch.cat(val_labels_all, dim=0)
+
+        # Save concept features for reproducibility
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(all_train_feats, os.path.join(save_dir, "train_concept_features.pt"))
+        torch.save(all_train_labels, os.path.join(save_dir, "train_concept_labels.pt"))
+        torch.save(val_feats, os.path.join(save_dir, "val_concept_features.pt"))
+        torch.save(val_labels_all, os.path.join(save_dir, "val_concept_labels.pt"))
+        norm_layer.save_model(save_dir)
+
+        train_concept_loader = DataLoader(
+            IndexedTensorDataset(all_train_feats, all_train_labels),
+            batch_size=saga_bs, shuffle=True
+        )
+        val_concept_loader = DataLoader(
+            TensorDataset(val_feats, val_labels_all),
+            batch_size=saga_bs, shuffle=False
+        )
+
+        # Precompute federated val split indices before releasing val_dataset.
+        # fedavg_thresh Phase 3 needs these to slice val_feats per client.
+        _val_indices_thresh = split_dataset_for_federated(
+            val_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
+        )
+
+        # Free objects no longer needed after feature extraction.
+        # The backbone, client models, and raw image datasets/loaders were only required for
+        # Phases 1-2.  Releasing them before Phase 3 prevents OOM during final layer training.
+        del client_models, client_train_loaders, base_cbl_dataset, val_cbl_dataset, val_cbl_loader
+        del full_train_dataset, train_dataset, val_dataset
+        global_model.backbone.cpu()          # move backbone off GPU — only needed again for test_model at the end
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("Freed backbone / raw-image objects before Phase 3")
 
     test_loader = get_concept_dataloader(
         args.dataset, "test", concepts, preprocess=preprocess, use_allones=True,
         batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
     )
-
-    num_train = len(base_cbl_dataset)
-    per_class_concepts = num_concepts // num_classes
-    class_counts = [0] * num_classes
-    for idx in range(len(train_dataset)):
-        _, label = train_dataset[idx]
-        class_counts[label] += 1
-    concept_counts = []
-    for c in range(num_classes):
-        concept_counts.extend([class_counts[c]] * per_class_concepts)
-    # Pad orphan concepts (when num_concepts % num_classes != 0) with the
-    # uniform-approximation count so pos_weight length matches num_concepts.
-    orphan_count = num_train // num_classes
-    while len(concept_counts) < num_concepts:
-        concept_counts.append(orphan_count)
-    loss_fn = get_loss_vlg(
-        getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
-        getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
-        tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
-    )
-
-    client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
-    for m in client_models:
-        m.to(device)
-
-    print("\n=== Phase 1: Federated CBL training ===")
-    projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
-    best_val_loss = float("inf")
-    best_cbl_state = None
-    cbl_finetune = getattr(args, "cbl_finetune", False)
-    # Only exclude backbone from aggregation when it is frozen (not being finetuned).
-    # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
-    cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
-    for round_num in range(args.num_rounds):
-        round_losses = []
-        for i in range(args.num_clients):
-            client_models[i].load_state_dict(global_model.state_dict())
-            client_train_loss = train_cbl(
-                client_models[i].backbone, client_models[i].cbl,
-                client_train_loaders[i],
-                epochs=getattr(args, "cbl_epochs", args.local_epochs),
-                loss_fn=loss_fn, lr=getattr(args, "cbl_lr", args.lr),
-                weight_decay=args.weight_decay, device=str(device),
-                finetune=cbl_finetune,
-                optimizer_name=getattr(args, "cbl_optimizer", "adam"),
-                backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
-            )
-            round_losses.append(client_train_loss)
-        global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
-        global_model.load_state_dict(global_state)
-        avg_train_loss = sum(round_losses) / len(round_losses)
-        # Server-side validation on aggregated model
-        server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
-        projection_metrics["rounds"].append(round_num + 1)
-        projection_metrics["client_losses"].append(round_losses)
-        projection_metrics["avg_client_loss"].append(avg_train_loss)
-        if server_val_loss < best_val_loss:
-            best_val_loss = server_val_loss
-            best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
-        projection_metrics["best_val_loss"].append(best_val_loss)
-        print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
-        _save_progress(save_dir, {"phase": "cbl_training", "projection_phase": projection_metrics})
-
-    # Restore the best CBL checkpoint (by server val loss) before Phase 2
-    if best_cbl_state is not None:
-        global_model.load_state_dict(best_cbl_state)
-        print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
-
-    print("\n=== Phase 2: Federated normalization and concept feature extraction ===")
-    saga_bs = getattr(args, "saga_batch_size", 512)
-
-    # Step 2a: Each client computes local concept feature statistics (mean, var, count)
-    # Server aggregates via parallel statistics formula — no raw data leaves clients
-    client_sums = []
-    client_sq_sums = []
-    client_counts = []
-    global_model.eval()
-    with torch.no_grad():
-        for i in range(args.num_clients):
-            local_sum = torch.zeros(num_concepts)
-            local_sq_sum = torch.zeros(num_concepts)
-            local_n = 0
-            for features, _, _ in client_train_loaders[i]:
-                features = features.to(device)
-                logits = global_model.cbl(global_model.backbone(features)).cpu()
-                local_sum += logits.sum(dim=0)
-                local_sq_sum += (logits ** 2).sum(dim=0)
-                local_n += logits.size(0)
-            client_sums.append(local_sum)
-            client_sq_sums.append(local_sq_sum)
-            client_counts.append(local_n)
-
-    # Server aggregates statistics
-    total_n = sum(client_counts)
-    global_sum = sum(client_sums)
-    global_sq_sum = sum(client_sq_sums)
-    global_mean = global_sum / total_n
-    global_var = (global_sq_sum / total_n) - (global_mean ** 2)
-    global_std = global_var.clamp(min=1e-8).sqrt()
-
-    norm_layer = NormalizationLayer(global_mean, global_std, device=str(device))
-    global_model.normalization = norm_layer
-
-    # Step 2b: Extract normalized concept features for centralized methods and NEC eval
-    # (hybrid_saga/fedavg need pooled features; fedavg_thresh extracts per-client features in Phase 3)
-    all_train_feats, all_train_labels = [], []
-    with torch.no_grad():
-        for i in range(args.num_clients):
-            for features, _, labels in client_train_loaders[i]:
-                features = features.to(device)
-                logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
-                all_train_feats.append(logits)
-                all_train_labels.append(labels)
-    all_train_feats = torch.cat(all_train_feats, dim=0)
-    all_train_labels = torch.cat(all_train_labels, dim=0)
-
-    val_feats, val_labels_all = [], []
-    with torch.no_grad():
-        for features, _, labels in val_cbl_loader:
-            features = features.to(device)
-            logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
-            val_feats.append(logits)
-            val_labels_all.append(labels)
-    val_feats = torch.cat(val_feats, dim=0)
-    val_labels_all = torch.cat(val_labels_all, dim=0)
-
-    # Save concept features for reproducibility
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(all_train_feats, os.path.join(save_dir, "train_concept_features.pt"))
-    torch.save(all_train_labels, os.path.join(save_dir, "train_concept_labels.pt"))
-    torch.save(val_feats, os.path.join(save_dir, "val_concept_features.pt"))
-    torch.save(val_labels_all, os.path.join(save_dir, "val_concept_labels.pt"))
-    norm_layer.save_model(save_dir)
-
-    train_concept_loader = DataLoader(
-        IndexedTensorDataset(all_train_feats, all_train_labels),
-        batch_size=saga_bs, shuffle=True
-    )
-    val_concept_loader = DataLoader(
-        TensorDataset(val_feats, val_labels_all),
-        batch_size=saga_bs, shuffle=False
-    )
-
-    # Free objects no longer needed after feature extraction.
-    # The backbone, client models, and raw image datasets/loaders were only required for
-    # Phases 1-2.  Releasing them before Phase 3 prevents OOM during final layer training.
-    del client_models, client_train_loaders, base_cbl_dataset, val_cbl_dataset, val_cbl_loader
-    del full_train_dataset, train_dataset, val_dataset
-    global_model.backbone.cpu()          # move backbone off GPU — only needed again for test_model at the end
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("Freed backbone / raw-image objects before Phase 3")
 
     vlg_final_method = args.final_layer_method
     if vlg_final_method in ("hybrid_saga", "fedavg"):
@@ -875,22 +945,37 @@ def simulate_federated_training_vlg(args):
                 batch_size=saga_bs, shuffle=True
             ))
 
-        # Per-client val concept features: index into the already-extracted val_feats
-        # using the same federated split indices — no second backbone pass needed.
-        val_indices = split_dataset_for_federated(
-            val_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
-        )
+        # Per-client val concept features.
+        # Normal mode: use same federated split indices as training to preserve label distribution.
+        # Pretrained mode: uniform split (val_dataset not available when loading pre-extracted features).
         client_val_concept_loaders = []
         client_val_sizes = []
-        for i in range(args.num_clients):
-            idx = torch.tensor(val_indices[i], dtype=torch.long)
-            v_feats = val_feats[idx]
-            v_labels = val_labels_all[idx]
-            client_val_concept_loaders.append(DataLoader(
-                TensorDataset(v_feats, v_labels),
-                batch_size=saga_bs, shuffle=False
-            ))
-            client_val_sizes.append(len(idx))
+        if _pretrained_mode:
+            n_val_total = val_feats.shape[0]
+            base_val = n_val_total // args.num_clients
+            rem_val = n_val_total % args.num_clients
+            offset_val = 0
+            for i in range(args.num_clients):
+                n_v = base_val + (1 if i < rem_val else 0)
+                v_feats_i = val_feats[offset_val:offset_val + n_v]
+                v_labels_i = val_labels_all[offset_val:offset_val + n_v]
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(v_feats_i, v_labels_i),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(n_v)
+                offset_val += n_v
+        else:
+            # _val_indices_thresh was precomputed before val_dataset was deleted
+            for i in range(args.num_clients):
+                idx = torch.tensor(_val_indices_thresh[i], dtype=torch.long)
+                v_feats_i = val_feats[idx]
+                v_labels_i = val_labels_all[idx]
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(v_feats_i, v_labels_i),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(len(idx))
         total_val = sum(client_val_sizes)
         client_val_weights = [n / total_val for n in client_val_sizes]
 
@@ -1159,6 +1244,12 @@ def main():
     parser.add_argument("--saga_n_iters", type=int, default=2000, help="SAGA iterations (VLG)")
     parser.add_argument("--saga_step_size", type=float, default=0.1, help="SAGA step size (VLG)")
     parser.add_argument("--saga_batch_size", type=int, default=512, help="SAGA batch size (VLG)")
+    parser.add_argument("--load_pretrained_vlg", type=str, default=None,
+        help="Path to a pretrained VLG directory (e.g. saved_models/fed_vlg_cifar100_...) containing "
+             "pre-extracted concept features (train_concept_features.pt, train_concept_labels.pt, "
+             "val_concept_features.pt, val_concept_labels.pt) and model weights (backbone.pt, cbl.pt, "
+             "train_concept_features_mean.pt, train_concept_features_std.pt). "
+             "When set, skips Phases 1-2 and runs Phase 3 directly using the loaded features.")
     parser.add_argument("--no_nec_eval", action="store_true", help="Skip NEC evaluation (Phase 4)")
     parser.add_argument("--nec_lam_max", type=float, default=0.01, help="NEC path max lambda (VLG)")
     parser.add_argument("--nec_measure_level", type=str, default="5,10,15,20,25,30", help="NEC levels, comma-separated (VLG)")
