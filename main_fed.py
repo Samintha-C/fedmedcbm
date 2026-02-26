@@ -8,7 +8,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset, Subset
 
-from glm_saga.elasticnet import soft_threshold, IndexedTensorDataset, glm_saga
+from glm_saga.elasticnet import soft_threshold, group_threshold, IndexedTensorDataset, glm_saga
 from tqdm import tqdm
 
 import clip
@@ -1097,7 +1097,7 @@ def simulate_federated_training_vlg(args):
         thresh_metrics = {
             "rounds": [], "client_losses": [], "avg_client_loss": [],
             "val_accuracy": [], "best_val_accuracy": [], "threshold_lam": [],
-            "mask_alive": [],
+            "mask_alive": [], "concepts_alive": [],
         }
         best_val_acc = 0.0
         best_fl_state = None
@@ -1140,18 +1140,22 @@ def simulate_federated_training_vlg(args):
                 else:
                     global_fl_state[key] = param.clone()
 
-            # Server-side soft thresholding
+            # Server-side group thresholding (zeros entire concept columns by L2 norm)
             progress = round_num / max(final_rounds - 1, 1)
             lam = args.thresh_lam_start + progress * (args.thresh_lam_end - args.thresh_lam_start)
             for key in global_fl_state:
                 if "weight" in key:
-                    global_fl_state[key] = soft_threshold(global_fl_state[key], lam)
-                    # FedMask: update mask — once dead, stays dead
+                    global_fl_state[key] = group_threshold(global_fl_state[key], lam)
+                    # FedMask: update mask — once a concept column is dead, it stays dead
                     _weight_mask[key] *= (global_fl_state[key].abs() > 1e-8).float()
                     global_fl_state[key] *= _weight_mask[key]
             _mask_total = sum(m.numel() for m in _weight_mask.values())
             _mask_alive = sum((m > 0).sum().item() for m in _weight_mask.values())
-            print(f"  Applied soft_threshold with lam={lam:.6f}  Mask: {_mask_alive}/{_mask_total} alive ({_mask_alive/_mask_total:.4f})")
+            # Count alive concepts (columns with any non-zero weight)
+            _concepts_alive = sum((_weight_mask[k].abs().sum(dim=0) > 0).sum().item()
+                                  for k in _weight_mask)
+            _concepts_total = sum(_weight_mask[k].shape[1] for k in _weight_mask)
+            print(f"  group_threshold lam={lam:.6f}  Weights: {_mask_alive}/{_mask_total} alive  Concepts: {_concepts_alive}/{_concepts_total}")
 
             final_layer.load_state_dict(global_fl_state)
 
@@ -1179,10 +1183,12 @@ def simulate_federated_training_vlg(args):
             thresh_metrics["best_val_accuracy"].append(float(best_val_acc))
             thresh_metrics["threshold_lam"].append(float(lam))
             thresh_metrics["mask_alive"].append(int(_mask_alive))
+            thresh_metrics["concepts_alive"].append(int(_concepts_alive))
             _update_log(_log_path, {"status": "in_progress", "phase": "final_layer_fedavg_thresh",
                                     "round": round_num + 1, "total_rounds": getattr(args, "final_rounds", 5),
                                     "val_accuracy": float(val_acc), "best_val_accuracy": float(best_val_acc),
-                                    "threshold_lam": float(lam), "mask_alive": int(_mask_alive)})
+                                    "threshold_lam": float(lam), "mask_alive": int(_mask_alive),
+                                    "concepts_alive": int(_concepts_alive)})
 
         if best_fl_state is not None:
             final_layer.load_state_dict(best_fl_state)
