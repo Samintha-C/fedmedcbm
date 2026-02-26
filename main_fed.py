@@ -1155,7 +1155,12 @@ def simulate_federated_training_vlg(args):
             _concepts_alive = sum((_weight_mask[k].abs().sum(dim=0) > 0).sum().item()
                                   for k in _weight_mask)
             _concepts_total = sum(_weight_mask[k].shape[1] for k in _weight_mask)
-            print(f"  group_threshold lam={lam:.6f}  Weights: {_mask_alive}/{_mask_total} alive  Concepts: {_concepts_alive}/{_concepts_total}")
+            # Log column norm stats for tuning threshold
+            for key in global_fl_state:
+                if "weight" in key:
+                    col_norms = global_fl_state[key].norm(p=2, dim=0)
+                    print(f"  group_threshold lam={lam:.6f}  col_norms: min={col_norms.min():.4f} median={col_norms.median():.4f} max={col_norms.max():.4f}")
+            print(f"  Weights: {_mask_alive}/{_mask_total} alive  Concepts: {_concepts_alive}/{_concepts_total}")
 
             final_layer.load_state_dict(global_fl_state)
 
@@ -1345,10 +1350,10 @@ def main():
              "fedavg_thresh (FedAvg + server-side thresholding), "
              "hybrid_saga (federated feature extraction + centralized GLM-SAGA). "
              "Default: fedavg for LFC, hybrid_saga for VLG")
-    parser.add_argument("--thresh_lam_start", type=float, default=1e-4,
-        help="Starting threshold for fedavg_thresh (small = less pruning)")
-    parser.add_argument("--thresh_lam_end", type=float, default=1e-2,
-        help="Ending threshold for fedavg_thresh (large = more pruning)")
+    parser.add_argument("--thresh_lam_start", type=float, default=0.1,
+        help="Starting group-threshold lambda (compared to column L2 norms)")
+    parser.add_argument("--thresh_lam_end", type=float, default=1.0,
+        help="Ending group-threshold lambda (compared to column L2 norms)")
     
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
