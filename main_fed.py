@@ -1097,9 +1097,13 @@ def simulate_federated_training_vlg(args):
         thresh_metrics = {
             "rounds": [], "client_losses": [], "avg_client_loss": [],
             "val_accuracy": [], "best_val_accuracy": [], "threshold_lam": [],
+            "mask_alive": [],
         }
         best_val_acc = 0.0
         best_fl_state = None
+        # FedMask: binary mask (1 = alive, 0 = dead). Starts all-ones; monotonically shrinks.
+        _weight_mask = {key: torch.ones_like(val)
+                        for key, val in final_layer.state_dict().items() if "weight" in key}
         for round_num in range(final_rounds):
             print(f"\n=== VLG Final Layer Round {round_num + 1}/{final_rounds} ===")
             round_losses = []
@@ -1117,6 +1121,9 @@ def simulate_federated_training_vlg(args):
                         opt.zero_grad()
                         loss.backward()
                         opt.step()
+                        # FedMask: re-zero dead weights after each step
+                        with torch.no_grad():
+                            client_final_layers[i].weight.data *= _weight_mask["weight"]
                         epoch_loss += loss.item()
                         n_batches += 1
                 round_losses.append(epoch_loss / max(n_batches, 1))
@@ -1139,7 +1146,12 @@ def simulate_federated_training_vlg(args):
             for key in global_fl_state:
                 if "weight" in key:
                     global_fl_state[key] = soft_threshold(global_fl_state[key], lam)
-            print(f"  Applied soft_threshold with lam={lam:.6f}")
+                    # FedMask: update mask — once dead, stays dead
+                    _weight_mask[key] *= (global_fl_state[key].abs() > 1e-8).float()
+                    global_fl_state[key] *= _weight_mask[key]
+            _mask_total = sum(m.numel() for m in _weight_mask.values())
+            _mask_alive = sum((m > 0).sum().item() for m in _weight_mask.values())
+            print(f"  Applied soft_threshold with lam={lam:.6f}  Mask: {_mask_alive}/{_mask_total} alive ({_mask_alive/_mask_total:.4f})")
 
             final_layer.load_state_dict(global_fl_state)
 
@@ -1166,10 +1178,11 @@ def simulate_federated_training_vlg(args):
             thresh_metrics["val_accuracy"].append(float(val_acc))
             thresh_metrics["best_val_accuracy"].append(float(best_val_acc))
             thresh_metrics["threshold_lam"].append(float(lam))
+            thresh_metrics["mask_alive"].append(int(_mask_alive))
             _update_log(_log_path, {"status": "in_progress", "phase": "final_layer_fedavg_thresh",
                                     "round": round_num + 1, "total_rounds": getattr(args, "final_rounds", 5),
                                     "val_accuracy": float(val_acc), "best_val_accuracy": float(best_val_acc),
-                                    "threshold_lam": float(lam)})
+                                    "threshold_lam": float(lam), "mask_alive": int(_mask_alive)})
 
         if best_fl_state is not None:
             final_layer.load_state_dict(best_fl_state)
