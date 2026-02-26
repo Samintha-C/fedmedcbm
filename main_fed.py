@@ -1350,9 +1350,9 @@ def main():
              "fedavg_thresh (FedAvg + server-side thresholding), "
              "hybrid_saga (federated feature extraction + centralized GLM-SAGA). "
              "Default: fedavg for LFC, hybrid_saga for VLG")
-    parser.add_argument("--thresh_lam_start", type=float, default=0.1,
+    parser.add_argument("--thresh_lam_start", type=float, default=0.01,
         help="Starting group-threshold lambda (compared to column L2 norms)")
-    parser.add_argument("--thresh_lam_end", type=float, default=1.0,
+    parser.add_argument("--thresh_lam_end", type=float, default=0.12,
         help="Ending group-threshold lambda (compared to column L2 norms)")
     
     parser.add_argument("--device", type=str, default="cuda", help="Device")
