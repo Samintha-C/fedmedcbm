@@ -572,7 +572,7 @@ def simulate_federated_training_vlg(args):
     _loss_vlg_spec.loader.exec_module(_loss_vlg_mod)
     get_loss_vlg = _loss_vlg_mod.get_loss
     from data import data_utils
-    from data.concept_dataset_vlg import AllOneConceptDataset, get_concept_dataloader
+    from data.concept_dataset_vlg import AllOneConceptDataset, DinoConceptDataset, get_concept_dataloader
     from models.fed_vlgcbm import (
         Backbone, BackboneCLIP, ConceptLayer, NormalizationLayer, FinalLayer, FedVLGCBM,
         train_cbl, validate_cbl, get_final_layer_dataset, train_sparse_final, train_dense_final, test_model, per_class_accuracy,
@@ -752,8 +752,22 @@ def simulate_federated_training_vlg(args):
         )
         print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
 
-        base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
-        val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
+        annotation_dir = getattr(args, "annotation_dir", None)
+        dino_conf = getattr(args, "dino_confidence_threshold", 0.10)
+        if annotation_dir and os.path.isdir(annotation_dir):
+            base_cbl_dataset = DinoConceptDataset(
+                args.dataset, train_dataset, concepts,
+                annotation_dir=annotation_dir, split_suffix="train",
+                confidence_threshold=dino_conf, preprocess=preprocess,
+            )
+            val_cbl_dataset = DinoConceptDataset(
+                args.dataset, val_dataset, concepts,
+                annotation_dir=annotation_dir, split_suffix="train",
+                confidence_threshold=dino_conf, preprocess=preprocess,
+            )
+        else:
+            base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
+            val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
         val_cbl_loader = DataLoader(
             val_cbl_dataset,
             batch_size=getattr(args, "cbl_batch_size", 32),
@@ -785,19 +799,28 @@ def simulate_federated_training_vlg(args):
             projection_metrics = {}
         else:
             num_train = len(base_cbl_dataset)
-            per_class_concepts = num_concepts // num_classes
-            class_counts = [0] * num_classes
-            for idx in range(len(train_dataset)):
-                _, label = train_dataset[idx]
-                class_counts[label] += 1
-            concept_counts = []
-            for c in range(num_classes):
-                concept_counts.extend([class_counts[c]] * per_class_concepts)
-            # Pad orphan concepts (when num_concepts % num_classes != 0) with the
-            # uniform-approximation count so pos_weight length matches num_concepts.
-            orphan_count = num_train // num_classes
-            while len(concept_counts) < num_concepts:
-                concept_counts.append(orphan_count)
+            use_dino = annotation_dir and os.path.isdir(annotation_dir)
+            if use_dino:
+                # Compute actual per-concept positive counts from DINO annotations.
+                print("Computing per-concept positive counts from DINO annotations...")
+                concept_counts = torch.zeros(num_concepts)
+                for idx in range(num_train):
+                    _, concept_vec, _ = base_cbl_dataset[idx]
+                    concept_counts += concept_vec
+                concept_counts = concept_counts.tolist()
+                print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
+            else:
+                per_class_concepts = num_concepts // num_classes
+                class_counts = [0] * num_classes
+                for idx in range(len(train_dataset)):
+                    _, label = train_dataset[idx]
+                    class_counts[label] += 1
+                concept_counts = []
+                for c in range(num_classes):
+                    concept_counts.extend([class_counts[c]] * per_class_concepts)
+                orphan_count = num_train // num_classes
+                while len(concept_counts) < num_concepts:
+                    concept_counts.append(orphan_count)
             loss_fn = get_loss_vlg(
                 getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
                 getattr(args, "cbl_pos_weight", 0.2), not getattr(args, "no_cbl_auto_weight", False),
@@ -983,7 +1006,10 @@ def simulate_federated_training_vlg(args):
         print("Freed backbone / raw-image objects before Phase 3")
 
     test_loader = get_concept_dataloader(
-        args.dataset, "test", concepts, preprocess=preprocess, use_allones=True,
+        args.dataset, "test", concepts, preprocess=preprocess,
+        use_allones=not (getattr(args, "annotation_dir", None) and os.path.isdir(getattr(args, "annotation_dir", ""))),
+        annotation_dir=getattr(args, "annotation_dir", None),
+        confidence_threshold=getattr(args, "dino_confidence_threshold", 0.10),
         batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
     )
 
@@ -1327,7 +1353,10 @@ def main():
     parser.add_argument("--clip_name", type=str, default="ViT-B/16", help="CLIP model name")
     parser.add_argument("--use_clip_penultimate", action="store_true", help="Use CLIP penultimate layer")
     parser.add_argument("--use_vlg", action="store_true", help="Use VLG-CBM training (AllOne concepts, BCE/TwoWay loss, SAGA final layer)")
-    
+    parser.add_argument("--annotation_dir", type=str, default=None,
+        help="Path to folder containing cifar100_train/ and cifar100_val/ (pre-generated Grounding DINO annotations). If set, use DINO concept labels instead of AllOne.")
+    parser.add_argument("--dino_confidence_threshold", type=float, default=0.10,
+        help="Min logit for DINO annotations to count (only when --annotation_dir is set)")
     parser.add_argument("--num_clients", type=int, default=5, help="Number of federated clients")
     parser.add_argument("--num_rounds", type=int, default=10, help="Number of federated rounds")
     parser.add_argument("--local_epochs", type=int, default=5, help="Local training epochs per round")
