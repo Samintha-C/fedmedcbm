@@ -81,9 +81,10 @@ def soft_threshold(beta, lam):
 # Grouped L1 regularization
 # proximal operator for f(weight) = lam * \|weight\|_2 
 # where the 2-norm is taken columnwise
-def group_threshold(weight, lam): 
+def group_threshold(weight, lam):
     norm = weight.norm(p=2, dim=0)
-    return (weight - lam*weight/norm)*(norm > lam)
+    safe_norm = norm.clamp(min=1e-8)   # prevent NaN when a column is already zero
+    return (weight - lam*weight/safe_norm)*(norm > lam)
 
 # Elastic net regularization
 # proximal operator for f(x) = alpha * \|x\|_1 + beta * \|x\|_2^2

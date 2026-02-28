@@ -1222,6 +1222,12 @@ def simulate_federated_training_vlg(args):
                                     "concepts_alive": int(_concepts_alive)})
 
         if best_fl_state is not None:
+            # Apply the accumulated dead-concept mask to the best-accuracy checkpoint.
+            # Concepts zeroed by server pruning in later rounds stay zeroed even if
+            # the best val accuracy was achieved before those rounds.
+            for key in _weight_mask:
+                if key in best_fl_state:
+                    best_fl_state[key] = best_fl_state[key] * _weight_mask[key]
             final_layer.load_state_dict(best_fl_state)
         global_model.final_layer = final_layer
 
