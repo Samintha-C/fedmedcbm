@@ -1236,6 +1236,199 @@ def simulate_federated_training_vlg(args):
         total_w = final_layer.weight.data.numel()
         print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
+    elif vlg_final_method == "feddualavg":
+        print("\n=== Phase 3: Federated Dual Averaging with Group Lasso (VLG) ===")
+        # Reuse the normalized concept features already extracted in Phase 2.
+        client_concept_loaders = []
+        offset = 0
+        for i in range(args.num_clients):
+            n = client_data_sizes[i]
+            c_feats = all_train_feats[offset:offset + n]
+            c_labels = all_train_labels[offset:offset + n]
+            offset += n
+            client_concept_loaders.append(DataLoader(
+                TensorDataset(c_feats, c_labels),
+                batch_size=saga_bs, shuffle=True
+            ))
+
+        # Per-client val concept features
+        client_val_concept_loaders = []
+        client_val_sizes = []
+        if _pretrained_mode:
+            n_val_total = val_feats.shape[0]
+            base_val = n_val_total // args.num_clients
+            rem_val = n_val_total % args.num_clients
+            offset_val = 0
+            for i in range(args.num_clients):
+                n_v = base_val + (1 if i < rem_val else 0)
+                v_feats_i = val_feats[offset_val:offset_val + n_v]
+                v_labels_i = val_labels_all[offset_val:offset_val + n_v]
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(v_feats_i, v_labels_i),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(n_v)
+                offset_val += n_v
+        else:
+            for i in range(args.num_clients):
+                idx = torch.tensor(_val_indices_thresh[i], dtype=torch.long)
+                v_feats_i = val_feats[idx]
+                v_labels_i = val_labels_all[idx]
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(v_feats_i, v_labels_i),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(len(idx))
+        total_val = sum(client_val_sizes)
+        client_val_weights = [n / total_val for n in client_val_sizes]
+
+        # Initialize final layer and dual state
+        final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+        ce_loss = nn.CrossEntropyLoss()
+
+        final_rounds = getattr(args, "final_rounds", 5)
+        final_epochs = getattr(args, "final_epochs", 3)
+        eta_s = args.dual_eta_s
+        eta_c = args.dual_eta_c
+        dual_lam = args.dual_lam
+
+        # Dual state: accumulated (negative) gradients — same shape as weight and bias
+        z_weight = torch.zeros(num_classes, num_concepts, device=device)
+        z_bias = torch.zeros(num_classes, device=device)
+
+        # Count total local steps per round (K) for eta_tilde schedule
+        # K = final_epochs * avg_batches_per_epoch; approximate from first client
+        K_approx = final_epochs * len(client_concept_loaders[0])
+
+        dual_metrics = {
+            "rounds": [], "client_losses": [], "avg_client_loss": [],
+            "val_accuracy": [], "best_val_accuracy": [],
+            "concepts_alive": [], "nnz_weights": [],
+            "eta_tilde": [],
+        }
+        best_val_acc = 0.0
+        best_fl_state = None
+
+        for round_num in range(final_rounds):
+            print(f"\n=== FedDualAvg Round {round_num + 1}/{final_rounds} ===")
+            round_losses = []
+            client_z_deltas_w = []
+            client_z_deltas_b = []
+
+            for i in range(args.num_clients):
+                # Each client starts from the global dual state
+                z_local_w = z_weight.clone()
+                z_local_b = z_bias.clone()
+
+                client_loss_sum = 0.0
+                n_steps = 0
+
+                for epoch in range(final_epochs):
+                    for feats, labels in client_concept_loaders[i]:
+                        feats, labels = feats.to(device), labels.to(device)
+
+                        # Step counter for eta_tilde schedule
+                        global_step = round_num * K_approx + n_steps + 1
+                        eta_tilde = eta_s * eta_c * global_step * dual_lam
+
+                        # 1. Primal recovery: w = prox(z, eta_tilde)
+                        w_primal = group_threshold(z_local_w, eta_tilde)
+                        b_primal = z_local_b.clone()  # no regularization on bias
+
+                        # 2. Forward pass and gradient at primal point
+                        w_param = w_primal.detach().requires_grad_(True)
+                        b_param = b_primal.detach().requires_grad_(True)
+                        logits = feats @ w_param.T + b_param
+                        loss = ce_loss(logits, labels)
+                        loss.backward()
+                        grad_w = w_param.grad.detach()
+                        grad_b = b_param.grad.detach()
+
+                        # 3. Update dual: z -= eta_c * grad
+                        z_local_w -= eta_c * grad_w
+                        z_local_b -= eta_c * grad_b
+
+                        client_loss_sum += loss.item()
+                        n_steps += 1
+
+                # Client dual delta
+                delta_w = z_local_w - z_weight
+                delta_b = z_local_b - z_bias
+                client_z_deltas_w.append(delta_w)
+                client_z_deltas_b.append(delta_b)
+                round_losses.append(client_loss_sum / max(n_steps, 1))
+                print(f"  Client {i}: Loss = {round_losses[-1]:.4f}")
+
+            # Server: weighted average of dual deltas
+            avg_delta_w = torch.zeros_like(z_weight)
+            avg_delta_b = torch.zeros_like(z_bias)
+            for i in range(args.num_clients):
+                avg_delta_w += client_weights[i] * client_z_deltas_w[i]
+                avg_delta_b += client_weights[i] * client_z_deltas_b[i]
+
+            z_weight += eta_s * avg_delta_w
+            z_bias += eta_s * avg_delta_b
+
+            # Server primal recovery
+            server_step = (round_num + 1) * K_approx
+            eta_tilde_server = eta_s * eta_c * server_step * dual_lam
+            w_server = group_threshold(z_weight, eta_tilde_server)
+            b_server = z_bias.clone()
+
+            # Load primal into final layer for evaluation
+            with torch.no_grad():
+                final_layer.weight.copy_(w_server)
+                final_layer.bias.copy_(b_server)
+
+            # Sparsity stats
+            nnz = (w_server.abs() > 1e-5).sum().item()
+            total_w = w_server.numel()
+            col_norms = w_server.norm(p=2, dim=0)
+            concepts_alive = (col_norms > 1e-5).sum().item()
+            concepts_total = w_server.shape[1]
+            print(f"  eta_tilde_server={eta_tilde_server:.6f}  col_norms: min={col_norms.min():.4f} median={col_norms.median():.4f} max={col_norms.max():.4f}")
+            print(f"  Weights: {nnz}/{total_w} non-zero  Concepts: {concepts_alive}/{concepts_total}")
+
+            # Federated evaluation
+            final_layer.eval()
+            val_acc = 0.0
+            with torch.no_grad():
+                for i in range(args.num_clients):
+                    client_correct, client_total = 0, 0
+                    for feats, labels in client_val_concept_loaders[i]:
+                        feats, labels = feats.to(device), labels.to(device)
+                        preds = final_layer(feats).argmax(dim=1)
+                        client_correct += (preds == labels).sum().item()
+                        client_total += labels.size(0)
+                    val_acc += client_val_weights[i] * (client_correct / max(client_total, 1))
+            print(f"  Val Accuracy: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_fl_state = {k: v.clone() for k, v in final_layer.state_dict().items()}
+
+            dual_metrics["rounds"].append(round_num + 1)
+            dual_metrics["client_losses"].append(round_losses)
+            dual_metrics["avg_client_loss"].append(sum(round_losses) / len(round_losses))
+            dual_metrics["val_accuracy"].append(float(val_acc))
+            dual_metrics["best_val_accuracy"].append(float(best_val_acc))
+            dual_metrics["concepts_alive"].append(int(concepts_alive))
+            dual_metrics["nnz_weights"].append(int(nnz))
+            dual_metrics["eta_tilde"].append(float(eta_tilde_server))
+            _update_log(_log_path, {"status": "in_progress", "phase": "final_layer_feddualavg",
+                                    "round": round_num + 1, "total_rounds": final_rounds,
+                                    "val_accuracy": float(val_acc), "best_val_accuracy": float(best_val_acc),
+                                    "concepts_alive": int(concepts_alive), "nnz_weights": int(nnz),
+                                    "eta_tilde": float(eta_tilde_server)})
+
+        if best_fl_state is not None:
+            final_layer.load_state_dict(best_fl_state)
+        global_model.final_layer = final_layer
+
+        # Report sparsity
+        nnz = (final_layer.weight.data.abs() > 1e-5).sum().item()
+        total_w = final_layer.weight.data.numel()
+        print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
+
     global_model.backbone.to(device)     # move backbone back to GPU for evaluation
     _log_mem("before test evaluation (backbone back on GPU)")
     test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
@@ -1277,6 +1470,11 @@ def simulate_federated_training_vlg(args):
         metrics_txt_data["thresh_lam_end"] = args.thresh_lam_end
         metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
         metrics_txt_data["final_lr"] = getattr(args, "final_lr", 1e-3)
+    elif vlg_final_method == "feddualavg":
+        metrics_txt_data["dual_eta_s"] = args.dual_eta_s
+        metrics_txt_data["dual_eta_c"] = args.dual_eta_c
+        metrics_txt_data["dual_lam"] = args.dual_lam
+        metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
     try:
         with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
             json.dump(metrics_txt_data, f, indent=2)
@@ -1339,6 +1537,8 @@ def simulate_federated_training_vlg(args):
     }
     if vlg_final_method == "fedavg_thresh":
         training_metrics["final_layer_phase"] = thresh_metrics
+    elif vlg_final_method == "feddualavg":
+        training_metrics["final_layer_phase"] = dual_metrics
     elif vlg_final_method in ("hybrid_saga", "fedavg"):
         training_metrics["final_layer_phase"] = vlg_central_metrics
     with open(os.path.join(save_dir, "training_metrics.json"), "w") as f:
@@ -1380,15 +1580,22 @@ def main():
     parser.add_argument("--final_rounds", type=int, default=5, help="Number of rounds for final layer training")
     parser.add_argument("--final_epochs", type=int, default=3, help="Epochs per round for final layer training")
     parser.add_argument("--final_layer_method", type=str, default=None,
-        choices=["fedavg", "fedavg_thresh", "hybrid_saga"],
+        choices=["fedavg", "fedavg_thresh", "hybrid_saga", "feddualavg"],
         help="Final layer training method: fedavg (dense FedAvg for LFC, dense centralized for VLG), "
              "fedavg_thresh (FedAvg + server-side thresholding), "
-             "hybrid_saga (federated feature extraction + centralized GLM-SAGA). "
+             "hybrid_saga (federated feature extraction + centralized GLM-SAGA), "
+             "feddualavg (Federated Dual Averaging with group-lasso proximal). "
              "Default: fedavg for LFC, hybrid_saga for VLG")
     parser.add_argument("--thresh_lam_start", type=float, default=0.01,
         help="Starting group-threshold lambda (compared to column L2 norms)")
     parser.add_argument("--thresh_lam_end", type=float, default=0.12,
         help="Ending group-threshold lambda (compared to column L2 norms)")
+    parser.add_argument("--dual_eta_s", type=float, default=1.0,
+        help="Server learning rate for FedDualAvg")
+    parser.add_argument("--dual_eta_c", type=float, default=0.01,
+        help="Client learning rate for FedDualAvg")
+    parser.add_argument("--dual_lam", type=float, default=0.001,
+        help="Group-lasso regularization lambda for FedDualAvg")
     
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
