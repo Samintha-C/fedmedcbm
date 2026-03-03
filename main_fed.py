@@ -1291,6 +1291,8 @@ def simulate_federated_training_vlg(args):
         eta_s = args.dual_eta_s
         eta_c = args.dual_eta_c
         dual_lam = args.dual_lam
+        dual_lam_end = getattr(args, "dual_lam_end", 0.01)
+        dual_schedule = getattr(args, "dual_schedule", "linear")
 
         # Dual state: accumulated (negative) gradients — same shape as weight and bias
         z_weight = torch.zeros(num_classes, num_concepts, device=device)
@@ -1329,7 +1331,12 @@ def simulate_federated_training_vlg(args):
 
                         # Step counter for eta_tilde schedule
                         global_step = round_num * K_approx + n_steps + 1
-                        eta_tilde = eta_s * eta_c * global_step * dual_lam
+                        total_steps = final_rounds * K_approx
+                        if dual_schedule == "burnin":
+                            progress = global_step / total_steps
+                            eta_tilde = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
+                        else:
+                            eta_tilde = eta_s * eta_c * global_step * dual_lam
 
                         # 1. Primal recovery: w = prox(z, eta_tilde)
                         w_primal = group_threshold(z_local_w, eta_tilde)
@@ -1371,7 +1378,12 @@ def simulate_federated_training_vlg(args):
 
             # Server primal recovery
             server_step = (round_num + 1) * K_approx
-            eta_tilde_server = eta_s * eta_c * server_step * dual_lam
+            total_steps = final_rounds * K_approx
+            if dual_schedule == "burnin":
+                progress = server_step / total_steps
+                eta_tilde_server = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
+            else:
+                eta_tilde_server = eta_s * eta_c * server_step * dual_lam
             w_server = group_threshold(z_weight, eta_tilde_server)
             b_server = z_bias.clone()
 
@@ -1474,7 +1486,10 @@ def simulate_federated_training_vlg(args):
         metrics_txt_data["dual_eta_s"] = args.dual_eta_s
         metrics_txt_data["dual_eta_c"] = args.dual_eta_c
         metrics_txt_data["dual_lam"] = args.dual_lam
+        metrics_txt_data["dual_schedule"] = getattr(args, "dual_schedule", "linear")
         metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
+        if getattr(args, "dual_schedule", "linear") == "burnin":
+            metrics_txt_data["dual_lam_end"] = getattr(args, "dual_lam_end", 0.01)
     try:
         with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
             json.dump(metrics_txt_data, f, indent=2)
@@ -1596,7 +1611,14 @@ def main():
         help="Client learning rate for FedDualAvg")
     parser.add_argument("--dual_lam", type=float, default=0.001,
         help="Group-lasso regularization lambda for FedDualAvg")
-    
+    parser.add_argument("--dual_lam_end", type=float, default=0.01,
+        help="Ending eta_tilde for burnin schedule (decays from dual_lam to this value)")
+    parser.add_argument("--dual_schedule", type=str, default="linear",
+        choices=["linear", "burnin"],
+        help="eta_tilde schedule for FedDualAvg: "
+             "linear (grows over time, original), "
+             "burnin (starts high and decays, SAGA-style)")
+
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--save_dir", type=str, default="saved_models", help="Save directory")
