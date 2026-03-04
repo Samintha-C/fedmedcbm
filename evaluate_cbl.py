@@ -93,37 +93,58 @@ def evaluate_cbl_dino(backbone, cbl, dino_loader, concepts, device):
     per_concept = []
     for c in range(C):
         gt = all_dino_labels[:, c].numpy()
-        pred = cbl_binary[:, c].numpy()
         prob = cbl_probs[:, c].numpy()
         prevalence = float(gt.mean())
+        n_pos = int(gt.sum())
 
         metrics_c = {
             "concept": concepts[c] if c < len(concepts) else f"concept_{c}",
             "prevalence": prevalence,
-            "precision": float(precision_score(gt, pred, zero_division=0)),
-            "recall": float(recall_score(gt, pred, zero_division=0)),
-            "f1": float(f1_score(gt, pred, zero_division=0)),
+            "n_positive": n_pos,
             "auc_roc": None,
+            # F1 at fixed 0.5 threshold
+            "f1_at_05": float(f1_score(gt, (prob > 0.5).astype(float), zero_division=0)),
+            "precision_at_05": float(precision_score(gt, (prob > 0.5).astype(float), zero_division=0)),
+            "recall_at_05": float(recall_score(gt, (prob > 0.5).astype(float), zero_division=0)),
+            # F1 at optimal threshold (sweep 0.01–0.99)
+            "f1_optimal": 0.0,
+            "threshold_optimal": None,
         }
-        if 0 < gt.sum() < len(gt):
+
+        if n_pos > 0 and n_pos < N:
             metrics_c["auc_roc"] = float(roc_auc_score(gt, prob))
+            # Find threshold maximising F1
+            best_f1, best_thr = 0.0, 0.5
+            for thr in np.linspace(0.01, 0.99, 99):
+                f = f1_score(gt, (prob >= thr).astype(float), zero_division=0)
+                if f > best_f1:
+                    best_f1, best_thr = f, float(thr)
+            metrics_c["f1_optimal"] = float(best_f1)
+            metrics_c["threshold_optimal"] = float(best_thr)
+
         per_concept.append(metrics_c)
 
-    all_f1s = [m["f1"] for m in per_concept]
-    all_aucs = [m["auc_roc"] for m in per_concept if m["auc_roc"] is not None]
+    # Aggregate only over concepts that have at least one positive annotation
+    annotated = [m for m in per_concept if m["n_positive"] > 0]
+    all_aucs = [m["auc_roc"] for m in annotated if m["auc_roc"] is not None]
     all_prevalences = [m["prevalence"] for m in per_concept]
     overall_acc = float((cbl_binary == all_dino_labels).float().mean())
 
     return {
         "num_samples": N,
         "num_concepts": C,
+        "concepts_with_any_positive": len(annotated),
         "overall_binary_accuracy": overall_acc,
-        "mean_f1": float(np.mean(all_f1s)),
-        "median_f1": float(np.median(all_f1s)),
+        # F1 at 0.5 threshold — only over annotated concepts
+        "mean_f1_at_05": float(np.mean([m["f1_at_05"] for m in annotated])) if annotated else None,
+        "median_f1_at_05": float(np.median([m["f1_at_05"] for m in annotated])) if annotated else None,
+        # F1 at per-concept optimal threshold — upper bound on F1 performance
+        "mean_f1_optimal": float(np.mean([m["f1_optimal"] for m in annotated])) if annotated else None,
+        "median_f1_optimal": float(np.median([m["f1_optimal"] for m in annotated])) if annotated else None,
+        # AUC — threshold-independent discrimination quality
         "mean_auc_roc": float(np.mean(all_aucs)) if all_aucs else None,
         "median_auc_roc": float(np.median(all_aucs)) if all_aucs else None,
         "mean_prevalence": float(np.mean(all_prevalences)),
-        "concepts_with_any_positive": sum(1 for p in all_prevalences if p > 0),
         "per_concept": per_concept,
     }
 
@@ -198,23 +219,28 @@ def main():
     print(f"Concepts with any positive annotation: {results['concepts_with_any_positive']}/{results['num_concepts']}")
     print(f"Mean concept prevalence: {results['mean_prevalence']:.4f}")
     print(f"\nOverall binary accuracy:  {results['overall_binary_accuracy']:.4f}")
-    print(f"Mean F1:                  {results['mean_f1']:.4f}")
-    print(f"Median F1:                {results['median_f1']:.4f}")
+    print(f"Mean F1 (at 0.5 thr):     {results['mean_f1_at_05']:.4f}")
+    print(f"Median F1 (at 0.5 thr):   {results['median_f1_at_05']:.4f}")
+    print(f"Mean F1 (optimal thr):    {results['mean_f1_optimal']:.4f}")
+    print(f"Median F1 (optimal thr):  {results['median_f1_optimal']:.4f}")
     if results['mean_auc_roc'] is not None:
         print(f"Mean AUC-ROC:             {results['mean_auc_roc']:.4f}")
         print(f"Median AUC-ROC:           {results['median_auc_roc']:.4f}")
 
-    sorted_by_f1 = sorted(results["per_concept"], key=lambda x: x["f1"], reverse=True)
+    sorted_by_f1 = sorted(results["per_concept"], key=lambda x: x["f1_optimal"], reverse=True)
 
-    print(f"\nTop 10 concepts by F1:")
+    print(f"\nTop 10 concepts by F1 (optimal threshold):")
     for i, m in enumerate(sorted_by_f1[:10]):
         auc_str = f"AUC={m['auc_roc']:.3f}" if m['auc_roc'] is not None else "AUC=N/A"
-        print(f"  {i+1:2d}. {m['concept']:40s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  {auc_str}  prev={m['prevalence']:.3f}")
+        thr_str = f"thr={m['threshold_optimal']:.2f}" if m['threshold_optimal'] is not None else "thr=N/A"
+        print(f"  {i+1:2d}. {m['concept']:40s}  F1*={m['f1_optimal']:.3f}  F1@.5={m['f1_at_05']:.3f}  {auc_str}  {thr_str}  prev={m['prevalence']:.3f}")
 
-    print(f"\nBottom 10 concepts by F1:")
-    for i, m in enumerate(sorted_by_f1[-10:]):
+    print(f"\nBottom 10 concepts by F1 (optimal threshold, annotated only):")
+    annotated_sorted = [m for m in sorted_by_f1 if m["n_positive"] > 0]
+    for i, m in enumerate(annotated_sorted[-10:]):
         auc_str = f"AUC={m['auc_roc']:.3f}" if m['auc_roc'] is not None else "AUC=N/A"
-        print(f"  {i+1:2d}. {m['concept']:40s}  F1={m['f1']:.3f}  P={m['precision']:.3f}  R={m['recall']:.3f}  {auc_str}  prev={m['prevalence']:.3f}")
+        thr_str = f"thr={m['threshold_optimal']:.2f}" if m['threshold_optimal'] is not None else "thr=N/A"
+        print(f"  {i+1:2d}. {m['concept']:40s}  F1*={m['f1_optimal']:.3f}  F1@.5={m['f1_at_05']:.3f}  {auc_str}  {thr_str}  prev={m['prevalence']:.3f}")
 
     results["load_dir"] = args.load_dir
     results["dataset"] = dataset_name
