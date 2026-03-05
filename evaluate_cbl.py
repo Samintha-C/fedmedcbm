@@ -26,7 +26,13 @@ from models.fed_vlgcbm import Backbone, BackboneCLIP, ConceptLayer
 
 
 def load_phase1(load_dir, device):
-    """Load backbone + CBL from a Phase 1 checkpoint directory."""
+    """Load backbone + CBL from a Phase 1 checkpoint directory.
+
+    Supports two checkpoint formats:
+    - Federated VLG (our format): backbone.pt + cbl.pt + args.txt with "backbone" key
+    - Vanilla VLG-CBM (original paper): cbl.pt only + args.txt with "backbone"/"concept_set" keys.
+      The backbone is not saved when cbl_finetune=False; pretrained weights are used as-is.
+    """
     args_path = os.path.join(load_dir, "args.txt")
     if os.path.exists(args_path):
         with open(args_path) as f:
@@ -42,9 +48,13 @@ def load_phase1(load_dir, device):
     else:
         backbone = Backbone(backbone_name, feature_layer, device)
 
-    backbone.backbone.load_state_dict(
-        torch.load(os.path.join(load_dir, "backbone.pt"), map_location=device)
-    )
+    backbone_pt = os.path.join(load_dir, "backbone.pt")
+    if os.path.exists(backbone_pt):
+        backbone.backbone.load_state_dict(
+            torch.load(backbone_pt, map_location=device)
+        )
+    else:
+        print(f"  [INFO] backbone.pt not found — using pretrained weights (cbl_finetune=False checkpoint)")
 
     # Infer num_concepts from cbl.pt
     cbl_sd = torch.load(os.path.join(load_dir, "cbl.pt"), map_location=device)
@@ -174,8 +184,8 @@ def main():
 
     dataset_name = args.dataset or saved_args.get("dataset", "cifar100")
 
-    # Load concepts
-    concept_file = args.concept_file or saved_args.get("concept_file")
+    # Load concepts — handle both "concept_file" (our format) and "concept_set" (vanilla VLG-CBM)
+    concept_file = args.concept_file or saved_args.get("concept_file") or saved_args.get("concept_set")
     if concept_file is None:
         concept_path = os.path.join(args.load_dir, "concepts.txt")
         if os.path.exists(concept_path):
