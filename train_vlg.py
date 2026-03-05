@@ -2,11 +2,17 @@ import copy
 import gc
 import json
 import os
+import sys
 import datetime
 import importlib.util
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Subset
+
+# Ensure project root is on sys.path before local imports
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
 
 from glm_saga.elasticnet import IndexedTensorDataset, group_threshold
 from tqdm import tqdm
@@ -222,9 +228,9 @@ def simulate_federated_training_vlg(args):
                 # Compute actual per-concept positive counts from DINO annotations.
                 print("Computing per-concept positive counts from DINO annotations...")
                 concept_counts = torch.zeros(num_concepts)
-                for idx in range(num_train):
-                    _, concept_vec, _ = base_cbl_dataset[idx]
-                    concept_counts += concept_vec
+                count_loader = DataLoader(base_cbl_dataset, batch_size=256, num_workers=args.num_workers, shuffle=False)
+                for _, concept_batch, _ in count_loader:
+                    concept_counts += concept_batch.sum(dim=0)
                 concept_counts = concept_counts.tolist()
                 print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
             else:

@@ -1,9 +1,15 @@
 import json
 import os
+import sys
 import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+
+# Ensure project root is on sys.path before local imports
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
 
 import clip
 from glm_saga.elasticnet import soft_threshold, IndexedTensorDataset, glm_saga

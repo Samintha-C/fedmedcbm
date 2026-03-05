@@ -1,5 +1,12 @@
 import argparse
 import json
+import os
+import sys
+
+# Ensure project root is on sys.path before local imports
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
 
 from train_lfc import simulate_federated_training
 from train_vlg import simulate_federated_training_vlg
