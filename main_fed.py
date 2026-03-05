@@ -10,6 +10,8 @@ def main():
 
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet", "cub"], help="Dataset name")
     parser.add_argument("--concept_file", type=str, required=True, help="Path to concept file")
+    parser.add_argument("--filter_set", type=str, default=None,
+        help="Path to file listing concepts to remove (one per line). Used to match vanilla VLG-CBM concept filtering.")
     parser.add_argument("--backbone", type=str, default="resnet50", help="Backbone type: resnet50 or clip_ViT-B/16")
     parser.add_argument("--clip_name", type=str, default="ViT-B/16", help="CLIP model name")
     parser.add_argument("--use_clip_penultimate", action="store_true", help="Use CLIP penultimate layer")
