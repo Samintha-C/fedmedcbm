@@ -143,13 +143,18 @@ def validate_cbl(backbone, cbl, val_loader, loss_fn, device="cuda"):
 
 
 def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_decay=1e-5,
-              device="cuda", finetune=False, optimizer_name="sgd", backbone_lr=1e-3):
+              device="cuda", finetune=False, optimizer_name="sgd", backbone_lr=1e-3,
+              val_loader=None):
     if optimizer_name == "sgd":
         opt = torch.optim.SGD(cbl.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9)
     else:
         opt = torch.optim.Adam(cbl.parameters(), lr=lr, weight_decay=weight_decay)
     if finetune:
         opt.add_param_group({"params": backbone.parameters(), "lr": backbone_lr})
+
+    best_val_loss = float("inf")
+    best_cbl_state = None
+    best_backbone_state = None
 
     for epoch in range(epochs):
         train_loss = 0.0
@@ -175,6 +180,20 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
             train_loss += loss.item()
         backbone.eval()
         train_loss /= len(train_loader)
+
+        if val_loader is not None:
+            val_loss = validate_cbl(backbone, cbl, val_loader, loss_fn, device)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_cbl_state = {k: v.clone() for k, v in cbl.state_dict().items()}
+                best_backbone_state = {k: v.clone() for k, v in backbone.state_dict().items()}
+
+    # Restore best-epoch weights (matches VLG-CBM train_cbl behaviour)
+    if val_loader is not None and best_cbl_state is not None:
+        cbl.load_state_dict(best_cbl_state)
+        if best_backbone_state is not None:
+            backbone.load_state_dict(best_backbone_state)
+
     return train_loss
 
 
