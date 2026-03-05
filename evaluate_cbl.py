@@ -184,18 +184,23 @@ def main():
 
     dataset_name = args.dataset or saved_args.get("dataset", "cifar100")
 
-    # Load concepts — handle both "concept_file" (our format) and "concept_set" (vanilla VLG-CBM)
-    concept_file = args.concept_file or saved_args.get("concept_file") or saved_args.get("concept_set")
-    if concept_file is None:
-        concept_path = os.path.join(args.load_dir, "concepts.txt")
-        if os.path.exists(concept_path):
-            with open(concept_path) as f:
-                concepts = [l.strip() for l in f if l.strip()]
-        else:
-            raise FileNotFoundError("No concept file found. Specify --concept_file.")
+    # Load concepts: prefer the checkpoint's concepts.txt (reflects post-filter concepts
+    # the model actually trained on) over the input concept file (which may be pre-filter).
+    checkpoint_concepts_path = os.path.join(args.load_dir, "concepts.txt")
+    if os.path.exists(checkpoint_concepts_path):
+        with open(checkpoint_concepts_path) as f:
+            concepts = [l.strip() for l in f if l.strip()]
+        print(f"Loaded {len(concepts)} concepts from checkpoint concepts.txt (CBL has {num_concepts} outputs)")
     else:
+        concept_file = args.concept_file or saved_args.get("concept_file") or saved_args.get("concept_set")
+        if concept_file is None:
+            raise FileNotFoundError("No concept file found. Specify --concept_file or place concepts.txt in load_dir.")
         concepts = data_utils.get_concepts(concept_file, saved_args.get("filter_set"))
-    print(f"Loaded {len(concepts)} concepts (CBL has {num_concepts} outputs)")
+        print(f"Loaded {len(concepts)} concepts from {concept_file} (CBL has {num_concepts} outputs)")
+
+    if len(concepts) != num_concepts:
+        print(f"  [WARNING] Concept count mismatch: {len(concepts)} concepts vs {num_concepts} CBL outputs. "
+              f"The model may have been trained with concept filtering.")
 
     from torch.utils.data import DataLoader
     from data.concept_dataset_vlg import DinoConceptDataset
