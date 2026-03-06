@@ -115,9 +115,11 @@ def simulate_federated_training_vlg(args):
             num_hidden=getattr(args, "cbl_hidden_layers", 0),
             bias=True, device="cpu"
         )
-        backbone.backbone.load_state_dict(
-            torch.load(os.path.join(load_dir, "backbone.pt"), map_location="cpu")
-        )
+        _bb_pt = os.path.join(load_dir, "backbone.pt")
+        if os.path.exists(_bb_pt):
+            backbone.backbone.load_state_dict(torch.load(_bb_pt, map_location="cpu"))
+        else:
+            print(f"  [INFO] backbone.pt not found in {load_dir} — using pretrained weights (cbl_finetune=False checkpoint)")
         cbl.load_state_dict(
             torch.load(os.path.join(load_dir, "cbl.pt"), map_location="cpu")
         )
@@ -213,9 +215,13 @@ def simulate_federated_training_vlg(args):
         _cbl_dir = getattr(args, "load_cbl_dir", None)
         if _cbl_dir is not None:
             # Load a Phase-1-only checkpoint; skip CBL training entirely.
-            global_model.backbone.backbone.load_state_dict(
-                torch.load(os.path.join(_cbl_dir, "backbone.pt"), map_location=str(device))
-            )
+            _bb_pt = os.path.join(_cbl_dir, "backbone.pt")
+            if os.path.exists(_bb_pt):
+                global_model.backbone.backbone.load_state_dict(
+                    torch.load(_bb_pt, map_location=str(device))
+                )
+            else:
+                print(f"  [INFO] backbone.pt not found in {_cbl_dir} — using pretrained weights (cbl_finetune=False checkpoint)")
             global_model.cbl.load_state_dict(
                 torch.load(os.path.join(_cbl_dir, "cbl.pt"), map_location=str(device))
             )
