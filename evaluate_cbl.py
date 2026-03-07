@@ -157,6 +157,64 @@ def evaluate_cbl_dino(backbone, cbl, dino_loader, concepts, device):
     }
 
 
+def _collect_val_activations(backbone, cbl, dino_loader, device):
+    """Return (logits [N,C], dino_labels [N,C], class_labels [N]) as numpy arrays."""
+    all_logits, all_dino, all_class = [], [], []
+    backbone.eval()
+    cbl.eval()
+    with torch.no_grad():
+        for images, concept_one_hot, targets in dino_loader:
+            images = images.to(device)
+            logits = cbl(backbone(images))
+            all_logits.append(logits.cpu().numpy())
+            all_dino.append(concept_one_hot.numpy())
+            all_class.append(
+                targets.numpy() if torch.is_tensor(targets) else np.array(targets)
+            )
+    return np.concatenate(all_logits), np.concatenate(all_dino), np.concatenate(all_class)
+
+
+def _collect_train_activations(backbone, cbl, dataset_name, preprocess, device, batch_size):
+    """Extract concept logits from the full training set.
+
+    Returns (logits [N,C], class_labels [N]), or (None, None) if the training
+    split cannot be loaded.
+    """
+    from torch.utils.data import DataLoader
+
+    class _Wrapped(torch.utils.data.Dataset):
+        def __init__(self, ds, tfm):
+            self.ds = ds
+            self.tfm = tfm
+        def __len__(self):
+            return len(self.ds)
+        def __getitem__(self, i):
+            img, lbl = self.ds[i]
+            return (self.tfm(img) if self.tfm is not None else img), lbl
+
+    try:
+        raw_train = data_utils.get_data(f"{dataset_name}_train", preprocess=None)
+    except Exception:
+        return None, None
+
+    loader = DataLoader(
+        _Wrapped(raw_train, preprocess),
+        batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True,
+    )
+    all_logits, all_labels = [], []
+    backbone.eval()
+    cbl.eval()
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs = imgs.to(device)
+            logits = cbl(backbone(imgs))
+            all_logits.append(logits.cpu().numpy())
+            all_labels.append(
+                labels.numpy() if torch.is_tensor(labels) else np.array(labels)
+            )
+    return np.concatenate(all_logits), np.concatenate(all_labels)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate CBL against DINO binary annotations")
     parser.add_argument("--load_dir", type=str, required=True,
@@ -173,6 +231,23 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--save_results", type=str, default=None,
         help="Path to save results JSON (default: <load_dir>/cbl_evaluation_dino.json)")
+    # ── Diagnostic flags ──────────────────────────────────────────────────────
+    parser.add_argument("--run_diagnostics", action="store_true",
+        help="Run all 6 CBL diagnostics (adds calibration, Cohen's d, co-activation, "
+             "linear probe, client geometry, and optional Jaccard comparison)")
+    parser.add_argument("--compare_dir", type=str, default=None,
+        help="Second CBL checkpoint for diagnostic 6 (Jaccard agreement). "
+             "Only used when --run_diagnostics is set.")
+    parser.add_argument("--num_clients", type=int, default=5,
+        help="Number of clients to simulate for diagnostic 1 (default: 5)")
+    parser.add_argument("--alpha", type=float, default=0.5,
+        help="Dirichlet alpha for client split in diagnostic 1 (default: 0.5)")
+    parser.add_argument("--diag_seed", type=int, default=42,
+        help="RNG seed for Dirichlet partition in diagnostic 1 (default: 42)")
+    parser.add_argument("--skip_client_geometry", action="store_true",
+        help="Skip diagnostic 1 — avoids the full training-set forward pass")
+    parser.add_argument("--skip_linear_probe", action="store_true",
+        help="Skip logistic regression in diagnostic 5 — avoids the training-set pass")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -259,6 +334,111 @@ def main():
     results["dataset"] = dataset_name
     results["annotation_dir"] = args.annotation_dir
     results["confidence_threshold"] = args.dino_confidence_threshold
+
+    # ── Optional diagnostics ──────────────────────────────────────────────────
+    if args.run_diagnostics:
+        from evaluation_utils import (
+            diag_client_geometry, diag_calibration, diag_cohens_d,
+            diag_coactivation, diag_class_conditional, diag_jaccard_agreement,
+        )
+
+        print(f"\n{'='*60}")
+        print("Running CBL diagnostics")
+        print(f"{'='*60}")
+
+        # Collect val activations (one extra forward pass to get class labels too)
+        print("\nCollecting val activations...")
+        val_logits, val_dino, val_class = _collect_val_activations(
+            backbone, cbl, dino_loader, device
+        )
+
+        # Train activations — needed for diagnostics 1 and 5
+        train_logits, train_class = None, None
+        need_train = not (args.skip_client_geometry and args.skip_linear_probe)
+        if need_train:
+            print("Collecting train activations (may take a few minutes)...")
+            train_logits, train_class = _collect_train_activations(
+                backbone, cbl, dataset_name, preprocess, device, args.batch_size
+            )
+            if train_logits is not None:
+                print(f"  train shape: {train_logits.shape}")
+            else:
+                print("  WARNING: could not load training split — skipping diag 1 & 5")
+
+        diagnostics = {}
+
+        # Diagnostic 1: client activation geometry
+        if not args.skip_client_geometry and train_logits is not None:
+            print("\n[Diag 1/6] Activation geometry across simulated client partitions...")
+            r1 = diag_client_geometry(
+                train_logits, train_class,
+                num_clients=args.num_clients, alpha=args.alpha, seed=args.diag_seed,
+            )
+            diagnostics["client_geometry"] = r1
+            print(f"  Mean pairwise cosine: {r1['mean_pairwise_cosine']:.4f}  "
+                  f"Min: {r1['min_pairwise_cosine']:.4f}  "
+                  f"Std: {r1['std_pairwise_cosine']:.4f}")
+        else:
+            print("\n[Diag 1/6] Skipped (--skip_client_geometry or no train data)")
+
+        # Diagnostic 2: calibration
+        print("\n[Diag 2/6] Calibration diagnostics...")
+        r2 = diag_calibration(val_logits, val_dino, concepts)
+        diagnostics["calibration"] = r2
+        ls = r2["logit_statistics"]
+        print(f"  Global ECE: {r2['global_ece']:.4f}   "
+              f"Mean per-concept ECE: {r2['mean_per_concept_ece']:.4f}")
+        if ls["pos_mean"] is not None:
+            print(f"  Pos logit mean={ls['pos_mean']:.3f}  "
+                  f"Neg logit mean={ls['neg_mean']:.3f}  "
+                  f"Frac(pos<0)={ls['frac_pos_below_zero']:.3f}")
+
+        # Diagnostic 3: Cohen's d
+        print("\n[Diag 3/6] Per-concept Cohen's d...")
+        r3 = diag_cohens_d(val_logits, val_dino, concepts)
+        diagnostics["cohens_d"] = r3
+        print(f"  Mean d={r3['mean_cohens_d']:.4f}  Median d={r3['median_cohens_d']:.4f}  "
+              f"Frac d>1.0={r3['frac_d_above_1_0']:.4f}  Frac d>0.5={r3['frac_d_above_0_5']:.4f}")
+
+        # Diagnostic 4: co-activation structure
+        print("\n[Diag 4/6] Concept co-activation structure...")
+        r4 = diag_coactivation(val_logits)
+        diagnostics["coactivation"] = r4
+        C_dim = val_logits.shape[1]
+        print(f"  Effective rank: {r4['effective_rank']:.1f} / {C_dim}  "
+              f"({r4['effective_rank_fraction']:.3f})  "
+              f"Mean |corr|={r4['mean_abs_pairwise_corr']:.4f}")
+
+        # Diagnostic 5: class-conditional patterns + linear probe
+        if not args.skip_linear_probe and train_logits is not None:
+            print("\n[Diag 5/6] Class-conditional patterns + linear probe...")
+            r5 = diag_class_conditional(train_logits, train_class, val_logits, val_class)
+            diagnostics["class_conditional"] = r5
+            if "error" not in r5:
+                print(f"  Linear probe val accuracy: {r5['linear_probe_val_accuracy']:.4f}")
+                print(f"  Mean inter-class cosine:   "
+                      f"{r5['mean_inter_class_cosine_of_class_means']:.4f}")
+            else:
+                print(f"  {r5['error']}")
+        else:
+            print("\n[Diag 5/6] Skipped (--skip_linear_probe or no train data)")
+
+        # Diagnostic 6: Jaccard agreement between two CBLs
+        if args.compare_dir:
+            print(f"\n[Diag 6/6] Jaccard agreement vs {args.compare_dir}...")
+            backbone2, cbl2, _, _ = load_phase1(args.compare_dir, device)
+            val_logits2, _, _ = _collect_val_activations(backbone2, cbl2, dino_loader, device)
+            min_c = min(val_logits.shape[1], val_logits2.shape[1])
+            r6 = diag_jaccard_agreement(val_logits[:, :min_c], val_logits2[:, :min_c],
+                                        concepts[:min_c])
+            diagnostics["jaccard_agreement"] = r6
+            print(f"  Mean Jaccard={r6['mean_jaccard']:.4f}  "
+                  f"Median={r6['median_jaccard']:.4f}  "
+                  f"Frac<0.3={r6['frac_below_0_3']:.4f}")
+        else:
+            print("\n[Diag 6/6] Skipped (no --compare_dir provided)")
+
+        results["diagnostics"] = diagnostics
 
     save_path = args.save_results or os.path.join(args.load_dir, "cbl_evaluation_dino.json")
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
