@@ -56,15 +56,13 @@ def load_phase1(load_dir, device):
     else:
         print(f"  [INFO] backbone.pt not found — using pretrained weights (cbl_finetune=False checkpoint)")
 
-    # Infer num_concepts from cbl.pt
+    # Infer num_concepts and num_hidden directly from cbl.pt state dict,
+    # so this works for both our format (args.txt has cbl_hidden_layers) and
+    # vanilla VLG-CBM checkpoints (may not have that key).
     cbl_sd = torch.load(os.path.join(load_dir, "cbl.pt"), map_location=device)
-    first_weight = None
-    for k, v in cbl_sd.items():
-        if "weight" in k:
-            first_weight = v
-            break
-    num_concepts = first_weight.shape[0]
-    num_hidden = saved_args.get("cbl_hidden_layers", 0)
+    weight_keys = sorted(k for k in cbl_sd if k.endswith(".weight"))
+    num_concepts = cbl_sd[weight_keys[0]].shape[0]  # first linear outputs num_concepts
+    num_hidden = len(weight_keys) - 1  # 0 for no hidden layers, 1 for one hidden, etc.
 
     cbl = ConceptLayer(backbone.output_dim, num_concepts, num_hidden=num_hidden, bias=True, device=device)
     cbl.load_state_dict(cbl_sd)
