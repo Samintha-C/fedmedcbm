@@ -366,7 +366,7 @@ def diag_class_conditional(
 
     lr = LogisticRegression(
         max_iter=2000, C=1.0, solver="lbfgs",
-        multi_class="multinomial", random_state=42,
+        random_state=42,
     )
     lr.fit(X_train, train_class_labels)
     val_acc = float(lr.score(X_val, val_class_labels))

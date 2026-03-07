@@ -28,38 +28,48 @@ class DinoConceptDataset(Dataset):
     ):
         self.torch_dataset = torch_dataset
         self.concepts = concepts
+        self.concept_set = set(concepts)
         self.preprocess = preprocess
         self.confidence_threshold = confidence_threshold
         self.dir = os.path.join(annotation_dir, f"{dataset_name}_{split_suffix}")
 
+        # Pre-load all annotations into RAM to avoid per-sample CephFS reads.
+        self._annotation_cache = self._preload_annotations()
+
+    def _preload_annotations(self) -> Dict[int, torch.Tensor]:
+        """Load all annotation JSONs and convert to concept one-hot tensors."""
+        cache = {}
+        n = len(self.torch_dataset)
+        indices = (
+            [int(self.torch_dataset.indices[i]) for i in range(n)]
+            if hasattr(self.torch_dataset, "indices")
+            else list(range(n))
+        )
+        for local_idx, real_idx in enumerate(indices):
+            path = os.path.join(self.dir, f"{real_idx}.json")
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                cache[local_idx] = torch.zeros(len(self.concepts), dtype=torch.float)
+                continue
+            bbxs = data[1:]
+            bbxs = [b for b in bbxs if b.get("logit", 0) > self.confidence_threshold]
+            present = set()
+            for b in bbxs:
+                present.add(format_concept(b.get("label", "")))
+            cache[local_idx] = torch.tensor(
+                [1.0 if c in present else 0.0 for c in self.concepts],
+                dtype=torch.float,
+            )
+        return cache
+
     def __len__(self):
         return len(self.torch_dataset)
 
-    def _real_idx(self, idx: int) -> int:
-        if hasattr(self.torch_dataset, "indices"):
-            return int(self.torch_dataset.indices[idx])
-        return idx
-
-    def _get_data(self, idx: int) -> list:
-        path = os.path.join(self.dir, f"{idx}.json")
-        with open(path, "r") as f:
-            return json.load(f)
-
-    def _find_in_list(self, concept: str, bbxs: List[Dict[str, Any]]) -> Tuple[bool, List[Dict[str, Any]]]:
-        matched = [b for b in bbxs if concept == b.get("label", "")]
-        return len(matched) > 0, matched
-
     def __getitem__(self, idx):
         image, target = self.torch_dataset[idx]
-        data = self._get_data(self._real_idx(idx))
-        bbxs = data[1:]
-        bbxs = [b for b in bbxs if b.get("logit", 0) > self.confidence_threshold]
-        for b in bbxs:
-            b["label"] = format_concept(b.get("label", ""))
-        concept_one_hot = torch.tensor(
-            [1.0 if self._find_in_list(c, bbxs)[0] else 0.0 for c in self.concepts],
-            dtype=torch.float,
-        )
+        concept_one_hot = self._annotation_cache[idx]
         if self.preprocess:
             image = self.preprocess(image)
         return image, concept_one_hot, target
