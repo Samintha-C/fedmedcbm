@@ -174,7 +174,7 @@ def _collect_val_activations(backbone, cbl, dino_loader, device):
     return np.concatenate(all_logits), np.concatenate(all_dino), np.concatenate(all_class)
 
 
-def _collect_train_activations(backbone, cbl, dataset_name, preprocess, device, batch_size):
+def _collect_train_activations(backbone, cbl, dataset_name, preprocess, device, batch_size, num_workers=4):
     """Extract concept logits from the full training set.
 
     Returns (logits [N,C], class_labels [N]), or (None, None) if the training
@@ -199,7 +199,7 @@ def _collect_train_activations(backbone, cbl, dataset_name, preprocess, device, 
 
     loader = DataLoader(
         _Wrapped(raw_train, preprocess),
-        batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True,
+        batch_size=batch_size, shuffle=False, num_workers=0,
     )
     all_logits, all_labels = [], []
     backbone.eval()
@@ -227,7 +227,8 @@ def main():
         help="Concept file (auto-detected from args.txt if omitted)")
     parser.add_argument("--dino_confidence_threshold", type=float, default=0.10,
         help="DINO detection confidence threshold")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--save_results", type=str, default=None,
         help="Path to save results JSON (default: <load_dir>/cbl_evaluation_dino.json)")
@@ -295,7 +296,8 @@ def main():
         confidence_threshold=args.dino_confidence_threshold,
         preprocess=preprocess,
     )
-    dino_loader = DataLoader(dino_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    dino_loader = DataLoader(dino_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
 
     print(f"\nEvaluating CBL vs DINO annotations on {dataset_name} val set ({len(dino_dataset)} samples)...")
     results = evaluate_cbl_dino(backbone, cbl, dino_loader, concepts, device)
@@ -358,7 +360,7 @@ def main():
         if need_train:
             print("Collecting train activations (may take a few minutes)...")
             train_logits, train_class = _collect_train_activations(
-                backbone, cbl, dataset_name, preprocess, device, args.batch_size
+                backbone, cbl, dataset_name, preprocess, device, args.batch_size, args.num_workers
             )
             if train_logits is not None:
                 print(f"  train shape: {train_logits.shape}")
