@@ -241,10 +241,10 @@ def simulate_federated_training_vlg(args):
                 print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
             else:
                 per_class_concepts = num_concepts // num_classes
+                targets = data_utils.get_dataset_targets(train_dataset)
                 class_counts = [0] * num_classes
-                for idx in range(len(train_dataset)):
-                    _, label = train_dataset[idx]
-                    class_counts[label] += 1
+                for label in targets:
+                    class_counts[int(label)] += 1
                 concept_counts = []
                 for c in range(num_classes):
                     concept_counts.extend([class_counts[c]] * per_class_concepts)
