@@ -67,6 +67,9 @@ def main():
         help="eta_tilde schedule for FedDualAvg: "
              "linear (grows over time, original), "
              "burnin (starts high and decays, SAGA-style)")
+    parser.add_argument("--dual_warmup_rounds", type=int, default=0,
+        help="Number of initial FedDualAvg rounds with lambda=0 (no regularization). "
+             "Lets the dense solution converge before sparsity pressure kicks in.")
 
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

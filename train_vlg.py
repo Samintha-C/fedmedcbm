@@ -724,6 +724,7 @@ def simulate_federated_training_vlg(args):
         dual_lam = args.dual_lam
         dual_lam_end = getattr(args, "dual_lam_end", 0.01)
         dual_schedule = getattr(args, "dual_schedule", "linear")
+        dual_warmup_rounds = getattr(args, "dual_warmup_rounds", 0)
 
         # Dual state: accumulated (negative) gradients — same shape as weight and bias
         z_weight = torch.zeros(num_classes, num_concepts, device=device)
@@ -761,13 +762,18 @@ def simulate_federated_training_vlg(args):
                         feats, labels = feats.to(device), labels.to(device)
 
                         # Step counter for eta_tilde schedule
-                        global_step = round_num * K_approx + n_steps + 1
-                        total_steps = final_rounds * K_approx
-                        if dual_schedule == "burnin":
-                            progress = global_step / total_steps
-                            eta_tilde = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
+                        if round_num < dual_warmup_rounds:
+                            eta_tilde = 0.0
                         else:
-                            eta_tilde = eta_s * eta_c * global_step * dual_lam
+                            effective_round = round_num - dual_warmup_rounds
+                            effective_rounds = final_rounds - dual_warmup_rounds
+                            effective_step = effective_round * K_approx + n_steps + 1
+                            effective_total = effective_rounds * K_approx
+                            if dual_schedule == "burnin":
+                                progress = effective_step / effective_total
+                                eta_tilde = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
+                            else:
+                                eta_tilde = eta_s * eta_c * effective_step * dual_lam
 
                         # 1. Primal recovery: w = prox(z, eta_tilde)
                         w_primal = group_threshold(z_local_w, eta_tilde)
@@ -808,13 +814,18 @@ def simulate_federated_training_vlg(args):
             z_bias += eta_s * avg_delta_b
 
             # Server primal recovery
-            server_step = (round_num + 1) * K_approx
-            total_steps = final_rounds * K_approx
-            if dual_schedule == "burnin":
-                progress = server_step / total_steps
-                eta_tilde_server = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
+            if round_num < dual_warmup_rounds:
+                eta_tilde_server = 0.0
             else:
-                eta_tilde_server = eta_s * eta_c * server_step * dual_lam
+                effective_round = round_num - dual_warmup_rounds
+                effective_rounds = final_rounds - dual_warmup_rounds
+                server_step = (effective_round + 1) * K_approx
+                effective_total = effective_rounds * K_approx
+                if dual_schedule == "burnin":
+                    progress = server_step / effective_total
+                    eta_tilde_server = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
+                else:
+                    eta_tilde_server = eta_s * eta_c * server_step * dual_lam
             w_server = group_threshold(z_weight, eta_tilde_server)
             b_server = z_bias.clone()
 
@@ -921,6 +932,8 @@ def simulate_federated_training_vlg(args):
         metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
         if getattr(args, "dual_schedule", "linear") == "burnin":
             metrics_txt_data["dual_lam_end"] = getattr(args, "dual_lam_end", 0.01)
+        if getattr(args, "dual_warmup_rounds", 0) > 0:
+            metrics_txt_data["dual_warmup_rounds"] = args.dual_warmup_rounds
     save_metrics_txt(save_dir, metrics_txt_data)
 
     # Wrap NEC evaluation in try-except so it doesn't prevent model saving
