@@ -11,14 +11,16 @@ def cosine_similarity_loss(pred, target):
 def cosine_similarity_cubed_loss(pred, target):
     pred_centered = pred - torch.mean(pred, dim=0, keepdim=True)
     target_centered = target - torch.mean(target, dim=0, keepdim=True)
-    
+
     pred_cubed = pred_centered ** 3
     target_cubed = target_centered ** 3
-    
-    pred_norm = pred_cubed / (pred_cubed.norm(dim=-1, keepdim=True) + 1e-8)
-    target_norm = target_cubed / (target_cubed.norm(dim=-1, keepdim=True) + 1e-8)
-    
-    return -torch.mean(torch.sum(pred_norm * target_norm, dim=-1))
+
+    # Normalize along dim=0 (across samples, per concept column) to match
+    # Label-free CBM's cos_similarity_cubed_single implementation.
+    pred_norm = pred_cubed / (pred_cubed.norm(p=2, dim=0, keepdim=True).clamp(min=1e-8))
+    target_norm = target_cubed / (target_cubed.norm(p=2, dim=0, keepdim=True).clamp(min=1e-8))
+
+    return -(pred_norm * target_norm).sum(dim=0).mean()
 
 
 class ElasticNetLoss(nn.Module):

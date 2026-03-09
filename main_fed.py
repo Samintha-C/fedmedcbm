@@ -80,7 +80,7 @@ def main():
 
     parser.add_argument("--val_split", type=float, default=0.1, help="Validation split (VLG)")
     parser.add_argument("--feature_layer", type=str, default="layer4", help="Backbone feature layer (VLG, non-CLIP)")
-    parser.add_argument("--cbl_loss_type", type=str, default="bce", choices=["bce", "twoway"], help="CBL loss (VLG)")
+    parser.add_argument("--cbl_loss_type", type=str, default="bce", choices=["bce", "twoway", "cos_cubed"], help="CBL loss (VLG)")
     parser.add_argument("--cbl_lr", type=float, default=5e-4, help="CBL learning rate (VLG)")
     parser.add_argument("--cbl_epochs", type=int, default=20, help="CBL epochs per client round (VLG)")
     parser.add_argument("--cbl_batch_size", type=int, default=32, help="CBL batch size (VLG)")
