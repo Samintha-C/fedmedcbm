@@ -37,31 +37,45 @@ class DinoConceptDataset(Dataset):
         self._annotation_cache = self._preload_annotations()
 
     def _preload_annotations(self) -> Dict[int, torch.Tensor]:
-        """Load all annotation JSONs and convert to concept one-hot tensors."""
-        cache = {}
+        """Load all annotation JSONs and convert to concept one-hot tensors.
+
+        Uses a thread pool to parallelise I/O when annotations live on
+        network-mounted storage (NFS / CephFS) where per-file latency
+        dominates.
+        """
+        import concurrent.futures
+
         n = len(self.torch_dataset)
         indices = (
             [int(self.torch_dataset.indices[i]) for i in range(n)]
             if hasattr(self.torch_dataset, "indices")
             else list(range(n))
         )
-        for local_idx, real_idx in enumerate(indices):
-            path = os.path.join(self.dir, f"{real_idx}.json")
+
+        concepts = self.concepts
+        num_concepts = len(concepts)
+        conf_thresh = self.confidence_threshold
+        ann_dir = self.dir
+
+        def _load_one(args):
+            local_idx, real_idx = args
+            path = os.path.join(ann_dir, f"{real_idx}.json")
             try:
                 with open(path, "r") as f:
                     data = json.load(f)
             except FileNotFoundError:
-                cache[local_idx] = torch.zeros(len(self.concepts), dtype=torch.float)
-                continue
-            bbxs = data[1:]
-            bbxs = [b for b in bbxs if b.get("logit", 0) > self.confidence_threshold]
-            present = set()
-            for b in bbxs:
-                present.add(format_concept(b.get("label", "")))
-            cache[local_idx] = torch.tensor(
-                [1.0 if c in present else 0.0 for c in self.concepts],
+                return local_idx, torch.zeros(num_concepts, dtype=torch.float)
+            bbxs = [b for b in data[1:] if b.get("logit", 0) > conf_thresh]
+            present = set(format_concept(b.get("label", "")) for b in bbxs)
+            return local_idx, torch.tensor(
+                [1.0 if c in present else 0.0 for c in concepts],
                 dtype=torch.float,
             )
+
+        cache = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            for local_idx, tensor in pool.map(_load_one, enumerate(indices)):
+                cache[local_idx] = tensor
         return cache
 
     def __len__(self):

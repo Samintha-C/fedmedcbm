@@ -84,11 +84,26 @@ def get_clip_preprocess():
     return preprocess
 
 def get_dataset_targets(dataset):
-    """Extract targets/labels from dataset, handling different dataset types."""
-    if hasattr(dataset, 'targets'):
-        return np.array(dataset.targets)
-    elif hasattr(dataset, 'labels'):
-        return np.array(dataset.labels)
+    """Extract targets/labels from dataset, handling different dataset types.
+
+    Efficiently handles Subset / random_split wrappers by reaching into the
+    underlying dataset's .targets / .labels attribute with index remapping,
+    avoiding the expensive fallback that loads every image.
+    """
+    # Unwrap Subset / random_split — walk the chain of .dataset / .indices
+    ds = dataset
+    indices = None
+    while isinstance(ds, Subset):
+        if indices is None:
+            indices = np.array(ds.indices)
+        else:
+            indices = np.array(ds.indices)[indices]
+        ds = ds.dataset
+
+    if hasattr(ds, 'targets'):
+        all_targets = np.array(ds.targets)
+    elif hasattr(ds, 'labels'):
+        all_targets = np.array(ds.labels)
     else:
         # Fallback: iterate through dataset (slower)
         targets = []
@@ -96,6 +111,10 @@ def get_dataset_targets(dataset):
             _, label = dataset[i]
             targets.append(label)
         return np.array(targets)
+
+    if indices is not None:
+        return all_targets[indices]
+    return all_targets
 
 
 def split_dataset_dirichlet(dataset, num_clients, alpha=0.5, seed=42, min_samples=10):

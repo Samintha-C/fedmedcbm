@@ -229,30 +229,38 @@ def simulate_federated_training_vlg(args):
             projection_metrics = {}
         else:
             num_train = len(base_cbl_dataset)
-            use_dino = annotation_dir and os.path.isdir(annotation_dir)
-            if use_dino:
-                # Compute actual per-concept positive counts from DINO annotations.
-                print("Computing per-concept positive counts from DINO annotations...")
-                concept_counts = torch.zeros(num_concepts)
-                count_loader = DataLoader(base_cbl_dataset, batch_size=256, num_workers=args.num_workers, shuffle=False)
-                for _, concept_batch, _ in count_loader:
-                    concept_counts += concept_batch.sum(dim=0)
-                concept_counts = concept_counts.tolist()
-                print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
+            cbl_loss_type = getattr(args, "cbl_loss_type", "bce")
+
+            # cos_cubed is parameterless — skip expensive concept count computation.
+            if cbl_loss_type in ("cos_cubed",):
+                concept_counts = [0] * num_concepts
             else:
-                per_class_concepts = num_concepts // num_classes
-                targets = data_utils.get_dataset_targets(train_dataset)
-                class_counts = [0] * num_classes
-                for label in targets:
-                    class_counts[int(label)] += 1
-                concept_counts = []
-                for c in range(num_classes):
-                    concept_counts.extend([class_counts[c]] * per_class_concepts)
-                orphan_count = num_train // num_classes
-                while len(concept_counts) < num_concepts:
-                    concept_counts.append(orphan_count)
+                use_dino = annotation_dir and os.path.isdir(annotation_dir)
+                if use_dino:
+                    # Compute per-concept positive counts directly from the preloaded
+                    # annotation cache — avoids creating a DataLoader that would load
+                    # and preprocess every image just to discard it.
+                    print("Computing per-concept positive counts from DINO annotations...")
+                    concept_counts = torch.zeros(num_concepts)
+                    for t in base_cbl_dataset._annotation_cache.values():
+                        concept_counts += t
+                    concept_counts = concept_counts.tolist()
+                    print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
+                else:
+                    per_class_concepts = num_concepts // num_classes
+                    targets = data_utils.get_dataset_targets(train_dataset)
+                    class_counts = [0] * num_classes
+                    for label in targets:
+                        class_counts[int(label)] += 1
+                    concept_counts = []
+                    for c in range(num_classes):
+                        concept_counts.extend([class_counts[c]] * per_class_concepts)
+                    orphan_count = num_train // num_classes
+                    while len(concept_counts) < num_concepts:
+                        concept_counts.append(orphan_count)
+
             loss_fn = get_loss_vlg(
-                getattr(args, "cbl_loss_type", "bce"), num_concepts, num_train, concept_counts,
+                cbl_loss_type, num_concepts, num_train, concept_counts,
                 getattr(args, "cbl_pos_weight", 0.2), getattr(args, "cbl_auto_weight", False),
                 tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
             )
