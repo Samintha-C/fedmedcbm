@@ -5,6 +5,7 @@ import os
 import sys
 import datetime
 import importlib.util
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Subset
@@ -52,6 +53,13 @@ def _build_run_name(a):
         return f"c{a.num_clients}r{r}-vlg-{a.dataset}-{method}-{date_tag}"
     else:
         return f"c{a.num_clients}r{a.num_rounds}-vlg-{a.dataset}-{method}-{date_tag}"
+
+
+def _step(label: str, t0: float) -> float:
+    """Print a labelled elapsed-time line and return the new start time."""
+    elapsed = time.time() - t0
+    print(f"[TIMING] {label}: {elapsed:.1f}s", flush=True)
+    return time.time()
 
 
 def simulate_federated_training_vlg(args):
@@ -148,12 +156,14 @@ def simulate_federated_training_vlg(args):
         )
         projection_metrics = {}
     else:
+        _t = time.time()
         if args.backbone.startswith("clip_"):
             preprocess = get_preprocess(args.backbone)
             backbone = BackboneCLIP(args.backbone, use_penultimate=getattr(args, "use_clip_penultimate", True), device=str(device))
         else:
             preprocess = get_preprocess(args.backbone)
             backbone = Backbone(args.backbone, getattr(args, "feature_layer", "layer4"), str(device))
+        _t = _step("backbone init", _t)
 
         cbl = ConceptLayer(
             backbone.output_dim, num_concepts,
@@ -162,8 +172,10 @@ def simulate_federated_training_vlg(args):
         )
         global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
         global_model.to(device)
+        _t = _step("CBL + global model init", _t)
 
         full_train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
+        _t = _step("get_data (dataset load)", _t)
 
         val_split = getattr(args, "val_split", 0.1)
         n_val = int(val_split * len(full_train_dataset))
@@ -172,28 +184,37 @@ def simulate_federated_training_vlg(args):
             full_train_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
         )
         print(f"Split full train dataset: {len(train_dataset)} train, {len(val_dataset)} val (val_split={val_split})")
+        _t = _step("train/val split", _t)
 
         client_indices = split_dataset_for_federated(
             train_dataset, args.num_clients, iid=args.iid, alpha=args.alpha, seed=args.seed
         )
+        _t = _step("split_dataset_for_federated", _t)
         print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
+        _t = _step("print_client_distribution", _t)
 
         annotation_dir = getattr(args, "annotation_dir", None)
         dino_conf = getattr(args, "dino_confidence_threshold", 0.10)
         if annotation_dir and os.path.isdir(annotation_dir):
+            print(f"[TIMING] Building train DinoConceptDataset ({len(train_dataset)} samples)...", flush=True)
             base_cbl_dataset = DinoConceptDataset(
                 args.dataset, train_dataset, concepts,
                 annotation_dir=annotation_dir, split_suffix="train",
                 confidence_threshold=dino_conf, preprocess=preprocess,
             )
+            _t = _step("DinoConceptDataset train (annotation preload)", _t)
+            print(f"[TIMING] Building val DinoConceptDataset ({len(val_dataset)} samples)...", flush=True)
             val_cbl_dataset = DinoConceptDataset(
                 args.dataset, val_dataset, concepts,
                 annotation_dir=annotation_dir, split_suffix="train",
                 confidence_threshold=dino_conf, preprocess=preprocess,
             )
+            _t = _step("DinoConceptDataset val (annotation preload)", _t)
         else:
             base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
             val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
+            _t = _step("AllOneConceptDataset init", _t)
+
         val_cbl_loader = DataLoader(
             val_cbl_dataset,
             batch_size=getattr(args, "cbl_batch_size", 32),
@@ -211,6 +232,7 @@ def simulate_federated_training_vlg(args):
             client_data_sizes.append(len(sub))
         total_samples = sum(client_data_sizes)
         client_weights = [n / total_samples for n in client_data_sizes]
+        _t = _step("DataLoader creation", _t)
 
         _cbl_dir = getattr(args, "load_cbl_dir", None)
         if _cbl_dir is not None:
@@ -234,6 +256,7 @@ def simulate_federated_training_vlg(args):
             # cos_cubed is parameterless — skip expensive concept count computation.
             if cbl_loss_type in ("cos_cubed",):
                 concept_counts = [0] * num_concepts
+                _t = _step("concept count (skipped for cos_cubed)", _t)
             else:
                 use_dino = annotation_dir and os.path.isdir(annotation_dir)
                 if use_dino:
@@ -258,17 +281,20 @@ def simulate_federated_training_vlg(args):
                     orphan_count = num_train // num_classes
                     while len(concept_counts) < num_concepts:
                         concept_counts.append(orphan_count)
+                _t = _step("concept count computation", _t)
 
             loss_fn = get_loss_vlg(
                 cbl_loss_type, num_concepts, num_train, concept_counts,
                 getattr(args, "cbl_pos_weight", 0.2), getattr(args, "cbl_auto_weight", False),
                 tp=getattr(args, "cbl_twoway_tp", 4.0), device=str(device)
             )
+            _t = _step("loss function init", _t)
 
             client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
             for m in client_models:
                 m.to(device)
             log_mem("after Phase 1 client model init")
+            _t = _step(f"deepcopy {args.num_clients} client models to {device}", _t)
 
             print("\n=== Phase 1: Federated CBL training ===")
             projection_metrics = {"rounds": [], "client_losses": [], "avg_client_loss": [], "best_val_loss": []}
