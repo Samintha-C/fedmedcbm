@@ -304,11 +304,14 @@ def simulate_federated_training_vlg(args):
             # Only exclude backbone from aggregation when it is frozen (not being finetuned).
             # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
             cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
+            lambda_ortho = getattr(args, "ortho_lambda", 0.0)
             for round_num in range(args.num_rounds):
                 round_losses = []
+                round_concept_losses = []
+                round_ortho_losses = []
                 for i in range(args.num_clients):
                     client_models[i].load_state_dict(global_model.state_dict())
-                    client_train_loss = train_cbl(
+                    total_loss, concept_loss, ortho_loss = train_cbl(
                         client_models[i].backbone, client_models[i].cbl,
                         client_train_loaders[i],
                         epochs=getattr(args, "cbl_epochs", args.local_epochs),
@@ -318,11 +321,18 @@ def simulate_federated_training_vlg(args):
                         optimizer_name=getattr(args, "cbl_optimizer", "adam"),
                         backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
                         val_loader=val_cbl_loader,
+                        lambda_ortho=lambda_ortho,
                     )
-                    round_losses.append(client_train_loss)
+                    round_losses.append(total_loss)
+                    round_concept_losses.append(concept_loss)
+                    round_ortho_losses.append(ortho_loss)
+                    if lambda_ortho > 0.0:
+                        print(f"  Round {round_num + 1} Client {i}: concept_loss={concept_loss:.4f} ortho_loss={ortho_loss:.4f} total_loss={total_loss:.4f}", flush=True)
                 global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
                 global_model.load_state_dict(global_state)
                 avg_train_loss = sum(round_losses) / len(round_losses)
+                avg_concept_loss = sum(round_concept_losses) / len(round_concept_losses)
+                avg_ortho_loss = sum(round_ortho_losses) / len(round_ortho_losses)
                 # Server-side validation on aggregated model
                 server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
                 projection_metrics["rounds"].append(round_num + 1)
@@ -332,7 +342,10 @@ def simulate_federated_training_vlg(args):
                     best_val_loss = server_val_loss
                     best_cbl_state = {k: v.clone() for k, v in global_model.state_dict().items()}
                 projection_metrics["best_val_loss"].append(best_val_loss)
-                print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
+                if lambda_ortho > 0.0:
+                    print(f"Round {round_num + 1} avg client: concept_loss={avg_concept_loss:.4f} ortho_loss={avg_ortho_loss:.4f} total_loss={avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
+                else:
+                    print(f"Round {round_num + 1} avg client train loss: {avg_train_loss:.4f}, server val loss: {server_val_loss:.4f}")
                 update_log(_log_path, {"status": "in_progress", "phase": "cbl_training",
                                         "round": round_num + 1, "total_rounds": args.num_rounds,
                                         "avg_train_loss": avg_train_loss, "server_val_loss": server_val_loss,

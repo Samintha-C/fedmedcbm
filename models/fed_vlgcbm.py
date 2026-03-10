@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ExponentialLR
@@ -142,9 +143,35 @@ def validate_cbl(backbone, cbl, val_loader, loss_fn, device="cuda"):
     return val_loss / len(val_loader)
 
 
+def _get_cbl_output_weight(cbl: nn.Module) -> torch.Tensor:
+    """Return the weight matrix of the CBL's output linear layer.
+
+    For a single-layer CBL (num_hidden=0) this is model[0].weight.
+    For a multi-layer CBL the output layer is the last nn.Linear in the
+    sequential, accessed by iterating model children.
+    """
+    last_linear = None
+    for m in cbl.model.modules():
+        if isinstance(m, nn.Linear):
+            last_linear = m
+    return last_linear.weight  # [num_concepts, in_features]
+
+
+def _ortho_loss(W: torch.Tensor) -> torch.Tensor:
+    """Off-diagonal Gram-matrix penalty that encourages row-wise orthogonality.
+
+    W: [num_concepts, d]  (the output linear layer's weight matrix)
+    Returns a scalar loss that is 0 when all rows are mutually orthogonal.
+    """
+    W_norm = F.normalize(W, dim=1)               # unit-norm rows
+    G = W_norm @ W_norm.T                        # [C, C] Gram matrix
+    I = torch.eye(G.size(0), device=G.device)
+    return (G - I).pow(2).mean()
+
+
 def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_decay=1e-5,
               device="cuda", finetune=False, optimizer_name="sgd", backbone_lr=1e-3,
-              val_loader=None):
+              val_loader=None, lambda_ortho=0.0):
     if optimizer_name == "sgd":
         opt = torch.optim.SGD(cbl.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9)
     else:
@@ -152,12 +179,16 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
     if finetune:
         opt.add_param_group({"params": backbone.parameters(), "lr": backbone_lr})
 
+    use_ortho = lambda_ortho > 0.0
+
     best_val_loss = float("inf")
     best_cbl_state = None
     best_backbone_state = None
 
     for epoch in range(epochs):
         train_loss = 0.0
+        concept_loss_sum = 0.0
+        ortho_loss_sum = 0.0
         for features, concept_one_hot, _ in train_loader:
             features = features.to(device)
             concept_one_hot = concept_one_hot.to(device)
@@ -173,13 +204,22 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
                     f"CBL output size ({concept_logits.shape[1]}) must match concept target size ({concept_one_hot.shape[1]}). "
                     "Ensure num_concepts = len(concepts) when building the CBL and the same concept list is used for the dataset."
                 )
-            loss = loss_fn(concept_logits, concept_one_hot)
+            c_loss = loss_fn(concept_logits, concept_one_hot)
+            if use_ortho:
+                W = _get_cbl_output_weight(cbl)
+                o_loss = _ortho_loss(W)
+                loss = c_loss + lambda_ortho * o_loss
+                ortho_loss_sum += o_loss.item()
+            else:
+                loss = c_loss
+            concept_loss_sum += c_loss.item()
             opt.zero_grad()
             loss.backward()
             opt.step()
             train_loss += loss.item()
         backbone.eval()
-        train_loss /= len(train_loader)
+        n_batches = len(train_loader)
+        train_loss /= n_batches
 
         if val_loader is not None:
             val_loss = validate_cbl(backbone, cbl, val_loader, loss_fn, device)
@@ -194,7 +234,10 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
         if best_backbone_state is not None:
             backbone.load_state_dict(best_backbone_state)
 
-    return train_loss
+    # Return breakdown so the caller can log component losses
+    if use_ortho:
+        return train_loss, concept_loss_sum / n_batches, ortho_loss_sum / n_batches
+    return train_loss, concept_loss_sum / n_batches, 0.0
 
 
 def test_model(loader, backbone, cbl, normalization, final_layer, device="cuda"):

@@ -90,6 +90,10 @@ def main():
     parser.add_argument("--cbl_auto_weight", action="store_true", help="Automatically weight positive examples by neg/pos ratio per concept (VLG). Matches VLG-CBM --cbl_auto_weight flag.")
     parser.add_argument("--cbl_twoway_tp", type=float, default=4.0, help="TwoWay loss Tp (VLG)")
     parser.add_argument("--cbl_finetune", action="store_true", help="Finetune backbone in CBL (VLG)")
+    parser.add_argument("--ortho_lambda", type=float, default=0.0,
+        help="Weight orthogonality regularization coefficient for CBL training (VLG). "
+             "Penalises aligned concept projection vectors via off-diagonal Gram-matrix loss. "
+             "0.0 disables (default). Suggested values to sweep: 0.1, 0.5, 1.0.")
     parser.add_argument("--cbl_bb_lr_rate", type=float, default=1.0, help="Backbone LR scale in CBL (VLG)")
     parser.add_argument("--saga_lam", type=float, default=0.0007, help="SAGA sparsity lambda (VLG)")
     parser.add_argument("--saga_n_iters", type=int, default=2000, help="SAGA iterations (VLG)")
