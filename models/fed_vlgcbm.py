@@ -331,6 +331,12 @@ def get_final_layer_dataset(backbone, cbl, train_loader, val_loader, save_dir, l
 
 
 def train_sparse_final(linear, indexed_train_loader, val_loader, n_iters, lam, step_size=0.1, device="cuda"):
+    # SAGA's per-example a_table requires random indexed scatter/gather every step.
+    # On GPU these are non-coalesced and force sync, causing ~90% idle time for a tiny
+    # FinalLayer. CPU MKL handles the small matmuls with zero sync overhead.
+    # Returned weights in out["path"][0] are already .cpu() (from elasticnet), so the
+    # caller's .to(device) copy still works.
+    linear.cpu()
     num_classes = linear.weight.shape[0]
     linear.weight.data.zero_()
     linear.bias.data.zero_()
