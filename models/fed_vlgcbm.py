@@ -336,7 +336,6 @@ def train_sparse_final(linear, indexed_train_loader, val_loader, n_iters, lam, s
     # FinalLayer. CPU MKL handles the small matmuls with zero sync overhead.
     # Returned weights in out["path"][0] are already .cpu() (from elasticnet), so the
     # caller's .to(device) copy still works.
-    linear.cpu()
     num_classes = linear.weight.shape[0]
     linear.weight.data.zero_()
     linear.bias.data.zero_()
