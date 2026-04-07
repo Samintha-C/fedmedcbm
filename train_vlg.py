@@ -62,6 +62,14 @@ def _step(label: str, t0: float) -> float:
     return time.time()
 
 
+def soft_threshold(z, lam):
+    """
+    Element-wise soft thresholding for standard L1 sparsity.
+    Allows each class to independently drop concepts.
+    """
+    return torch.sign(z) * torch.clamp(torch.abs(z) - lam, min=0.0)
+
+
 def simulate_federated_training_vlg(args):
     get_loss_vlg = _get_loss_vlg()
 
@@ -823,7 +831,7 @@ def simulate_federated_training_vlg(args):
                                 eta_tilde = eta_s * eta_c * effective_step * dual_lam
 
                         # 1. Primal recovery: w = prox(z, eta_tilde)
-                        w_primal = group_threshold(z_local_w, eta_tilde)
+                        w_primal = soft_threshold(z_local_w, eta_tilde)
                         b_primal = z_local_b.clone()  # no regularization on bias
 
                         # 2. Forward pass and gradient at primal point
@@ -873,7 +881,7 @@ def simulate_federated_training_vlg(args):
                     eta_tilde_server = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
                 else:
                     eta_tilde_server = eta_s * eta_c * server_step * dual_lam
-            w_server = group_threshold(z_weight, eta_tilde_server)
+            w_server = soft_threshold(z_weight, eta_tilde_server)
             b_server = z_bias.clone()
 
             # Load primal into final layer for evaluation
