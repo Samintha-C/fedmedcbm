@@ -95,8 +95,6 @@ def simulate_federated_training_vlg(args):
     args.num_classes = num_classes
 
     save_args(save_dir, args)
-    with open(os.path.join(save_dir, "concepts.txt"), "w") as f:
-        f.write("\n".join(concepts))
 
     load_dir = getattr(args, "load_pretrained_vlg", None)
     _pretrained_mode = load_dir is not None
@@ -173,15 +171,6 @@ def simulate_federated_training_vlg(args):
             backbone = Backbone(args.backbone, getattr(args, "feature_layer", "layer4"), str(device))
         _t = _step("backbone init", _t)
 
-        cbl = ConceptLayer(
-            backbone.output_dim, num_concepts,
-            num_hidden=getattr(args, "cbl_hidden_layers", 0),
-            bias=True, device=str(device)
-        )
-        global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
-        global_model.to(device)
-        _t = _step("CBL + global model init", _t)
-
         full_train_dataset = get_data(f"{args.dataset}_train", preprocess=None)
         _t = _step("get_data (dataset load)", _t)
 
@@ -222,6 +211,48 @@ def simulate_federated_training_vlg(args):
             base_cbl_dataset = AllOneConceptDataset(args.dataset, train_dataset, concepts, preprocess)
             val_cbl_dataset = AllOneConceptDataset(args.dataset, val_dataset, concepts, preprocess)
             _t = _step("AllOneConceptDataset init", _t)
+
+        # VLG-CBM-style concept filtering: drop concepts with zero DINO presence in the
+        # training set. Matches VLG-CBM/data/concept_dataset.py:get_filtered_concepts_and_counts.
+        # Only applies when DINO annotations are in use (AllOne has no real counts).
+        if annotation_dir and os.path.isdir(annotation_dir):
+            _counts = torch.zeros(len(concepts))
+            for _t_ann in base_cbl_dataset._annotation_cache.values():
+                _counts += _t_ann
+            keep_mask = _counts > 0
+            if not bool(keep_mask.all()):
+                removed_concepts = [c for c, k in zip(concepts, keep_mask.tolist()) if not k]
+                concepts = [c for c, k in zip(concepts, keep_mask.tolist()) if k]
+                print(f"[concept filter] kept {len(concepts)}, removed {len(removed_concepts)} "
+                      f"zero-count concepts (VLG-CBM dynamic filter)")
+                with open(os.path.join(save_dir, "removed_concepts.txt"), "w") as f:
+                    f.write("\n".join(removed_concepts))
+                # Apply mask in place to both cached datasets — avoids re-reading JSONs.
+                for _k in base_cbl_dataset._annotation_cache:
+                    base_cbl_dataset._annotation_cache[_k] = base_cbl_dataset._annotation_cache[_k][keep_mask]
+                for _k in val_cbl_dataset._annotation_cache:
+                    val_cbl_dataset._annotation_cache[_k] = val_cbl_dataset._annotation_cache[_k][keep_mask]
+                base_cbl_dataset.concepts = concepts
+                val_cbl_dataset.concepts = concepts
+                base_cbl_dataset.concept_set = set(concepts)
+                val_cbl_dataset.concept_set = set(concepts)
+                num_concepts = len(concepts)
+                args.num_concepts = num_concepts
+            else:
+                print(f"[concept filter] all {len(concepts)} concepts have DINO presence; nothing removed")
+            _t = _step("concept filter (dino zero-count)", _t)
+
+        with open(os.path.join(save_dir, "concepts.txt"), "w") as f:
+            f.write("\n".join(concepts))
+
+        cbl = ConceptLayer(
+            backbone.output_dim, num_concepts,
+            num_hidden=getattr(args, "cbl_hidden_layers", 0),
+            bias=True, device=str(device)
+        )
+        global_model = FedVLGCBM(backbone, cbl, normalization=None, final_layer=None)
+        global_model.to(device)
+        _t = _step("CBL + global model init", _t)
 
         val_cbl_loader = DataLoader(
             val_cbl_dataset,

@@ -8,7 +8,6 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 
-from train_lfc import simulate_federated_training
 from train_vlg import simulate_federated_training_vlg
 
 
@@ -128,13 +127,9 @@ def main():
     args.run_nec_eval = not getattr(args, "no_nec_eval", False)
     nm = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
     args.nec_measure_level = tuple(int(x) for x in (nm.split(",") if isinstance(nm, str) else nm))
-    # Set default final_layer_method based on variant
     if args.final_layer_method is None:
-        args.final_layer_method = "hybrid_saga" if getattr(args, "use_vlg", False) else "fedavg"
-    if getattr(args, "use_vlg", False):
-        simulate_federated_training_vlg(args)
-    else:
-        simulate_federated_training(args)
+        args.final_layer_method = "hybrid_saga"
+    simulate_federated_training_vlg(args)
 
 
 if __name__ == "__main__":
