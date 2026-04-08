@@ -23,7 +23,7 @@ class Backbone(nn.Module):
         def hook(module, input, output):
             self.feature_vals[output.device] = output
 
-        getattr(target_model, feature_layer).register_forward_hook(hook)
+        target_model.get_submodule(feature_layer).register_forward_hook(hook)
         self.backbone = target_model
         self.preprocess = target_preprocess
         self.output_dim = data_utils.BACKBONE_ENCODING_DIMENSION[backbone_name]
