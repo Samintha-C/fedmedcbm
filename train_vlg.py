@@ -88,6 +88,23 @@ def simulate_federated_training_vlg(args):
     print(f"SAVE_DIR={save_dir}")
 
     concepts = data_utils.get_concepts(args.concept_file, getattr(args, "filter_set", None))
+    # When resuming from a Phase-1 checkpoint, the saved concepts.txt is authoritative:
+    # the checkpoint's CBL width is fixed to that list, and any discrepancy with
+    # --concept_file (e.g. dynamic filter having dropped zero-count concepts during
+    # Phase 1) would cause load_state_dict size mismatch downstream.
+    _cbl_dir_preload = getattr(args, "load_cbl_dir", None)
+    if _cbl_dir_preload is not None:
+        _ckpt_concepts_path = os.path.join(_cbl_dir_preload, "concepts.txt")
+        if os.path.exists(_ckpt_concepts_path):
+            with open(_ckpt_concepts_path) as _f:
+                _ckpt_concepts = [line.strip() for line in _f if line.strip()]
+            if _ckpt_concepts != concepts:
+                print(f"[concept filter] overriding concept list with checkpoint's concepts.txt "
+                      f"({len(concepts)} -> {len(_ckpt_concepts)} concepts) to match CBL width")
+                concepts = _ckpt_concepts
+        else:
+            print(f"[WARN] {_ckpt_concepts_path} not found; using --concept_file as-is "
+                  f"(CBL load may fail on width mismatch)")
     num_concepts = len(concepts)
     classes = get_classes(args.dataset)
     num_classes = len(classes)
