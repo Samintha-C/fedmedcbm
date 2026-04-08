@@ -17,26 +17,20 @@ if current_dir not in sys.path:
 
 # Import local utils modules directly from files to avoid conflicts with Label-free-CBM's utils.py
 utils_concepts_path = os.path.join(current_dir, 'utils', 'concepts.py')
-utils_losses_path = os.path.join(current_dir, 'utils', 'losses.py')
 data_utils_path = os.path.join(current_dir, 'data', 'data_utils.py')
 
 spec_concepts = importlib.util.spec_from_file_location("fed_utils_concepts", utils_concepts_path)
-spec_losses = importlib.util.spec_from_file_location("fed_utils_losses", utils_losses_path)
 spec_data = importlib.util.spec_from_file_location("fed_data_utils", data_utils_path)
 
 fed_utils_concepts = importlib.util.module_from_spec(spec_concepts)
-fed_utils_losses = importlib.util.module_from_spec(spec_losses)
 fed_data_utils = importlib.util.module_from_spec(spec_data)
 
 spec_concepts.loader.exec_module(fed_utils_concepts)
-spec_losses.loader.exec_module(fed_utils_losses)
 spec_data.loader.exec_module(fed_data_utils)
 
 # Import functions with unique names to avoid conflicts
 load_concepts_from_file = fed_utils_concepts.load_concepts_from_file
 load_or_generate_concept_embeddings = fed_utils_concepts.load_or_generate_concept_embeddings
-cosine_similarity_cubed_loss = fed_utils_losses.cosine_similarity_cubed_loss
-L1SparsityLoss = fed_utils_losses.L1SparsityLoss
 get_data = fed_data_utils.get_data
 get_classes = fed_data_utils.get_classes
 get_resnet_preprocess = fed_data_utils.get_resnet_preprocess
