@@ -159,8 +159,38 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max
     with torch.no_grad():
         preds_orig = (a @ W.T + b).argmax(dim=1)  # [N]
 
-    # Intervention values: +1.0 (present) / -1.0 (absent) in normalized space
-    interv_vals = 2.0 * dv - 1.0  # [N, C]
+    # ── Empirical intervention values ────────────────────────────────────────
+    # Hardcoded ±1.0 does NOT reflect the activation distribution for label-free
+    # CBMs: rare concepts have positive-class means many stds above zero (because
+    # the training std is dominated by the absent class). Calibrate per concept
+    # using the test-set activations grouped by DINO label.
+    pos_mask = dv > 0.5                                  # [N, C] bool
+    neg_mask = ~pos_mask
+    pos_count = pos_mask.float().sum(dim=0)              # [C]
+    neg_count = neg_mask.float().sum(dim=0)              # [C]
+
+    mu_pos = (a * pos_mask.float()).sum(dim=0) / pos_count.clamp(min=1)   # [C]
+    mu_neg = (a * neg_mask.float()).sum(dim=0) / neg_count.clamp(min=1)   # [C]
+
+    # Fallback for concepts with too few DINO-positives to trust the mean
+    min_count = 5
+    overall_mean = a.mean(dim=0)                         # [C] ~ 0
+    overall_std = a.std(dim=0).clamp(min=1e-6)           # [C] ~ 1
+    mu_pos = torch.where(pos_count >= min_count, mu_pos, overall_mean + overall_std)
+    mu_neg = torch.where(neg_count >= min_count, mu_neg, overall_mean - overall_std)
+
+    # Per-sample intervention values: broadcast mu_pos/mu_neg via DINO mask
+    interv_vals = torch.where(pos_mask, mu_pos.expand_as(a), mu_neg.expand_as(a))  # [N, C]
+
+    # Diagnostic print (helps catch calibration issues going forward)
+    n_rare = int((pos_count < min_count).sum().item())
+    print(f"  Activation stats: mean={a.mean().item():+.3f}  std={a.std().item():.3f}  "
+          f"min={a.min().item():+.3f}  max={a.max().item():+.3f}")
+    print(f"  Calibrated mu_pos: mean={mu_pos.mean().item():+.3f}  "
+          f"[{mu_pos.min().item():+.2f}, {mu_pos.max().item():+.2f}]")
+    print(f"  Calibrated mu_neg: mean={mu_neg.mean().item():+.3f}  "
+          f"[{mu_neg.min().item():+.2f}, {mu_neg.max().item():+.2f}]")
+    print(f"  Concepts with <{min_count} positives (using fallback): {n_rare}/{C}")
 
     # Per-sample importance ranks: sort |W[pred_i, :]| descending for each sample
     ranks_imp = W[preds_orig].abs().argsort(dim=1, descending=True)  # [N, C]
