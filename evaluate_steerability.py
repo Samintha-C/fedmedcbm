@@ -208,32 +208,6 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, max_interve
     }
 
 
-def plot_intervention(results, dataset_name, output_dir):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("  [WARN] matplotlib not available — skipping intervention plot")
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    imp = results["importance_order"]
-    rnd = results["random_order"]
-    ax.plot(imp["n_interventions"], [a * 100 for a in imp["accuracy"]],
-            label="Importance order", color="steelblue", linewidth=2)
-    ax.plot(rnd["n_interventions"], [a * 100 for a in rnd["accuracy"]],
-            label="Random order", color="coral", linewidth=2, linestyle="--")
-    ax.set_xlabel("Number of intervened concepts")
-    ax.set_ylabel("Test accuracy (%)")
-    ax.set_title(f"Test-time concept intervention: {dataset_name}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    out_path = os.path.join(output_dir, "intervention_curve.png")
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"  Saved intervention curve to {out_path}")
 
 
 # ── Experiment 3: Decision faithfulness (top-k pruning) ──────────────────────
@@ -282,48 +256,6 @@ def run_faithfulness_experiment(a_tilde, targets, W_f, b_f, k_values=(3, 5, 10, 
     }
 
 
-def plot_faithfulness(results, output_dir):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("  [WARN] matplotlib not available — skipping faithfulness plot")
-        return
-
-    k_vals = sorted(int(k) for k in results["results_by_k"])
-    pct_changed = [results["results_by_k"][str(k)]["pct_changed"] * 100 for k in k_vals]
-    acc_pruned = [results["results_by_k"][str(k)]["acc_pruned"] * 100 for k in k_vals]
-    acc_original = results["original_accuracy"] * 100
-    nec = results["model_nec"]
-
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-
-    color1, color2 = "tomato", "steelblue"
-    ax1.plot(k_vals, pct_changed, color=color1, linewidth=2, marker="o", label="% predictions changed")
-    ax1.set_xlabel("k (concepts retained per class)")
-    ax1.set_ylabel("% predictions changed vs original", color=color1)
-    ax1.tick_params(axis="y", labelcolor=color1)
-
-    ax2 = ax1.twinx()
-    ax2.plot(k_vals, acc_pruned, color=color2, linewidth=2, marker="s", linestyle="--", label="Pruned accuracy (%)")
-    ax2.axhline(acc_original, color=color2, linestyle=":", alpha=0.6, label=f"Original acc ({acc_original:.1f}%)")
-    ax2.set_ylabel("Test accuracy (%)", color=color2)
-    ax2.tick_params(axis="y", labelcolor=color2)
-
-    # NEC reference line
-    ax1.axvline(nec, color="gray", linestyle="--", alpha=0.7, label=f"NEC={nec:.1f}")
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right")
-
-    ax1.set_title("Decision faithfulness: top-k pruning")
-    fig.tight_layout()
-    out_path = os.path.join(output_dir, "faithfulness_curve.png")
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"  Saved faithfulness curve to {out_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -404,8 +336,6 @@ def main():
             json.dump(intervention_results, f, indent=2)
         print(f"  Saved to {out_path}")
 
-        plot_intervention(intervention_results, dataset_name, output_dir)
-
         baseline_acc = intervention_results["importance_order"]["accuracy"][0]
         max_acc = intervention_results["importance_order"]["accuracy"][-1]
         print(f"  Baseline accuracy (0 interventions): {baseline_acc:.4f}")
@@ -430,8 +360,6 @@ def main():
         with open(out_path, "w") as f:
             json.dump(faithfulness_results, f, indent=2)
         print(f"  Saved to {out_path}")
-
-        plot_faithfulness(faithfulness_results, output_dir)
     else:
         faithfulness_results = None
         print("\nSkipping Experiment 3 (--skip_faithfulness)")
