@@ -129,70 +129,74 @@ def collect_activations(model, loader, device):
 
 # ── Experiment 1: Concept intervention curves ─────────────────────────────────
 
-def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, max_interventions=50, n_random_trials=5):
+def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max_interventions=50, n_random_trials=5):
     """
     Args:
-        a_tilde   [N, C]  normalized concept activations
-        dino_gt   [N, C]  DINO binary labels (0.0 or 1.0)
-        targets   [N]     true class labels
-        W_f       [K, C]  final layer weights
-        b_f       [K]     final layer bias
+        a_tilde   [N, C]  normalized concept activations (CPU)
+        dino_gt   [N, C]  DINO binary labels (0.0 or 1.0, CPU)
+        targets   [N]     true class labels (CPU)
+        W_f       [K, C]  final layer weights (CPU)
+        b_f       [K]     final layer bias (CPU)
+        device:           torch device for vectorized GPU ops
         max_interventions: max number of concepts to intervene on
         n_random_trials: number of random permutation seeds for the random-order baseline
+
+    Vectorized: for each n, a single [N,C]@[C,K] matmul replaces the per-sample loop.
+    Per-sample importance ranks are gathered with W_f[preds_orig].abs().argsort(dim=1) [N,C],
+    and the cumulative intervention mask is updated each step via scatter_.
     """
     N, C = a_tilde.shape
     max_interventions = min(max_interventions, C)
 
-    # Original predictions (no intervention)
-    logits_orig = a_tilde @ W_f.T + b_f  # [N, K]
-    preds_orig = logits_orig.argmax(dim=1)  # [N]
+    # Move everything to device for GPU ops
+    a = a_tilde.to(device)
+    dv = dino_gt.to(device)
+    t = targets.to(device)
+    W = W_f.to(device)
+    b = b_f.to(device)
 
+    # Original predictions
+    with torch.no_grad():
+        preds_orig = (a @ W.T + b).argmax(dim=1)  # [N]
+
+    # Intervention values: +1.0 (present) / -1.0 (absent) in normalized space
+    interv_vals = 2.0 * dv - 1.0  # [N, C]
+
+    # Per-sample importance ranks: sort |W[pred_i, :]| descending for each sample
+    ranks_imp = W[preds_orig].abs().argsort(dim=1, descending=True)  # [N, C]
+
+    # Importance-order sweep: cumulative mask grows by one concept per step
+    mask = torch.zeros(N, C, dtype=torch.bool, device=device)
     importance_acc = []
-    random_acc = []
+    with torch.no_grad():
+        for n in tqdm(range(max_interventions + 1), desc="Intervention sweep (importance)"):
+            if n > 0:
+                # Add the (n-1)-th most important concept for each sample
+                mask.scatter_(1, ranks_imp[:, n - 1 : n], True)
+            a_iv = torch.where(mask, interv_vals, a)             # [N, C]
+            preds = (a_iv @ W.T + b).argmax(dim=1)              # [N]
+            importance_acc.append((preds == t).float().mean().item())
 
-    for n in tqdm(range(max_interventions + 1), desc="Intervention sweep (importance)"):
-        correct = 0
-        for i in range(N):
-            a_i = a_tilde[i].clone()
-            dino_i = dino_gt[i]         # [C] binary
-            pred_i = preds_orig[i].item()
-            w_pred = W_f[pred_i]        # [C]
-
-            # Rank by importance for this sample's predicted class
-            rank = torch.argsort(w_pred.abs(), descending=True)
-
-            # Intervene on top-n concepts
-            for j in range(n):
-                c_idx = rank[j].item()
-                a_i[c_idx] = 1.0 if dino_i[c_idx].item() > 0.5 else -1.0
-
-            pred_intervened = (a_i @ W_f.T + b_f).argmax().item()
-            correct += int(pred_intervened == targets[i].item())
-        importance_acc.append(correct / N)
-
-    # Random order: average over multiple trials
+    # Random-order sweep: new rank permutation per trial, same cumulative pattern
     random_acc_trials = []
     for seed in range(n_random_trials):
-        rng = torch.Generator()
+        rng = torch.Generator()  # CPU generator — reproducible, then move ranks to device
         rng.manual_seed(seed)
+        # [N, C] random ranks: argsort of uniform noise gives a uniform random permutation
+        ranks_rnd = torch.rand(N, C, generator=rng).argsort(dim=1).to(device)
+
+        mask = torch.zeros(N, C, dtype=torch.bool, device=device)
         trial_acc = []
-        for n in range(max_interventions + 1):
-            correct = 0
-            for i in range(N):
-                a_i = a_tilde[i].clone()
-                dino_i = dino_gt[i]
-                rank = torch.randperm(C, generator=rng)
-                for j in range(n):
-                    c_idx = rank[j].item()
-                    a_i[c_idx] = 1.0 if dino_i[c_idx].item() > 0.5 else -1.0
-                pred_intervened = (a_i @ W_f.T + b_f).argmax().item()
-                correct += int(pred_intervened == targets[i].item())
-            trial_acc.append(correct / N)
+        with torch.no_grad():
+            for n in range(max_interventions + 1):
+                if n > 0:
+                    mask.scatter_(1, ranks_rnd[:, n - 1 : n], True)
+                a_iv = torch.where(mask, interv_vals, a)
+                preds = (a_iv @ W.T + b).argmax(dim=1)
+                trial_acc.append((preds == t).float().mean().item())
         random_acc_trials.append(trial_acc)
 
-    random_acc = np.mean(random_acc_trials, axis=0).tolist()
-
-    avg_nonzero = float((W_f.abs() > 1e-5).sum(dim=1).float().mean().item())
+    avg_nonzero = float((W.abs() > 1e-5).sum(dim=1).float().mean().item())
 
     return {
         "importance_order": {
@@ -201,7 +205,7 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, max_interve
         },
         "random_order": {
             "n_interventions": list(range(max_interventions + 1)),
-            "accuracy": random_acc,
+            "accuracy": np.mean(random_acc_trials, axis=0).tolist(),
         },
         "num_test_samples": N,
         "avg_nonzero_weights_per_class": avg_nonzero,
@@ -212,39 +216,35 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, max_interve
 
 # ── Experiment 3: Decision faithfulness (top-k pruning) ──────────────────────
 
-def run_faithfulness_experiment(a_tilde, targets, W_f, b_f, k_values=(3, 5, 10, 15, 20, 25, 30)):
+def run_faithfulness_experiment(a_tilde, targets, W_f, b_f, device, k_values=(3, 5, 10, 15, 20, 25, 30)):
     N, C = a_tilde.shape
-    K = W_f.shape[0]
 
-    # Original predictions
-    logits_orig = a_tilde @ W_f.T + b_f  # [N, K]
-    preds_orig = logits_orig.argmax(dim=1)  # [N]
-    acc_original = float((preds_orig == targets).float().mean().item())
+    a = a_tilde.to(device)
+    t = targets.to(device)
+    W = W_f.to(device)
+    b = b_f.to(device)
 
-    avg_nonzero = float((W_f.abs() > 1e-5).sum(dim=1).float().mean().item())
+    with torch.no_grad():
+        preds_orig = (a @ W.T + b).argmax(dim=1)
+        acc_original = float((preds_orig == t).float().mean().item())
+
+    avg_nonzero = float((W.abs() > 1e-5).sum(dim=1).float().mean().item())
 
     results_by_k = {}
     for k in tqdm(k_values, desc="Faithfulness sweep (top-k)"):
-        # Build pruned weight matrix: keep top-k per row by |magnitude|
-        W_pruned = W_f.clone()
-        for cls in range(K):
-            row = W_pruned[cls]
-            if k < C:
-                # Zero out all but top-k
-                threshold_val = row.abs().topk(k).values.min()
-                mask = row.abs() < threshold_val
-                W_pruned[cls][mask] = 0.0
+        W_pruned = W.clone()
+        if k < C:
+            # Vectorized top-k mask: zero all weights below the k-th largest per row
+            kth_vals = W_pruned.abs().topk(k, dim=1).values[:, -1:]  # [K, 1]
+            W_pruned[W_pruned.abs() < kth_vals] = 0.0
 
-        logits_pruned = a_tilde @ W_pruned.T + b_f
-        preds_pruned = logits_pruned.argmax(dim=1)
+        with torch.no_grad():
+            preds_pruned = (a @ W_pruned.T + b).argmax(dim=1)
 
         n_changed = int((preds_pruned != preds_orig).sum().item())
-        pct_changed = n_changed / N
-        acc_pruned = float((preds_pruned == targets).float().mean().item())
-
         results_by_k[str(k)] = {
-            "pct_changed": pct_changed,
-            "acc_pruned": acc_pruned,
+            "pct_changed": n_changed / N,
+            "acc_pruned": float((preds_pruned == t).float().mean().item()),
             "n_changed": n_changed,
         }
 
@@ -313,10 +313,8 @@ def main():
 
     print(f"\nCollecting concept activations on test set...")
     a_tilde, dino_gt, targets = collect_activations(model, loader, device)
-    # Move to CPU for per-sample loops
-    a_tilde = a_tilde.cpu()
-    dino_gt = dino_gt.cpu()
-    targets = targets.cpu()
+    # Activations are returned on CPU from collect_activations;
+    # experiment functions move them to device internally for vectorized GPU ops.
 
     # ── Experiment 1 ──────────────────────────────────────────────────────────
     if not args.skip_intervention:
@@ -326,7 +324,7 @@ def main():
         print(f"{'='*60}")
 
         intervention_results = run_intervention_experiment(
-            a_tilde, dino_gt, targets, W_f, b_f,
+            a_tilde, dino_gt, targets, W_f, b_f, device,
             max_interventions=max_iv,
             n_random_trials=args.n_random_trials,
         )
@@ -352,7 +350,7 @@ def main():
         print(f"{'='*60}")
 
         faithfulness_results = run_faithfulness_experiment(
-            a_tilde, targets, W_f, b_f,
+            a_tilde, targets, W_f, b_f, device,
             k_values=args.k_values,
         )
 
