@@ -25,8 +25,6 @@ fed_data_utils = importlib.util.module_from_spec(spec_data)
 spec_concepts.loader.exec_module(fed_utils_concepts)
 spec_data.loader.exec_module(fed_data_utils)
 
-from models.fed_lfc import FedLFC_CBM
-
 load_concepts_from_file = fed_utils_concepts.load_concepts_from_file
 get_data = fed_data_utils.get_data
 get_classes = fed_data_utils.get_classes
@@ -72,64 +70,7 @@ def load_fed_vlg_cbm(load_dir, device):
 
 
 def load_fed_cbm(load_dir, device):
-    if _is_vlg_checkpoint(load_dir):
-        return load_fed_vlg_cbm(load_dir, device)
-    with open(os.path.join(load_dir, "args.txt"), "r") as f:
-        args = json.load(f)
-    
-    model_path = os.path.join(load_dir, "best_model.pt")
-    if not os.path.exists(model_path):
-        model_path = os.path.join(load_dir, "final_model.pt")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found in {load_dir}. Expected 'best_model.pt' or 'final_model.pt'")
-    
-    state_dict = torch.load(model_path, map_location=device)
-    
-    if "num_concepts" not in args or "num_classes" not in args:
-        print("Warning: args.txt missing num_concepts/num_classes. Inferring from model state_dict...")
-        if "final_layer.linear.weight" in state_dict:
-            num_classes = state_dict["final_layer.linear.weight"].shape[0]
-            num_concepts = state_dict["final_layer.linear.weight"].shape[1]
-        elif "final_layer.model.weight" in state_dict:
-            num_classes = state_dict["final_layer.model.weight"].shape[0]
-            num_concepts = state_dict["final_layer.model.weight"].shape[1]
-        else:
-            raise ValueError("Cannot infer num_concepts/num_classes from model. Please retrain with updated training script.")
-        args["num_concepts"] = num_concepts
-        args["num_classes"] = num_classes
-        print(f"Inferred: num_concepts={num_concepts}, num_classes={num_classes}")
-    
-    model = FedLFC_CBM(
-        backbone_type=args["backbone"],
-        clip_name=args.get("clip_name", "ViT-B/16"),
-        num_concepts=args["num_concepts"],
-        num_classes=args["num_classes"],
-        use_clip_penultimate=args.get("use_clip_penultimate", False),
-        proj_hidden_layers=args.get("proj_hidden_layers", 0),
-        device=device
-    )
-    
-    filtered_state_dict = {k: v for k, v in state_dict.items() 
-                          if not k.startswith("normalization.")}
-    
-    model.load_state_dict(filtered_state_dict, strict=False)
-    
-    proj_mean_path = os.path.join(load_dir, "proj_mean.pt")
-    proj_std_path = os.path.join(load_dir, "proj_std.pt")
-    
-    if os.path.exists(proj_mean_path) and os.path.exists(proj_std_path):
-        proj_mean = torch.load(proj_mean_path, map_location=device)
-        proj_std = torch.load(proj_std_path, map_location=device)
-        model.set_normalization(proj_mean, proj_std)
-    elif "normalization.mean" in state_dict and "normalization.std" in state_dict:
-        proj_mean = state_dict["normalization.mean"]
-        proj_std = state_dict["normalization.std"]
-        model.set_normalization(proj_mean, proj_std)
-    else:
-        print("Warning: Normalization statistics not found. Model may not work correctly.")
-    
-    model.eval()
-    return model, args
+    return load_fed_vlg_cbm(load_dir, device)
 
 
 def get_accuracy_cbm(model, dataset, device, batch_size=250, num_workers=2):
