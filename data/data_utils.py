@@ -49,6 +49,17 @@ def get_concepts(concept_file: str, filter_file: Optional[str] = None) -> List[s
     return concepts
 
 def get_data(dataset_name, preprocess=None, root=None):
+    # Places365: LF-CBM hardcodes ~/.cache which doesn't persist between Nautilus jobs.
+    # Allow override via PLACES365_ROOT env var pointing at PVC-backed storage.
+    if dataset_name in ("places365_train", "places365_val"):
+        places_root = root or os.environ.get("PLACES365_ROOT", os.path.expanduser("~/.cache"))
+        split = "train-standard" if dataset_name == "places365_train" else "val"
+        try:
+            return datasets.Places365(root=places_root, split=split, small=True,
+                                      download=True, transform=preprocess)
+        except RuntimeError:
+            return datasets.Places365(root=places_root, split=split, small=True,
+                                      download=False, transform=preprocess)
     return lf_cbm_data_utils.get_data(dataset_name, preprocess)
 
 def get_target_model(target_name, device):
@@ -69,6 +80,8 @@ def get_classes(dataset_name):
                 label_file = lf_cbm_data_utils.LABEL_FILES["imagenet"]
             elif dataset_name == "cub":
                 label_file = lf_cbm_data_utils.LABEL_FILES["cub"]
+            elif dataset_name == "places365":
+                label_file = lf_cbm_data_utils.LABEL_FILES["places365"]
             else:
                 raise ValueError(f"Unknown dataset: {dataset_name}")
     

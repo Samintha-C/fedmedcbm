@@ -198,6 +198,13 @@ def simulate_federated_training_vlg(args):
             full_train_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
         )
         print(f"Split full train dataset: {len(train_dataset)} train, {len(val_dataset)} val (val_split={val_split})")
+        # Sanity: random_split should produce disjoint Subsets. Verify to rule out
+        # any silent leakage from upstream dataset quirks.
+        _train_idx_set = set(train_dataset.indices)
+        _val_idx_set = set(val_dataset.indices)
+        _overlap = _train_idx_set & _val_idx_set
+        assert not _overlap, f"train/val index overlap detected: {len(_overlap)} samples"
+        print(f"[sanity] train/val disjoint: |train|={len(_train_idx_set)} |val|={len(_val_idx_set)} overlap=0")
         _t = _step("train/val split", _t)
 
         client_indices = split_dataset_for_federated(
@@ -959,7 +966,14 @@ def simulate_federated_training_vlg(args):
                         client_total += labels.size(0)
                     val_acc += client_val_weights[i] * (client_correct / max(client_total, 1))
             print(f"  Val Accuracy: {val_acc:.4f}")
-            if val_acc > best_val_acc:
+            # On val_acc ties, prefer the sparser iterate. Without this, once val_acc
+            # saturates (common on tiny val splits) the first-saturating (denser) iterate
+            # is kept and all subsequent L1 thresholding is effectively discarded.
+            _cur_nnz = nnz
+            _best_nnz = dual_metrics["nnz_weights"][-1] if dual_metrics.get("nnz_weights") and best_fl_state is not None else None
+            if (val_acc > best_val_acc) or (
+                val_acc == best_val_acc and best_fl_state is not None and _cur_nnz < int((best_fl_state["weight"].abs() > 1e-5).sum().item())
+            ):
                 best_val_acc = val_acc
                 best_fl_state = {k: v.clone() for k, v in final_layer.state_dict().items()}
 
