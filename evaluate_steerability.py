@@ -192,8 +192,13 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max
           f"[{mu_neg.min().item():+.2f}, {mu_neg.max().item():+.2f}]")
     print(f"  Concepts with <{min_count} positives (using fallback): {n_rare}/{C}")
 
-    # Per-sample importance ranks: sort |W[pred_i, :]| descending for each sample
-    ranks_imp = W[preds_orig].abs().argsort(dim=1, descending=True)  # [N, C]
+    # Per-sample importance ranks: sort by concept prediction error (descending).
+    # Intervene first on concepts where the model's activation is furthest from
+    # the DINO-calibrated ground-truth value.  This is the continuous-activation
+    # analogue of the uncertainty-based ordering standard in CBM literature
+    # (Koh et al. 2020; Shin et al. ICML 2023), adapted for label-free CBMs
+    # whose concept outputs are z-scored activations rather than probabilities.
+    ranks_imp = (a - interv_vals).abs().argsort(dim=1, descending=True)  # [N, C]
 
     # Importance-order sweep: cumulative mask grows by one concept per step
     mask = torch.zeros(N, C, dtype=torch.bool, device=device)
