@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -129,7 +130,8 @@ def collect_activations(model, loader, device):
 
 # ── Experiment 1: Concept intervention curves ─────────────────────────────────
 
-def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max_interventions=50, n_random_trials=5):
+def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max_interventions=50, n_random_trials=5,
+                                min_pos_samples=5, min_pos_value=0.0):
     """
     Args:
         a_tilde   [N, C]  normalized concept activations (CPU)
@@ -192,13 +194,30 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max
           f"[{mu_neg.min().item():+.2f}, {mu_neg.max().item():+.2f}]")
     print(f"  Concepts with <{min_count} positives (using fallback): {n_rare}/{C}")
 
+    # ── Filter unreliable concepts from intervention ───────────────────────
+    # Concepts with negative mu_pos or too few positive DINO labels have
+    # unreliable calibration — intervening on them pushes activations in the
+    # wrong direction.  Mark them as "never intervene" by setting their
+    # error to -inf so they sort last in the importance ranking.
+    reliable = torch.ones(C, dtype=torch.bool, device=device)
+    if min_pos_samples > 0:
+        reliable &= (pos_count >= min_pos_samples)
+    if min_pos_value is not None:
+        reliable &= (mu_pos >= min_pos_value)
+    n_excluded = int((~reliable).sum().item())
+    if n_excluded > 0:
+        print(f"  Excluding {n_excluded}/{C} concepts from intervention "
+              f"(mu_pos<{min_pos_value} or <{min_pos_samples} positives)")
+
     # Per-sample importance ranks: sort by concept prediction error (descending).
     # Intervene first on concepts where the model's activation is furthest from
     # the DINO-calibrated ground-truth value.  This is the continuous-activation
     # analogue of the uncertainty-based ordering standard in CBM literature
     # (Koh et al. 2020; Shin et al. ICML 2023), adapted for label-free CBMs
     # whose concept outputs are z-scored activations rather than probabilities.
-    ranks_imp = (a - interv_vals).abs().argsort(dim=1, descending=True)  # [N, C]
+    error = (a - interv_vals).abs()                                       # [N, C]
+    error[:, ~reliable] = -1.0  # push unreliable concepts to end of ranking
+    ranks_imp = error.argsort(dim=1, descending=True)                     # [N, C]
 
     # Importance-order sweep: cumulative mask grows by one concept per step
     mask = torch.zeros(N, C, dtype=torch.bool, device=device)
@@ -213,12 +232,15 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max
             importance_acc.append((preds == t).float().mean().item())
 
     # Random-order sweep: new rank permutation per trial, same cumulative pattern
+    # Apply same reliability filter: unreliable concepts get large noise values
+    # so they sort last and are never reached within max_interventions.
     random_acc_trials = []
     for seed in range(n_random_trials):
         rng = torch.Generator()  # CPU generator — reproducible, then move ranks to device
         rng.manual_seed(seed)
-        # [N, C] random ranks: argsort of uniform noise gives a uniform random permutation
-        ranks_rnd = torch.rand(N, C, generator=rng).argsort(dim=1).to(device)
+        noise = torch.rand(N, C, generator=rng)
+        noise[:, ~reliable.cpu()] = 2.0  # push unreliable to end of random ordering
+        ranks_rnd = noise.argsort(dim=1).to(device)
 
         mask = torch.zeros(N, C, dtype=torch.bool, device=device)
         trial_acc = []
@@ -243,6 +265,11 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max
             "accuracy": np.mean(random_acc_trials, axis=0).tolist(),
         },
         "num_test_samples": N,
+        "num_concepts": C,
+        "num_reliable_concepts": int(reliable.sum().item()),
+        "num_excluded_concepts": n_excluded,
+        "min_pos_samples": min_pos_samples,
+        "min_pos_value": min_pos_value,
         "avg_nonzero_weights_per_class": avg_nonzero,
     }
 
@@ -314,6 +341,10 @@ def main():
         help="Number of random permutation seeds for Experiment 1 baseline")
     parser.add_argument("--k_values", type=int, nargs="+", default=[3, 5, 10, 15, 20, 25, 30],
         help="k values for top-k pruning (Experiment 3)")
+    parser.add_argument("--min_pos_samples", type=int, default=5,
+        help="Exclude concepts with fewer than this many DINO positives from intervention")
+    parser.add_argument("--min_pos_value", type=float, default=0.0,
+        help="Exclude concepts whose calibrated mu_pos is below this threshold")
     parser.add_argument("--skip_intervention", action="store_true",
         help="Skip Experiment 1 (intervention curves)")
     parser.add_argument("--skip_faithfulness", action="store_true",
@@ -323,6 +354,7 @@ def main():
     device = args.device if torch.cuda.is_available() else "cpu"
     output_dir = args.output_dir or os.path.join(args.load_dir, "steerability")
     os.makedirs(output_dir, exist_ok=True)
+    run_ts = datetime.now().strftime("%b%d-%H%M").lower()
 
     print(f"Loading model from {args.load_dir}")
     model, saved_args, num_concepts, num_classes = load_full_model(args.load_dir, device)
@@ -362,9 +394,11 @@ def main():
             a_tilde, dino_gt, targets, W_f, b_f, device,
             max_interventions=max_iv,
             n_random_trials=args.n_random_trials,
+            min_pos_samples=args.min_pos_samples,
+            min_pos_value=args.min_pos_value,
         )
 
-        out_path = os.path.join(output_dir, "intervention_results.json")
+        out_path = os.path.join(output_dir, f"intervention_{dataset_name}_{run_ts}.json")
         with open(out_path, "w") as f:
             json.dump(intervention_results, f, indent=2)
         print(f"  Saved to {out_path}")
@@ -389,7 +423,7 @@ def main():
             k_values=args.k_values,
         )
 
-        out_path = os.path.join(output_dir, "faithfulness_results.json")
+        out_path = os.path.join(output_dir, f"faithfulness_{dataset_name}_{run_ts}.json")
         with open(out_path, "w") as f:
             json.dump(faithfulness_results, f, indent=2)
         print(f"  Saved to {out_path}")
