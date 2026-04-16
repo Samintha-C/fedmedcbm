@@ -32,41 +32,64 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Label-free-CBM"))
 
 from data import data_utils
+from evaluate_steerability import load_full_model, load_concepts
+from torch.utils.data import DataLoader
 
 
 # ── Loading ──────────────────────────────────────────────────────────────────
 
-def load_checkpoint(load_dir, device="cpu"):
-    """Load concepts, normalization stats, final layer, and concept features."""
-    # Concepts
-    with open(os.path.join(load_dir, "concepts.txt")) as f:
-        concepts = [l.strip() for l in f if l.strip()]
+def load_and_extract(load_dir, dataset_name, device="cpu", batch_size=128):
+    """Load model, run on test set, return aligned activations + PIL dataset."""
+    model, saved_args, num_concepts, num_classes = load_full_model(load_dir, device)
+    concepts = load_concepts(load_dir, saved_args)
 
-    # Normalization
-    mean = torch.load(os.path.join(load_dir, "train_concept_features_mean.pt"), map_location=device)
-    std = torch.load(os.path.join(load_dir, "train_concept_features_std.pt"), map_location=device).clamp(min=1e-8)
+    # Final layer weights
+    W = model.final_layer.weight.data.cpu()
+    b = model.final_layer.bias.data.cpu()
 
-    # Final layer
-    final_sd = torch.load(os.path.join(load_dir, "final.pt"), map_location=device)
-    W = final_sd["weight"]  # [K, C]
-    b = final_sd["bias"]    # [K]
+    # Get preprocessed test set for model inference
+    if hasattr(model.backbone, "preprocess"):
+        preprocess = model.backbone.preprocess
+    else:
+        _, preprocess = data_utils.get_target_model(
+            model.backbone.backbone.__class__.__name__.lower(), "cpu"
+        )
+        if preprocess is None:
+            import torchvision.transforms as T
+            preprocess = T.Compose([
+                T.Resize(224), T.CenterCrop(224), T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
 
-    # Pre-saved concept features (CBL output, pre-normalization)
-    val_feats = torch.load(os.path.join(load_dir, "val_concept_features.pt"), map_location=device)  # [N, C]
-    val_labels = torch.load(os.path.join(load_dir, "val_concept_labels.pt"), map_location=device)    # [N]
-
-    # Normalize
-    val_normed = (val_feats - mean) / std  # [N, C]
-
-    return concepts, val_normed, val_labels, W, b
-
-
-def load_images(dataset_name):
-    """Load the raw PIL dataset for image display."""
     try:
-        return data_utils.get_data(f"{dataset_name}_test", preprocess=None)
+        test_data = data_utils.get_data(f"{dataset_name}_test", preprocess=preprocess)
     except Exception:
-        return data_utils.get_data(f"{dataset_name}_val", preprocess=None)
+        test_data = data_utils.get_data(f"{dataset_name}_val", preprocess=preprocess)
+
+    loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    # Extract normalized concept activations
+    all_a, all_y = [], []
+    model.eval()
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            h = model.backbone(images)
+            c = model.cbl(h)
+            a = model.normalization(c)
+            all_a.append(a.cpu())
+            all_y.append(labels if torch.is_tensor(labels) else torch.tensor(labels))
+
+    val_normed = torch.cat(all_a, dim=0)
+    val_labels = torch.cat(all_y, dim=0)
+
+    # Load raw PIL images (same test set, no transform) — indices will match
+    try:
+        pil_dataset = data_utils.get_data(f"{dataset_name}_test", preprocess=None)
+    except Exception:
+        pil_dataset = data_utils.get_data(f"{dataset_name}_val", preprocess=None)
+
+    return concepts, val_normed, val_labels, W, b, pil_dataset
 
 
 # ── Visualization 1: Top-k images per concept ───────────────────────────────
@@ -277,17 +300,19 @@ def main():
                         help="Manual concept indices for Viz 1 (overrides auto-selection)")
     parser.add_argument("--image_indices", type=int, nargs="+", default=None,
                         help="Manual image indices for Viz 2 (overrides auto-selection)")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--batch_size", type=int, default=128)
     args = parser.parse_args()
 
+    device = args.device if torch.cuda.is_available() else "cpu"
     output_dir = args.output_dir or os.path.join(args.load_dir, "visualizations")
     os.makedirs(output_dir, exist_ok=True)
 
-    print("Loading checkpoint...")
-    concepts, val_normed, val_labels, W, b = load_checkpoint(args.load_dir)
+    print("Loading model and extracting test-set activations...")
+    concepts, val_normed, val_labels, W, b, pil_dataset = load_and_extract(
+        args.load_dir, args.dataset, device=device, batch_size=args.batch_size,
+    )
     print(f"  Concepts: {len(concepts)}  |  Samples: {val_normed.shape[0]}  |  Classes: {W.shape[0]}")
-
-    print("Loading images...")
-    pil_dataset = load_images(args.dataset)
 
     classes = data_utils.get_classes(args.dataset)
 
