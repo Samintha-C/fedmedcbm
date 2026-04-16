@@ -105,26 +105,27 @@ def plot_topk_images_per_concept(val_normed, concepts, pil_dataset, concept_indi
     for row, cidx in enumerate(concept_indices):
         activations = val_normed[:, cidx]  # [N]
         topk_vals, topk_idxs = activations.topk(top_k)
+        cname = concepts[cidx] if cidx < len(concepts) else f"concept_{cidx}"
 
         for col in range(top_k):
             ax = axes[row, col]
             img_idx = topk_idxs[col].item()
             img = pil_dataset[img_idx][0]
             if not isinstance(img, Image.Image):
-                # Handle tensor images
                 if isinstance(img, torch.Tensor):
                     img = img.permute(1, 2, 0).numpy()
                     img = (img * 255).clip(0, 255).astype(np.uint8)
                     img = Image.fromarray(img)
 
             ax.imshow(img)
-            ax.set_title(f"{topk_vals[col]:.2f}", fontsize=9)
+            # Per-image activation value above
+            ax.text(0.5, 1.02, f"{topk_vals[col]:.2f}", transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=8)
             ax.axis("off")
 
-        # Row label
-        cname = concepts[cidx] if cidx < len(concepts) else f"concept_{cidx}"
-        axes[row, 0].set_ylabel(f"C{cidx}: {cname}", fontsize=9, rotation=0,
-                                labelpad=max(80, 8 * len(cname)), ha="right", va="center")
+        # Concept name as text to the LEFT of the row (works with axis off)
+        axes[row, 0].text(-0.05, 0.5, f"C{cidx}: {cname}", transform=axes[row, 0].transAxes,
+                          ha="right", va="center", fontsize=10, fontweight="bold")
 
     fig.suptitle("Top-k activated images per concept neuron", fontsize=13, y=1.01)
     plt.tight_layout()
@@ -200,19 +201,23 @@ def plot_concept_contributions(val_normed, val_labels, W, b, concepts, classes,
         # Contribution of each concept to predicted class
         contributions = (a * W[pred_class]).cpu().numpy()  # [C]
 
-        # Top concepts by absolute contribution
-        order = np.argsort(np.abs(contributions))[::-1]
-        top_idxs = order[:max_display]
-        remaining = contributions[order[max_display:]].sum()
+        # Only display concepts that are actively expressed (a > 0).
+        # Below-average concepts (a < 0) can still contribute via negative weights,
+        # but the "NOT X" framing is misleading on z-scored activations.
+        a_np = a.cpu().numpy()
+        eligible = np.where(a_np > 0)[0]
+        eligible_sorted = eligible[np.argsort(np.abs(contributions[eligible]))[::-1]]
+        top_idxs = eligible_sorted[:max_display]
+
+        # Remaining = everything not shown (both positive-but-not-top and negative-a concepts)
+        shown_mask = np.zeros(len(contributions), dtype=bool)
+        shown_mask[top_idxs] = True
+        remaining = contributions[~shown_mask].sum()
+        n_remaining = (~shown_mask).sum()
 
         values = contributions[top_idxs]
-        names = []
-        for ci in top_idxs:
-            name = concepts[ci] if ci < len(concepts) else f"concept_{ci}"
-            if a[ci] < 0:
-                name = "NOT " + name
-            names.append(name)
-        names.append(f"Sum of {len(contributions) - max_display} others")
+        names = [concepts[ci] if ci < len(concepts) else f"concept_{ci}" for ci in top_idxs]
+        names.append(f"Sum of {n_remaining} others")
         values = np.append(values, remaining)
 
         # Image panel
