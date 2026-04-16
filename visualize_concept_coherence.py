@@ -66,7 +66,7 @@ def load_and_extract(load_dir, dataset_name, device="cpu", batch_size=128):
     except Exception:
         test_data = data_utils.get_data(f"{dataset_name}_val", preprocess=preprocess)
 
-    loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=2)
+    loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # Extract normalized concept activations
     all_a, all_y = [], []
