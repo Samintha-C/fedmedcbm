@@ -14,7 +14,7 @@ from train_vlg import simulate_federated_training_vlg
 def main():
     parser = argparse.ArgumentParser(description="Federated Label-Free Concept Bottleneck Model")
 
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet", "cub"], help="Dataset name")
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet", "cub", "places365"], help="Dataset name")
     parser.add_argument("--concept_file", type=str, required=True, help="Path to concept file")
     parser.add_argument("--filter_set", type=str, default=None,
         help="Path to file listing concepts to remove (one per line). Used to match vanilla VLG-CBM concept filtering.")
