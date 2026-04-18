@@ -778,7 +778,7 @@ def simulate_federated_training_vlg(args):
         print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
     elif vlg_final_method == "feddualavg":
-        print("\n=== Phase 3: Federated Dual Averaging with Elementwise L1 Sparsity (VLG) ===")
+        print("\n=== Phase 3: Federated Dual Averaging with Group Lasso (VLG) ===")
         # Reuse the normalized concept features already extracted in Phase 2.
         client_concept_loaders = []
         offset = 0
