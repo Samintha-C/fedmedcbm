@@ -26,6 +26,10 @@ def main():
         help="Path to folder containing cifar100_train/ and cifar100_val/ (pre-generated Grounding DINO annotations). If set, use DINO concept labels instead of AllOne.")
     parser.add_argument("--dino_confidence_threshold", type=float, default=0.10,
         help="Min logit for DINO annotations to count (only when --annotation_dir is set)")
+    parser.add_argument("--annotation_cache_dir", type=str, default=None,
+        help="Directory to cache preloaded DINO annotation tensors. First run writes; "
+             "subsequent runs with matching (dataset, split, confidence, concepts, indices) "
+             "skip JSON reads. Critical for places365 (~1.6M files over NFS).")
     parser.add_argument("--num_clients", type=int, default=5, help="Number of federated clients")
     parser.add_argument("--num_rounds", type=int, default=10, help="Number of federated rounds")
     parser.add_argument("--local_epochs", type=int, default=5, help="Local training epochs per round")

@@ -135,7 +135,10 @@ def validate_cbl(backbone, cbl, val_loader, loss_fn, device="cuda"):
         for features, concept_one_hot, _ in val_loader:
             features = features.to(device)
             concept_one_hot = concept_one_hot.to(device)
-            concept_logits = cbl(backbone(features))
+            # features.dim() == 4: raw image batch → run backbone.
+            # Otherwise: pre-extracted embeddings [B, D] from feature cache.
+            embeddings = backbone(features) if features.dim() == 4 else features
+            concept_logits = cbl(embeddings)
             val_loss += loss_fn(concept_logits, concept_one_hot).item()
     return val_loss / len(val_loader)
 
@@ -189,12 +192,18 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
         for features, concept_one_hot, _ in train_loader:
             features = features.to(device)
             concept_one_hot = concept_one_hot.to(device)
-            if finetune:
-                backbone.train()
-                embeddings = backbone(features)
-            else:
-                with torch.no_grad():
+            # 4D (raw image batch) → run backbone. 2D → cached embeddings,
+            # skip backbone entirely. When finetune=True the caller must not
+            # pre-populate the feature cache (stale embeddings).
+            if features.dim() == 4:
+                if finetune:
+                    backbone.train()
                     embeddings = backbone(features)
+                else:
+                    with torch.no_grad():
+                        embeddings = backbone(features)
+            else:
+                embeddings = features
             concept_logits = cbl(embeddings)
             if concept_logits.shape[1] != concept_one_hot.shape[1]:
                 raise RuntimeError(

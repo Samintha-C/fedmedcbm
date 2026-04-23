@@ -216,12 +216,14 @@ def simulate_federated_training_vlg(args):
 
         annotation_dir = getattr(args, "annotation_dir", None)
         dino_conf = getattr(args, "dino_confidence_threshold", 0.10)
+        ann_cache_dir = getattr(args, "annotation_cache_dir", None)
         if annotation_dir and os.path.isdir(annotation_dir):
             print(f"[TIMING] Building train DinoConceptDataset ({len(train_dataset)} samples)...", flush=True)
             base_cbl_dataset = DinoConceptDataset(
                 args.dataset, train_dataset, concepts,
                 annotation_dir=annotation_dir, split_suffix="train",
                 confidence_threshold=dino_conf, preprocess=preprocess,
+                cache_dir=ann_cache_dir,
             )
             _t = _step("DinoConceptDataset train (annotation preload)", _t)
             print(f"[TIMING] Building val DinoConceptDataset ({len(val_dataset)} samples)...", flush=True)
@@ -229,6 +231,7 @@ def simulate_federated_training_vlg(args):
                 args.dataset, val_dataset, concepts,
                 annotation_dir=annotation_dir, split_suffix="train",
                 confidence_threshold=dino_conf, preprocess=preprocess,
+                cache_dir=ann_cache_dir,
             )
             _t = _step("DinoConceptDataset val (annotation preload)", _t)
         else:
@@ -240,9 +243,7 @@ def simulate_federated_training_vlg(args):
         # training set. Matches VLG-CBM/data/concept_dataset.py:get_filtered_concepts_and_counts.
         # Only applies when DINO annotations are in use (AllOne has no real counts).
         if annotation_dir and os.path.isdir(annotation_dir):
-            _counts = torch.zeros(len(concepts))
-            for _t_ann in base_cbl_dataset._annotation_cache.values():
-                _counts += _t_ann
+            _counts = base_cbl_dataset._annotation_cache.sum(dim=0)
             keep_mask = _counts > 0
             if not bool(keep_mask.all()):
                 removed_concepts = [c for c, k in zip(concepts, keep_mask.tolist()) if not k]
@@ -251,11 +252,10 @@ def simulate_federated_training_vlg(args):
                       f"zero-count concepts (VLG-CBM dynamic filter)")
                 with open(os.path.join(save_dir, "removed_concepts.txt"), "w") as f:
                     f.write("\n".join(removed_concepts))
-                # Apply mask in place to both cached datasets — avoids re-reading JSONs.
-                for _k in base_cbl_dataset._annotation_cache:
-                    base_cbl_dataset._annotation_cache[_k] = base_cbl_dataset._annotation_cache[_k][keep_mask]
-                for _k in val_cbl_dataset._annotation_cache:
-                    val_cbl_dataset._annotation_cache[_k] = val_cbl_dataset._annotation_cache[_k][keep_mask]
+                # Mask the stacked tensors in place; disk cache stays full-width so
+                # different --concept_file / threshold runs can reuse it.
+                base_cbl_dataset._annotation_cache = base_cbl_dataset._annotation_cache[:, keep_mask]
+                val_cbl_dataset._annotation_cache = val_cbl_dataset._annotation_cache[:, keep_mask]
                 base_cbl_dataset.concepts = concepts
                 val_cbl_dataset.concepts = concepts
                 base_cbl_dataset.concept_set = set(concepts)
@@ -327,10 +327,7 @@ def simulate_federated_training_vlg(args):
                     # annotation cache — avoids creating a DataLoader that would load
                     # and preprocess every image just to discard it.
                     print("Computing per-concept positive counts from DINO annotations...")
-                    concept_counts = torch.zeros(num_concepts)
-                    for t in base_cbl_dataset._annotation_cache.values():
-                        concept_counts += t
-                    concept_counts = concept_counts.tolist()
+                    concept_counts = base_cbl_dataset._annotation_cache.sum(dim=0).tolist()
                     print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
                 else:
                     per_class_concepts = num_concepts // num_classes
@@ -345,6 +342,25 @@ def simulate_federated_training_vlg(args):
                     while len(concept_counts) < num_concepts:
                         concept_counts.append(orphan_count)
                 _t = _step("concept count computation", _t)
+
+            # Pre-extract backbone features once when frozen. Each client/epoch/round
+            # below would otherwise rerun the backbone on the same images, which for
+            # places365 is hundreds of millions of wasted forward passes. Only safe
+            # when the backbone is not being finetuned.
+            if (not getattr(args, "cbl_finetune", False)
+                    and annotation_dir and os.path.isdir(annotation_dir)):
+                _feat_bs = getattr(args, "cbl_batch_size", 32) * 4
+                base_cbl_dataset.populate_feature_cache(
+                    backbone=backbone, device=str(device),
+                    backbone_name=args.backbone,
+                    batch_size=_feat_bs, num_workers=args.num_workers,
+                )
+                val_cbl_dataset.populate_feature_cache(
+                    backbone=backbone, device=str(device),
+                    backbone_name=args.backbone,
+                    batch_size=_feat_bs, num_workers=args.num_workers,
+                )
+                _t = _step("backbone feature pre-extraction", _t)
 
             loss_fn = get_loss_vlg(
                 cbl_loss_type, num_concepts, num_train, concept_counts,
@@ -551,6 +567,7 @@ def simulate_federated_training_vlg(args):
         use_allones=not (getattr(args, "annotation_dir", None) and os.path.isdir(getattr(args, "annotation_dir", ""))),
         annotation_dir=getattr(args, "annotation_dir", None),
         confidence_threshold=getattr(args, "dino_confidence_threshold", 0.10),
+        cache_dir=getattr(args, "annotation_cache_dir", None),
         batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False
     )
 
