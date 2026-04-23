@@ -311,6 +311,27 @@ def simulate_federated_training_vlg(args):
                 torch.load(os.path.join(_cbl_dir, "cbl.pt"), map_location=str(device))
             )
             print(f"Loaded CBL weights from {_cbl_dir}, skipping Phase 1")
+
+            # Populate feature cache so the Phase 2 loops below (3 backbone passes)
+            # skip the backbone. If the Phase 1 job wrote a cache to the same
+            # --annotation_cache_dir, this is an on-disk hit and costs ~1s; otherwise
+            # extraction runs once here. Gated on not cbl_finetune because a
+            # finetuned backbone would invalidate any prior cache silently.
+            if (not getattr(args, "cbl_finetune", False)
+                    and annotation_dir and os.path.isdir(annotation_dir)):
+                _feat_bs = getattr(args, "cbl_batch_size", 32) * 4
+                base_cbl_dataset.populate_feature_cache(
+                    backbone=backbone, device=str(device),
+                    backbone_name=args.backbone,
+                    batch_size=_feat_bs, num_workers=args.num_workers,
+                )
+                val_cbl_dataset.populate_feature_cache(
+                    backbone=backbone, device=str(device),
+                    backbone_name=args.backbone,
+                    batch_size=_feat_bs, num_workers=args.num_workers,
+                )
+                _t = _step("backbone feature pre-extraction (Phase 2 only)", _t)
+
             projection_metrics = {}
         else:
             num_train = len(base_cbl_dataset)
@@ -486,7 +507,9 @@ def simulate_federated_training_vlg(args):
                 local_n = 0
                 for features, _, _ in phase2_loaders[i]:
                     features = features.to(device)
-                    logits = global_model.cbl(global_model.backbone(features)).cpu()
+                    # 4D → raw images, run backbone. 2D → feature cache active, skip it.
+                    emb = global_model.backbone(features) if features.dim() == 4 else features
+                    logits = global_model.cbl(emb).cpu()
                     local_sum += logits.sum(dim=0)
                     local_sq_sum += (logits ** 2).sum(dim=0)
                     local_n += logits.size(0)
@@ -512,7 +535,8 @@ def simulate_federated_training_vlg(args):
             for i in range(args.num_clients):
                 for features, _, labels in phase2_loaders[i]:
                     features = features.to(device)
-                    logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+                    emb = global_model.backbone(features) if features.dim() == 4 else features
+                    logits = norm_layer(global_model.cbl(emb)).cpu()
                     all_train_feats.append(logits)
                     all_train_labels.append(labels)
         all_train_feats = torch.cat(all_train_feats, dim=0)
@@ -523,7 +547,8 @@ def simulate_federated_training_vlg(args):
         with torch.no_grad():
             for features, _, labels in phase2_val_loader:
                 features = features.to(device)
-                logits = norm_layer(global_model.cbl(global_model.backbone(features))).cpu()
+                emb = global_model.backbone(features) if features.dim() == 4 else features
+                logits = norm_layer(global_model.cbl(emb)).cpu()
                 val_feats.append(logits)
                 val_labels_all.append(labels)
         val_feats = torch.cat(val_feats, dim=0)
