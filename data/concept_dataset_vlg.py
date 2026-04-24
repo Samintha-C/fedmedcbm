@@ -188,9 +188,12 @@ class DinoConceptDataset(Dataset):
                     img = preprocess(img)
                 return img, tgt
 
+        # pin_memory=False: extraction is a one-shot, GPU-bound op. Pinning
+        # balloons CPU RSS (page-locked memory accounting is lossy in cgroup v2)
+        # and gave us OOMKills on CLIP backbones with batch_size * 4 loaders.
         loader = DataLoader(
             _PreprocessDataset(), batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=True,
+            num_workers=num_workers, pin_memory=False,
         )
 
         print(f"[feature cache] extracting backbone features "
