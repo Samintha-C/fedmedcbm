@@ -21,6 +21,13 @@ if os.path.exists(lf_cbm_path):
 else:
     raise ImportError(f"Label-free-CBM not found at {lf_cbm_path}. Please ensure Label-free-CBM is in the parent directory.")
 
+# Override Label-free-CBM's placeholder ImageNet paths with PVC-resident dataset.
+# Set IMAGENET_ROOT env var in job yamls; if unset, LF-CBM placeholders remain.
+_imagenet_root = os.environ.get("IMAGENET_ROOT")
+if _imagenet_root:
+    lf_cbm_data_utils.DATASET_ROOTS["imagenet_train"] = f"{_imagenet_root}/train"
+    lf_cbm_data_utils.DATASET_ROOTS["imagenet_val"] = f"{_imagenet_root}/val"
+
 
 def format_concept(s: str) -> str:
     s = s.lower()
