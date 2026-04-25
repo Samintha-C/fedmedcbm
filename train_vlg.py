@@ -243,7 +243,19 @@ def simulate_federated_training_vlg(args):
         # training set. Matches VLG-CBM/data/concept_dataset.py:get_filtered_concepts_and_counts.
         # Only applies when DINO annotations are in use (AllOne has no real counts).
         if annotation_dir and os.path.isdir(annotation_dir):
-            _counts = base_cbl_dataset._annotation_cache.sum(dim=0)
+            log_mem("concept filter: start (before sum)")
+            # Chunked sum across rows. Naive bool.sum(dim=0) on a 4GB+ tensor can
+            # blow up to int64 intermediates (N × C × 8 bytes ≈ 35GB on places365)
+            # depending on the kernel path. Streaming in chunks bounds the
+            # working set to chunk_rows × C bytes for the bool view + small
+            # int64 accumulator.
+            _ann = base_cbl_dataset._annotation_cache
+            _N, _C = _ann.shape
+            _counts = torch.zeros(_C, dtype=torch.long)
+            _chunk = 65536
+            for _start in range(0, _N, _chunk):
+                _counts += _ann[_start:_start + _chunk].sum(dim=0).long()
+            log_mem("concept filter: after chunked sum")
             keep_mask = _counts > 0
             if not bool(keep_mask.all()):
                 removed_concepts = [c for c, k in zip(concepts, keep_mask.tolist()) if not k]
@@ -252,10 +264,23 @@ def simulate_federated_training_vlg(args):
                       f"zero-count concepts (VLG-CBM dynamic filter)")
                 with open(os.path.join(save_dir, "removed_concepts.txt"), "w") as f:
                     f.write("\n".join(removed_concepts))
-                # Mask the stacked tensors in place; disk cache stays full-width so
-                # different --concept_file / threshold runs can reuse it.
-                base_cbl_dataset._annotation_cache = base_cbl_dataset._annotation_cache[:, keep_mask]
-                val_cbl_dataset._annotation_cache = val_cbl_dataset._annotation_cache[:, keep_mask]
+                # Mask in-place. We delete the old reference and gc.collect()
+                # before letting the indexed slice settle, so the parent tensor
+                # is freed at the earliest possible moment (otherwise both old
+                # and new tensors live concurrently → 2× annotation cache peak).
+                log_mem("concept filter: before train mask")
+                _new_train_ann = base_cbl_dataset._annotation_cache[:, keep_mask]
+                base_cbl_dataset._annotation_cache = _new_train_ann
+                del _new_train_ann
+                gc.collect()
+                log_mem("concept filter: after train mask")
+
+                _new_val_ann = val_cbl_dataset._annotation_cache[:, keep_mask]
+                val_cbl_dataset._annotation_cache = _new_val_ann
+                del _new_val_ann
+                gc.collect()
+                log_mem("concept filter: after val mask")
+
                 base_cbl_dataset.concepts = concepts
                 val_cbl_dataset.concepts = concepts
                 base_cbl_dataset.concept_set = set(concepts)
@@ -363,7 +388,15 @@ def simulate_federated_training_vlg(args):
                     # annotation cache — avoids creating a DataLoader that would load
                     # and preprocess every image just to discard it.
                     print("Computing per-concept positive counts from DINO annotations...")
-                    concept_counts = base_cbl_dataset._annotation_cache.sum(dim=0).tolist()
+                    log_mem("concept count: before chunked sum")
+                    _ann = base_cbl_dataset._annotation_cache
+                    _N, _C = _ann.shape
+                    _cc = torch.zeros(_C, dtype=torch.long)
+                    _chunk = 65536
+                    for _start in range(0, _N, _chunk):
+                        _cc += _ann[_start:_start + _chunk].sum(dim=0).long()
+                    concept_counts = _cc.tolist()
+                    log_mem("concept count: after chunked sum")
                     print(f"  Concept pos counts: min={min(concept_counts):.0f} median={sorted(concept_counts)[len(concept_counts)//2]:.0f} max={max(concept_counts):.0f}")
                 else:
                     per_class_concepts = num_concepts // num_classes
