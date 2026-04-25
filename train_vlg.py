@@ -422,16 +422,17 @@ def simulate_federated_training_vlg(args):
             # when the backbone is not being finetuned.
             if (not getattr(args, "cbl_finetune", False)
                     and annotation_dir and os.path.isdir(annotation_dir)):
-                _extract_workers = max(args.num_workers, 8)
+                _extract_bs = min(1024, getattr(args, "cbl_batch_size", 32) * 8)
+                _extract_workers = max(args.num_workers, 4)
                 base_cbl_dataset.populate_feature_cache(
                     backbone=backbone, device=str(device),
                     backbone_name=args.backbone,
-                    batch_size=1024, num_workers=_extract_workers, prefetch_factor=4,
+                    batch_size=_extract_bs, num_workers=_extract_workers, prefetch_factor=4,
                 )
                 val_cbl_dataset.populate_feature_cache(
                     backbone=backbone, device=str(device),
                     backbone_name=args.backbone,
-                    batch_size=1024, num_workers=_extract_workers, prefetch_factor=4,
+                    batch_size=_extract_bs, num_workers=_extract_workers, prefetch_factor=4,
                 )
                 _t = _step("backbone feature pre-extraction", _t)
 
