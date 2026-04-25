@@ -193,6 +193,12 @@ class DinoConceptDataset(Dataset):
         # balloons CPU RSS (page-locked memory accounting is lossy in cgroup v2)
         # and gave us OOMKills on CLIP backbones with batch_size * 4 loaders.
         # prefetch_factor keeps workers further ahead of the GPU during NFS stalls.
+        # file_system sharing avoids FD exhaustion on long extractions (places365,
+        # imagenet) where the default socket-based IPC accumulates open FDs across
+        # thousands of batches and hits the OS ulimit.
+        if num_workers > 0:
+            import torch.multiprocessing
+            torch.multiprocessing.set_sharing_strategy('file_system')
         _pf = prefetch_factor if num_workers > 0 else None
         loader = DataLoader(
             _PreprocessDataset(), batch_size=batch_size, shuffle=False,
