@@ -278,10 +278,25 @@ def simulate_federated_training_vlg(args):
         global_model.to(device)
         _t = _step("CBL + global model init", _t)
 
+        # When the feature cache will be populated below, Phase 1's DataLoaders
+        # serve from in-RAM tensors — no I/O or preprocessing happens per __getitem__.
+        # In that regime, workers add zero throughput value but each fork inherits
+        # the parent's ~11GB+ of cached tensors. On large datasets (places365,
+        # imagenet) this triggers OOM under CoW edge cases (pin_memory pool growth,
+        # tensor refcount touches dirtying many pages, etc.). Use num_workers=0 +
+        # pin_memory=False to keep the loaders single-process and avoid duplication.
+        # If feature cache won't be active (cbl_finetune or no DINO), keep workers.
+        _will_use_feature_cache = (
+            not getattr(args, "cbl_finetune", False)
+            and annotation_dir and os.path.isdir(annotation_dir)
+        )
+        _p1_workers = 0 if _will_use_feature_cache else args.num_workers
+        _p1_pin = not _will_use_feature_cache
+
         val_cbl_loader = DataLoader(
             val_cbl_dataset,
             batch_size=getattr(args, "cbl_batch_size", 32),
-            num_workers=args.num_workers,
+            num_workers=_p1_workers,
             shuffle=False
         )
         client_train_loaders = []
@@ -290,7 +305,7 @@ def simulate_federated_training_vlg(args):
             sub = Subset(base_cbl_dataset, client_indices[i])
             client_train_loaders.append(DataLoader(
                 sub, batch_size=getattr(args, "cbl_batch_size", 32),
-                shuffle=True, num_workers=args.num_workers, pin_memory=True
+                shuffle=True, num_workers=_p1_workers, pin_memory=_p1_pin
             ))
             client_data_sizes.append(len(sub))
         total_samples = sum(client_data_sizes)
