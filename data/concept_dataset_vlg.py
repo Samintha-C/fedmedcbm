@@ -154,6 +154,7 @@ class DinoConceptDataset(Dataset):
         backbone_name: str,
         batch_size: int = 256,
         num_workers: int = 4,
+        prefetch_factor: int = 4,
     ) -> None:
         """Pre-extract and cache backbone embeddings + targets. Caller must
         ensure the backbone is frozen — cached features become invalid
@@ -191,9 +192,12 @@ class DinoConceptDataset(Dataset):
         # pin_memory=False: extraction is a one-shot, GPU-bound op. Pinning
         # balloons CPU RSS (page-locked memory accounting is lossy in cgroup v2)
         # and gave us OOMKills on CLIP backbones with batch_size * 4 loaders.
+        # prefetch_factor keeps workers further ahead of the GPU during NFS stalls.
+        _pf = prefetch_factor if num_workers > 0 else None
         loader = DataLoader(
             _PreprocessDataset(), batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=False,
+            prefetch_factor=_pf,
         )
 
         print(f"[feature cache] extracting backbone features "

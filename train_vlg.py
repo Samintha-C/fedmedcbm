@@ -359,16 +359,16 @@ def simulate_federated_training_vlg(args):
             # finetuned backbone would invalidate any prior cache silently.
             if (not getattr(args, "cbl_finetune", False)
                     and annotation_dir and os.path.isdir(annotation_dir)):
-                _feat_bs = getattr(args, "cbl_batch_size", 32) * 4
+                _extract_workers = max(args.num_workers, 8)
                 base_cbl_dataset.populate_feature_cache(
                     backbone=backbone, device=str(device),
                     backbone_name=args.backbone,
-                    batch_size=_feat_bs, num_workers=args.num_workers,
+                    batch_size=1024, num_workers=_extract_workers, prefetch_factor=4,
                 )
                 val_cbl_dataset.populate_feature_cache(
                     backbone=backbone, device=str(device),
                     backbone_name=args.backbone,
-                    batch_size=_feat_bs, num_workers=args.num_workers,
+                    batch_size=1024, num_workers=_extract_workers, prefetch_factor=4,
                 )
                 _t = _step("backbone feature pre-extraction (Phase 2 only)", _t)
 
@@ -418,16 +418,16 @@ def simulate_federated_training_vlg(args):
             # when the backbone is not being finetuned.
             if (not getattr(args, "cbl_finetune", False)
                     and annotation_dir and os.path.isdir(annotation_dir)):
-                _feat_bs = getattr(args, "cbl_batch_size", 32) * 4
+                _extract_workers = max(args.num_workers, 8)
                 base_cbl_dataset.populate_feature_cache(
                     backbone=backbone, device=str(device),
                     backbone_name=args.backbone,
-                    batch_size=_feat_bs, num_workers=args.num_workers,
+                    batch_size=1024, num_workers=_extract_workers, prefetch_factor=4,
                 )
                 val_cbl_dataset.populate_feature_cache(
                     backbone=backbone, device=str(device),
                     backbone_name=args.backbone,
-                    batch_size=_feat_bs, num_workers=args.num_workers,
+                    batch_size=1024, num_workers=_extract_workers, prefetch_factor=4,
                 )
                 _t = _step("backbone feature pre-extraction", _t)
 
