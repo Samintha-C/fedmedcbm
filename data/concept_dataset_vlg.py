@@ -197,7 +197,6 @@ class DinoConceptDataset(Dataset):
         # imagenet) where the default socket-based IPC accumulates open FDs across
         # thousands of batches and hits the OS ulimit.
         if num_workers > 0:
-            import torch.multiprocessing
             torch.multiprocessing.set_sharing_strategy('file_system')
         _pf = prefetch_factor if num_workers > 0 else None
         loader = DataLoader(
