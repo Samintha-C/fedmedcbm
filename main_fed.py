@@ -73,6 +73,10 @@ def main():
     parser.add_argument("--dual_warmup_rounds", type=int, default=0,
         help="Number of initial FedDualAvg rounds with lambda=0 (no regularization). "
              "Lets the dense solution converge before sparsity pressure kicks in.")
+    parser.add_argument("--dual_l2_lam", type=float, default=0.0,
+        help="L2 penalty λ₂ for elastic net proximal operator in FedDualAvg. "
+             "When >0, switches prox from L1 soft-threshold to elastic net: "
+             "prox(z) = sign(z)*max(|z|-η·λ₁,0)/(1+η·λ₂). Default 0 (pure L1).")
 
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

@@ -70,6 +70,15 @@ def soft_threshold(z, lam):
     return torch.sign(z) * torch.clamp(torch.abs(z) - lam, min=0.0)
 
 
+def elasticnet_threshold(z, lam_l1, lam_l2):
+    """
+    Proximal operator for elastic net: R(W) = λ₁‖W‖₁ + λ₂‖W‖²_F.
+    prox(z)_{k,c} = sign(z) * max(|z| - η·λ₁, 0) / (1 + η·λ₂)
+    lam_l1 and lam_l2 are the already-scaled η·λ values.
+    """
+    return soft_threshold(z, lam_l1) / (1.0 + lam_l2)
+
+
 def simulate_federated_training_vlg(args):
     get_loss_vlg = _get_loss_vlg()
 
@@ -930,6 +939,15 @@ def simulate_federated_training_vlg(args):
         dual_lam_end = getattr(args, "dual_lam_end", 0.01)
         dual_schedule = getattr(args, "dual_schedule", "linear")
         dual_warmup_rounds = getattr(args, "dual_warmup_rounds", 0)
+        dual_l2_lam = getattr(args, "dual_l2_lam", 0.0)
+        if dual_l2_lam > 0.0:
+            # Elastic net: scale L2 threshold by the same ratio as L1 at each step
+            _l2_ratio = dual_l2_lam / dual_lam
+            _prox = lambda z, eta: elasticnet_threshold(z, eta, eta * _l2_ratio)
+            print(f"[feddualavg] proximal: elastic net (λ₁={dual_lam}, λ₂={dual_l2_lam})")
+        else:
+            _prox = soft_threshold
+            print(f"[feddualavg] proximal: L1 soft threshold (λ={dual_lam})")
 
         # Dual state: accumulated (negative) gradients — same shape as weight and bias
         z_weight = torch.zeros(num_classes, num_concepts, device=device)
@@ -981,7 +999,7 @@ def simulate_federated_training_vlg(args):
                                 eta_tilde = eta_s * eta_c * effective_step * dual_lam
 
                         # 1. Primal recovery: w = prox(z, eta_tilde)
-                        w_primal = soft_threshold(z_local_w, eta_tilde)
+                        w_primal = _prox(z_local_w, eta_tilde)
                         b_primal = z_local_b.clone()  # no regularization on bias
 
                         # 2. Forward pass and gradient at primal point
@@ -1031,7 +1049,7 @@ def simulate_federated_training_vlg(args):
                     eta_tilde_server = dual_lam_end + (dual_lam - dual_lam_end) * (1.0 - progress)
                 else:
                     eta_tilde_server = eta_s * eta_c * server_step * dual_lam
-            w_server = soft_threshold(z_weight, eta_tilde_server)
+            w_server = _prox(z_weight, eta_tilde_server)
             b_server = z_bias.clone()
 
             # Load primal into final layer for evaluation
