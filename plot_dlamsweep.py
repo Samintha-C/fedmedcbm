@@ -13,7 +13,7 @@ Override paths:
 import argparse
 import json
 import os
-import glob
+import shutil
 
 import matplotlib
 matplotlib.use("Agg")
@@ -87,6 +87,76 @@ def plot_metric(data, key, ylabel, title, filename, output_dir):
     return out_path
 
 
+def plot_pareto(data, output_dir):
+    """Option 1: Pareto scatter — sparsity on x, accuracy on y, λ encoded as dot size."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    # Size range: smallest λ → smallest dot, largest λ → largest dot
+    min_lam, max_lam = min(LAM_VALUES), max(LAM_VALUES)
+
+    for ds in DATASETS:
+        xs = data[ds]["sparsity"]   # % non-zero (lower = sparser)
+        ys = data[ds]["accuracy"]
+        lams = data[ds]["lams"]
+        if not xs:
+            continue
+        sizes = [40 + 180 * (lam - min_lam) / (max_lam - min_lam) for lam in lams]
+        sc = ax.scatter(xs, ys, s=sizes, color=COLORS[ds], marker=MARKERS[ds],
+                        alpha=0.85, label=ds, zorder=3)
+        # Annotate each point with its λ value
+        for x, y, lam in zip(xs, ys, lams):
+            ax.annotate(f"λ={lam}", (x, y), textcoords="offset points",
+                        xytext=(5, 4), fontsize=7.5, color=COLORS[ds])
+
+    ax.set_xlabel("Non-zero Weights (%) — lower is sparser →", fontsize=12)
+    ax.set_ylabel("Test Accuracy (%)", fontsize=12)
+    ax.set_title("FedDualAvg: Accuracy–Sparsity Pareto (dot size ∝ λ₁)", fontsize=13)
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "dlamsweep_pareto.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_connected_dots(data, output_dir):
+    """Option 3: Connected dot plot — one panel per dataset, x=sparsity, y=accuracy,
+    dots connected as λ increases, each dot labelled with its λ value."""
+    n = len(DATASETS)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), sharey=True)
+
+    for ax, ds in zip(axes, DATASETS):
+        xs = data[ds]["sparsity"]
+        ys = data[ds]["accuracy"]
+        lams = data[ds]["lams"]
+        if not xs:
+            ax.set_title(ds, fontsize=12)
+            continue
+
+        # Connect in order of increasing λ (already sorted)
+        ax.plot(xs, ys, color=COLORS[ds], linewidth=1.5, zorder=2, alpha=0.6)
+        for i, (x, y, lam) in enumerate(zip(xs, ys, lams)):
+            # Fade dots from light (small λ) to full color (large λ)
+            alpha = 0.4 + 0.6 * i / max(len(lams) - 1, 1)
+            ax.scatter(x, y, s=80, color=COLORS[ds], marker=MARKERS[ds],
+                       alpha=alpha, zorder=3)
+            ax.annotate(f"λ={lam}", (x, y), textcoords="offset points",
+                        xytext=(4, 4), fontsize=8, color=COLORS[ds])
+
+        ax.set_xlabel("Non-zero Weights (%)", fontsize=11)
+        ax.set_title(ds, fontsize=12, color=COLORS[ds])
+        ax.grid(True, alpha=0.3)
+
+    axes[0].set_ylabel("Test Accuracy (%)", fontsize=11)
+    fig.suptitle("FedDualAvg: Accuracy–Sparsity Tradeoff by Dataset (λ₁ increases →)",
+                 fontsize=13)
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "dlamsweep_connected.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_dir",   default="/sc-rwx-vol/fedmedcbm/models")
@@ -98,6 +168,7 @@ def main():
     print("Collecting metrics...")
     data = collect(args.base_dir)
 
+    # Separate accuracy and sparsity lines
     plot_metric(data, "accuracy", "Test Accuracy (%)",
                 "FedDualAvg: Test Accuracy vs. dual_lam",
                 "dlamsweep_accuracy.png", args.output_dir)
@@ -106,12 +177,23 @@ def main():
                 "FedDualAvg: Sparsity vs. dual_lam",
                 "dlamsweep_sparsity.png", args.output_dir)
 
-    # Mirror plots into each dataset's own dlamsweep dir for easy reference
+    # Pareto scatter (accuracy vs sparsity, λ as dot size)
+    plot_pareto(data, args.output_dir)
+
+    # Connected dot plot (one panel per dataset)
+    plot_connected_dots(data, args.output_dir)
+
+    # Mirror all plots into each dataset's own dlamsweep dir for easy reference
+    all_fnames = (
+        "dlamsweep_accuracy.png",
+        "dlamsweep_sparsity.png",
+        "dlamsweep_pareto.png",
+        "dlamsweep_connected.png",
+    )
     for ds in DATASETS:
         ds_out = os.path.join(args.base_dir, ds, "dlamsweep")
         if os.path.isdir(ds_out):
-            import shutil
-            for fname in ("dlamsweep_accuracy.png", "dlamsweep_sparsity.png"):
+            for fname in all_fnames:
                 src = os.path.join(args.output_dir, fname)
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(ds_out, fname))
