@@ -18,22 +18,47 @@ import shutil
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+from matplotlib import rcParams
 
+# ── Global style ──────────────────────────────────────────────────────────────
+rcParams.update({
+    "font.family":       "sans-serif",
+    "font.sans-serif":   ["DejaVu Sans"],
+    "font.size":         11,
+    "axes.titlesize":    13,
+    "axes.labelsize":    12,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.linewidth":    0.8,
+    "xtick.major.size":  4,
+    "ytick.major.size":  4,
+    "xtick.minor.size":  2,
+    "ytick.minor.size":  2,
+    "legend.framealpha": 0.9,
+    "legend.edgecolor":  "0.85",
+    "legend.fontsize":   10,
+    "figure.dpi":        150,
+    "savefig.dpi":       200,
+    "savefig.bbox":      "tight",
+    "savefig.facecolor": "white",
+})
 
-DATASETS = ["cifar10", "cifar100", "cub"]
-COLORS   = {"cifar10": "steelblue", "cifar100": "darkorange", "cub": "forestgreen"}
-MARKERS  = {"cifar10": "o",         "cifar100": "s",           "cub": "^"}
+# Muted, colour-blind-friendly palette
+COLORS  = {"cifar10": "#4C72B0", "cifar100": "#DD8452", "cub": "#55A868"}
+MARKERS = {"cifar10": "o",       "cifar100": "s",        "cub": "^"}
+LABELS  = {"cifar10": "CIFAR-10", "cifar100": "CIFAR-100", "cub": "CUB-200"}
 
-# All lam values we expect; missing ones are silently skipped.
+DATASETS   = ["cifar10", "cifar100", "cub"]
 LAM_VALUES = [0.0005, 0.001, 0.002, 0.005, 0.01]
 LAM_STRS   = ["0.0005", "0.001", "0.002", "0.005", "0.01"]
 
 
+# ── Data loading ──────────────────────────────────────────────────────────────
 def load_metrics(base_dir, dataset, lam_str):
     lam_dir = os.path.join(base_dir, dataset, "dlamsweep", f"lam{lam_str}")
     if not os.path.isdir(lam_dir):
         return None
-    # Pick the most recent model subdir (alphabetical sort → timestamp order)
     subdirs = sorted(
         d for d in os.listdir(lam_dir)
         if os.path.isdir(os.path.join(lam_dir, d))
@@ -64,99 +89,123 @@ def collect(base_dir):
     return data
 
 
-def plot_metric(data, key, ylabel, title, filename, output_dir):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for ds in DATASETS:
-        xs = data[ds]["lams"]
-        ys = data[ds][key]
-        if not xs:
-            continue
-        ax.plot(xs, ys, marker=MARKERS[ds], color=COLORS[ds], linewidth=2,
-                markersize=7, label=ds)
-    ax.set_xscale("log")
-    ax.set_xlabel("dual_lam (λ₁)", fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=13)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+def _style_ax(ax, grid_axis="both"):
+    ax.grid(True, which="major", linestyle="--", linewidth=0.5,
+            color="0.88", alpha=0.9, axis=grid_axis)
+    ax.set_axisbelow(True)
+
+
+def _save(fig, output_dir, filename):
     out_path = os.path.join(output_dir, filename)
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path)
     plt.close(fig)
     print(f"Saved: {out_path}")
-    return out_path
 
 
+# ── Plot 1: separate line charts ───────────────────────────────────────────────
+def plot_metric(data, key, ylabel, title, filename, output_dir):
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for ds in DATASETS:
+        xs, ys = data[ds]["lams"], data[ds][key]
+        if not xs:
+            continue
+        ax.plot(xs, ys, marker=MARKERS[ds], color=COLORS[ds],
+                linewidth=2, markersize=7, label=LABELS[ds],
+                markeredgecolor="white", markeredgewidth=0.8)
+    ax.set_xscale("log")
+    ax.xaxis.set_major_formatter(ticker.LogFormatter(minor_thresholds=(2, 0.5)))
+    ax.set_xlabel("Regularisation strength  λ₁")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=10)
+    ax.legend(loc="best")
+    _style_ax(ax)
+    plt.tight_layout()
+    _save(fig, output_dir, filename)
+
+
+# ── Plot 2: Pareto scatter ─────────────────────────────────────────────────────
 def plot_pareto(data, output_dir):
-    """Option 1: Pareto scatter — sparsity on x, accuracy on y, λ encoded as dot size."""
-    fig, ax = plt.subplots(figsize=(8, 6))
-    # Size range: smallest λ → smallest dot, largest λ → largest dot
+    fig, ax = plt.subplots(figsize=(7, 5.5))
     min_lam, max_lam = min(LAM_VALUES), max(LAM_VALUES)
 
     for ds in DATASETS:
-        xs = data[ds]["sparsity"]   # % non-zero (lower = sparser)
-        ys = data[ds]["accuracy"]
-        lams = data[ds]["lams"]
+        xs, ys, lams = data[ds]["sparsity"], data[ds]["accuracy"], data[ds]["lams"]
         if not xs:
             continue
-        sizes = [40 + 180 * (lam - min_lam) / (max_lam - min_lam) for lam in lams]
-        sc = ax.scatter(xs, ys, s=sizes, color=COLORS[ds], marker=MARKERS[ds],
-                        alpha=0.85, label=ds, zorder=3)
-        # Annotate each point with its λ value
+        # Draw a faint connecting line so the λ trajectory is readable
+        ax.plot(xs, ys, color=COLORS[ds], linewidth=1, alpha=0.35, zorder=1)
+        sizes = [50 + 200 * (lam - min_lam) / (max_lam - min_lam) for lam in lams]
+        ax.scatter(xs, ys, s=sizes, color=COLORS[ds], marker=MARKERS[ds],
+                   alpha=0.9, zorder=3, label=LABELS[ds],
+                   edgecolors="white", linewidths=0.8)
         for x, y, lam in zip(xs, ys, lams):
-            ax.annotate(f"λ={lam}", (x, y), textcoords="offset points",
-                        xytext=(5, 4), fontsize=7.5, color=COLORS[ds])
+            ax.annotate(
+                f"λ={lam}", xy=(x, y),
+                xytext=(6, 4), textcoords="offset points",
+                fontsize=8, color=COLORS[ds],
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.6, ec="none"),
+            )
 
-    ax.set_xlabel("Non-zero Weights (%) — lower is sparser →", fontsize=12)
-    ax.set_ylabel("Test Accuracy (%)", fontsize=12)
-    ax.set_title("FedDualAvg: Accuracy–Sparsity Pareto (dot size ∝ λ₁)", fontsize=13)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("Non-zero weights  (%)  ←  sparser")
+    ax.set_ylabel("Test accuracy  (%)")
+    ax.set_title("Accuracy–Sparsity Frontier  (dot size ∝ λ₁)", pad=10)
+    ax.legend(loc="lower right")
+    _style_ax(ax)
     plt.tight_layout()
-    out_path = os.path.join(output_dir, "dlamsweep_pareto.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Saved: {out_path}")
+    _save(fig, output_dir, "dlamsweep_pareto.png")
 
 
+# ── Plot 3: Connected dot panels ──────────────────────────────────────────────
 def plot_connected_dots(data, output_dir):
-    """Option 3: Connected dot plot — one panel per dataset, x=sparsity, y=accuracy,
-    dots connected as λ increases, each dot labelled with its λ value."""
     n = len(DATASETS)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), sharey=True)
+    fig, axes = plt.subplots(1, n, figsize=(4.8 * n, 5), sharey=True)
+    fig.subplots_adjust(wspace=0.08)
 
     for ax, ds in zip(axes, DATASETS):
-        xs = data[ds]["sparsity"]
-        ys = data[ds]["accuracy"]
-        lams = data[ds]["lams"]
+        xs, ys, lams = data[ds]["sparsity"], data[ds]["accuracy"], data[ds]["lams"]
+        color = COLORS[ds]
+
         if not xs:
-            ax.set_title(ds, fontsize=12)
+            ax.set_title(LABELS[ds], color=color, pad=8)
             continue
 
-        # Connect in order of increasing λ (already sorted)
-        ax.plot(xs, ys, color=COLORS[ds], linewidth=1.5, zorder=2, alpha=0.6)
+        # Trajectory line
+        ax.plot(xs, ys, color=color, linewidth=1.4, alpha=0.45, zorder=2)
+
         for i, (x, y, lam) in enumerate(zip(xs, ys, lams)):
-            # Fade dots from light (small λ) to full color (large λ)
-            alpha = 0.4 + 0.6 * i / max(len(lams) - 1, 1)
-            ax.scatter(x, y, s=80, color=COLORS[ds], marker=MARKERS[ds],
-                       alpha=alpha, zorder=3)
-            ax.annotate(f"λ={lam}", (x, y), textcoords="offset points",
-                        xytext=(4, 4), fontsize=8, color=COLORS[ds])
+            t = i / max(len(lams) - 1, 1)
+            # Dots lighten at small λ, saturate at large λ
+            dot_alpha = 0.35 + 0.65 * t
+            ax.scatter(x, y, s=90, color=color, marker=MARKERS[ds],
+                       alpha=dot_alpha, zorder=3,
+                       edgecolors="white", linewidths=0.8)
+            # Alternate label offset to reduce overlap
+            dy = 6 if i % 2 == 0 else -14
+            ax.annotate(
+                f"λ={lam}", xy=(x, y),
+                xytext=(5, dy), textcoords="offset points",
+                fontsize=7.5, color=color,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.65, ec="none"),
+            )
 
-        ax.set_xlabel("Non-zero Weights (%)", fontsize=11)
-        ax.set_title(ds, fontsize=12, color=COLORS[ds])
-        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Non-zero weights  (%)")
+        ax.set_title(LABELS[ds], color=color, pad=8, fontweight="semibold")
+        _style_ax(ax, grid_axis="both")
+        # Only left panel gets a y-label
+        if ax is axes[0]:
+            ax.set_ylabel("Test accuracy  (%)")
+        else:
+            ax.tick_params(labelleft=False)
 
-    axes[0].set_ylabel("Test Accuracy (%)", fontsize=11)
-    fig.suptitle("FedDualAvg: Accuracy–Sparsity Tradeoff by Dataset (λ₁ increases →)",
-                 fontsize=13)
-    plt.tight_layout()
-    out_path = os.path.join(output_dir, "dlamsweep_connected.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Saved: {out_path}")
+    fig.suptitle(
+        "Accuracy–Sparsity Tradeoff  (λ₁ increases along each curve  →)",
+        fontsize=13, y=1.02,
+    )
+    _save(fig, output_dir, "dlamsweep_connected.png")
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_dir",   default="/sc-rwx-vol/fedmedcbm/models")
@@ -168,22 +217,18 @@ def main():
     print("Collecting metrics...")
     data = collect(args.base_dir)
 
-    # Separate accuracy and sparsity lines
-    plot_metric(data, "accuracy", "Test Accuracy (%)",
-                "FedDualAvg: Test Accuracy vs. dual_lam",
+    plot_metric(data, "accuracy", "Test accuracy  (%)",
+                "Test Accuracy vs. Regularisation Strength",
                 "dlamsweep_accuracy.png", args.output_dir)
 
-    plot_metric(data, "sparsity", "Non-zero Weights (%)",
-                "FedDualAvg: Sparsity vs. dual_lam",
+    plot_metric(data, "sparsity", "Non-zero weights  (%)",
+                "Sparsity vs. Regularisation Strength",
                 "dlamsweep_sparsity.png", args.output_dir)
 
-    # Pareto scatter (accuracy vs sparsity, λ as dot size)
     plot_pareto(data, args.output_dir)
-
-    # Connected dot plot (one panel per dataset)
     plot_connected_dots(data, args.output_dir)
 
-    # Mirror all plots into each dataset's own dlamsweep dir for easy reference
+    # Mirror all plots into each dataset's dlamsweep dir
     all_fnames = (
         "dlamsweep_accuracy.png",
         "dlamsweep_sparsity.png",
@@ -201,8 +246,9 @@ def main():
 
     print("\nDone.")
     print("\nTo copy results locally, run:")
-    print(f"kubectl cp wenglab-interpretable-ai/sc-rwx-copy-pod:/sc-rwx-vol/fedmedcbm/eval_results/visualizations/dlam_sweep "
-          f"/Users/saminthachandrasiri/Research/TrustworthyMLLab/fed_lfc_cbm/visualizations/dlam_sweep")
+    print("kubectl cp wenglab-interpretable-ai/sc-rwx-copy-pod:"
+          "/sc-rwx-vol/fedmedcbm/eval_results/visualizations/dlam_sweep "
+          "/Users/saminthachandrasiri/Research/TrustworthyMLLab/fed_lfc_cbm/visualizations/dlam_sweep")
 
 
 if __name__ == "__main__":
