@@ -881,6 +881,158 @@ def simulate_federated_training_vlg(args):
         total_w = final_layer.weight.data.numel()
         print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
+    elif vlg_final_method == "fedavg_l1":
+        print("\n=== Phase 3: FedAvg + Element-wise L1 Soft-Threshold (naive baseline) ===")
+        # Each client trains the final layer with CE only, server FedAvgs the
+        # weights, then applies element-wise L1 soft-threshold post-aggregation.
+        # No proximal step in the local objective, no FedMask — the server's
+        # soft_threshold is the only sparsity pressure.
+        client_concept_loaders = []
+        offset = 0
+        for i in range(args.num_clients):
+            n = client_data_sizes[i]
+            c_feats = all_train_feats[offset:offset + n]
+            c_labels = all_train_labels[offset:offset + n]
+            offset += n
+            client_concept_loaders.append(DataLoader(
+                TensorDataset(c_feats, c_labels),
+                batch_size=saga_bs, shuffle=True
+            ))
+
+        # Per-client val concept features (mirrors fedavg_thresh)
+        client_val_concept_loaders = []
+        client_val_sizes = []
+        if _pretrained_mode:
+            n_val_total = val_feats.shape[0]
+            base_val = n_val_total // args.num_clients
+            rem_val = n_val_total % args.num_clients
+            offset_val = 0
+            for i in range(args.num_clients):
+                n_v = base_val + (1 if i < rem_val else 0)
+                v_feats_i = val_feats[offset_val:offset_val + n_v]
+                v_labels_i = val_labels_all[offset_val:offset_val + n_v]
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(v_feats_i, v_labels_i),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(n_v)
+                offset_val += n_v
+        else:
+            for i in range(args.num_clients):
+                idx = torch.tensor(_val_indices_thresh[i], dtype=torch.long)
+                v_feats_i = val_feats[idx]
+                v_labels_i = val_labels_all[idx]
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(v_feats_i, v_labels_i),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(len(idx))
+        total_val = sum(client_val_sizes)
+        client_val_weights = [n / total_val for n in client_val_sizes]
+
+        final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+        client_final_layers = [FinalLayer(num_concepts, num_classes, device=str(device))
+                               for _ in range(args.num_clients)]
+        ce_loss = nn.CrossEntropyLoss()
+
+        final_rounds = getattr(args, "final_rounds", 5)
+        final_epochs = getattr(args, "final_epochs", 3)
+        final_lr = getattr(args, "final_lr", 1e-3)
+        l1_lam = float(args.fedavg_l1_lam)
+        print(f"[fedavg_l1] post-aggregation L1 threshold λ={l1_lam}")
+
+        l1_metrics = {
+            "rounds": [], "client_losses": [], "avg_client_loss": [],
+            "val_accuracy": [], "best_val_accuracy": [],
+            "nnz_weights": [], "concepts_alive": [],
+            "threshold_lam": l1_lam,
+        }
+        best_val_acc = 0.0
+        best_fl_state = None
+
+        for round_num in range(final_rounds):
+            print(f"\n=== FedAvg+L1 Round {round_num + 1}/{final_rounds} ===")
+            round_losses = []
+            for i in range(args.num_clients):
+                client_final_layers[i].load_state_dict(final_layer.state_dict())
+                client_final_layers[i].train()
+                opt = torch.optim.Adam(client_final_layers[i].parameters(), lr=final_lr)
+                epoch_loss = 0.0
+                n_batches = 0
+                for epoch in range(final_epochs):
+                    for feats, labels in client_concept_loaders[i]:
+                        feats, labels = feats.to(device), labels.to(device)
+                        loss = ce_loss(client_final_layers[i](feats), labels)
+                        opt.zero_grad()
+                        loss.backward()
+                        opt.step()
+                        epoch_loss += loss.item()
+                        n_batches += 1
+                round_losses.append(epoch_loss / max(n_batches, 1))
+                print(f"  Client {i}: Loss = {round_losses[-1]:.4f}")
+
+            # Server: weighted FedAvg of client final layers
+            global_fl_state = {}
+            for key in final_layer.state_dict().keys():
+                param = client_final_layers[0].state_dict()[key]
+                if param.dtype.is_floating_point:
+                    global_fl_state[key] = torch.zeros_like(param)
+                    for i in range(args.num_clients):
+                        global_fl_state[key] += client_weights[i] * client_final_layers[i].state_dict()[key]
+                else:
+                    global_fl_state[key] = param.clone()
+
+            # Element-wise L1 soft threshold on the averaged weight matrix.
+            # Bias is left unregularized (matches feddualavg).
+            for key in global_fl_state:
+                if "weight" in key:
+                    global_fl_state[key] = soft_threshold(global_fl_state[key], l1_lam)
+
+            final_layer.load_state_dict(global_fl_state)
+
+            # Federated val evaluation
+            final_layer.eval()
+            val_acc = 0.0
+            with torch.no_grad():
+                for i in range(args.num_clients):
+                    client_correct, client_total = 0, 0
+                    for feats, labels in client_val_concept_loaders[i]:
+                        feats, labels = feats.to(device), labels.to(device)
+                        preds = final_layer(feats).argmax(dim=1)
+                        client_correct += (preds == labels).sum().item()
+                        client_total += labels.size(0)
+                    val_acc += client_val_weights[i] * (client_correct / max(client_total, 1))
+            print(f"  Val Accuracy: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_fl_state = {k: v.clone() for k, v in final_layer.state_dict().items()}
+
+            nnz_round = int((final_layer.weight.data.abs() > 1e-5).sum().item())
+            concepts_alive_round = int(
+                (final_layer.weight.data.abs().sum(dim=0) > 1e-5).sum().item()
+            )
+
+            l1_metrics["rounds"].append(round_num + 1)
+            l1_metrics["client_losses"].append(round_losses)
+            l1_metrics["avg_client_loss"].append(sum(round_losses) / len(round_losses))
+            l1_metrics["val_accuracy"].append(float(val_acc))
+            l1_metrics["best_val_accuracy"].append(float(best_val_acc))
+            l1_metrics["nnz_weights"].append(nnz_round)
+            l1_metrics["concepts_alive"].append(concepts_alive_round)
+            update_log(_log_path, {"status": "in_progress", "phase": "final_layer_fedavg_l1",
+                                    "round": round_num + 1, "total_rounds": final_rounds,
+                                    "val_accuracy": float(val_acc), "best_val_accuracy": float(best_val_acc),
+                                    "threshold_lam": l1_lam, "nnz_weights": nnz_round,
+                                    "concepts_alive": concepts_alive_round})
+
+        if best_fl_state is not None:
+            final_layer.load_state_dict(best_fl_state)
+        global_model.final_layer = final_layer
+
+        nnz = (final_layer.weight.data.abs() > 1e-5).sum().item()
+        total_w = final_layer.weight.data.numel()
+        print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
+
     elif vlg_final_method == "feddualavg":
         print("\n=== Phase 3: Federated Dual Averaging with Group Lasso (VLG) ===")
         # Reuse the normalized concept features already extracted in Phase 2.
@@ -1154,6 +1306,10 @@ def simulate_federated_training_vlg(args):
         metrics_txt_data["thresh_lam_end"] = args.thresh_lam_end
         metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
         metrics_txt_data["final_lr"] = getattr(args, "final_lr", 1e-3)
+    elif vlg_final_method == "fedavg_l1":
+        metrics_txt_data["fedavg_l1_lam"] = float(args.fedavg_l1_lam)
+        metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
+        metrics_txt_data["final_lr"] = getattr(args, "final_lr", 1e-3)
     elif vlg_final_method == "feddualavg":
         metrics_txt_data["dual_eta_s"] = args.dual_eta_s
         metrics_txt_data["dual_eta_c"] = args.dual_eta_c
@@ -1222,6 +1378,8 @@ def simulate_federated_training_vlg(args):
     }
     if vlg_final_method == "fedavg_thresh":
         training_metrics["final_layer_phase"] = thresh_metrics
+    elif vlg_final_method == "fedavg_l1":
+        training_metrics["final_layer_phase"] = l1_metrics
     elif vlg_final_method == "feddualavg":
         training_metrics["final_layer_phase"] = dual_metrics
     elif vlg_final_method in ("hybrid_saga", "fedavg"):

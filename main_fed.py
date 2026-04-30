@@ -47,9 +47,10 @@ def main():
     parser.add_argument("--final_rounds", type=int, default=5, help="Number of rounds for final layer training")
     parser.add_argument("--final_epochs", type=int, default=3, help="Epochs per round for final layer training")
     parser.add_argument("--final_layer_method", type=str, default=None,
-        choices=["fedavg", "fedavg_thresh", "hybrid_saga", "feddualavg"],
+        choices=["fedavg", "fedavg_thresh", "fedavg_l1", "hybrid_saga", "feddualavg"],
         help="Final layer training method: fedavg (dense FedAvg for LFC, dense centralized for VLG), "
-             "fedavg_thresh (FedAvg + server-side thresholding), "
+             "fedavg_thresh (FedAvg + server-side group thresholding), "
+             "fedavg_l1 (FedAvg + element-wise L1 soft-threshold post-aggregation; naive baseline), "
              "hybrid_saga (federated feature extraction + centralized GLM-SAGA), "
              "feddualavg (Federated Dual Averaging with group-lasso proximal). "
              "Default: fedavg for LFC, hybrid_saga for VLG")
@@ -57,6 +58,9 @@ def main():
         help="Starting group-threshold lambda (compared to column L2 norms)")
     parser.add_argument("--thresh_lam_end", type=float, default=0.12,
         help="Ending group-threshold lambda (compared to column L2 norms)")
+    parser.add_argument("--fedavg_l1_lam", type=float, default=0.01,
+        help="Fixed L1 soft-threshold lambda applied to the FedAvg-aggregated weight matrix "
+             "each round (used by --final_layer_method fedavg_l1)")
     parser.add_argument("--dual_eta_s", type=float, default=1.0,
         help="Server learning rate for FedDualAvg")
     parser.add_argument("--dual_eta_c", type=float, default=0.01,
