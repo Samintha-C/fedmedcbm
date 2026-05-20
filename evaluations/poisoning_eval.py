@@ -141,8 +141,15 @@ def _try_compute_eval_metrics(results, base_args, exp, output_dir):
             return
 
         baseline = results.get("n0_none")
+        if baseline is None:
+            n0_path = os.path.join(output_dir, "n0_none_result.json")
+            if os.path.exists(n0_path):
+                with open(n0_path) as f:
+                    baseline = json.load(f)
 
         for key, result in results.items():
+            if result.get("eval_metrics"):
+                continue  # already computed (e.g. cached result from a previous run)
             if not result.get("model_dir"):
                 continue
             try:
@@ -170,27 +177,24 @@ def _load_global_model(pretrained_dir: str, args, device: str):
         num_classes = len(classes)
 
         backbone_name = getattr(args, "backbone", "resnet50")
-        saved_args_path = os.path.join(pretrained_dir, "args.json")
-        if os.path.exists(saved_args_path):
-            with open(saved_args_path) as f:
-                saved = json.load(f)
-            backbone_name = saved.get("backbone", backbone_name)
+        feature_layer = getattr(args, "feature_layer", "layer4")
 
         use_clip = "clip" in backbone_name.lower()
         if use_clip:
-            backbone = BackboneCLIP(backbone_name, device=device)
+            use_penultimate = getattr(args, "use_clip_penultimate", True)
+            backbone = BackboneCLIP(backbone_name, use_penultimate=use_penultimate, device="cpu")
         else:
-            backbone = Backbone(backbone_name, device=device)
+            backbone = Backbone(backbone_name, feature_layer, device="cpu")
 
         cbl_path = os.path.join(pretrained_dir, "cbl.pt")
-        norm_path = os.path.join(pretrained_dir, "normalization.pt")
         final_path = os.path.join(pretrained_dir, "final.pt")
 
         if not os.path.exists(cbl_path):
             print(f"[load_model] cbl.pt not found in {pretrained_dir}")
             return None
 
-        cbl_state = torch.load(cbl_path, map_location=device, weights_only=True)
+        cbl_state = torch.load(cbl_path, map_location="cpu", weights_only=True)
+        # Infer num_concepts from the last weight tensor in the CBL state dict
         w_keys = [k for k in cbl_state if "weight" in k]
         num_concepts = cbl_state[w_keys[-1]].shape[0] if w_keys else None
         if num_concepts is None:
@@ -198,17 +202,18 @@ def _load_global_model(pretrained_dir: str, args, device: str):
             return None
 
         num_hidden = getattr(args, "cbl_hidden_layers", 0)
-        cbl = ConceptLayer(backbone.out_features, num_concepts, num_hidden, device=device)
+        cbl = ConceptLayer(backbone.output_dim, num_concepts, num_hidden, bias=True, device="cpu")
         cbl.load_state_dict(cbl_state)
 
-        norm = NormalizationLayer(num_concepts, device=device)
-        if os.path.exists(norm_path):
-            norm.load_state_dict(torch.load(norm_path, map_location=device, weights_only=True))
+        norm = NormalizationLayer.from_pretrained(pretrained_dir, device=device)
 
         final = FinalLayer(num_concepts, num_classes, device=device)
         if os.path.exists(final_path):
             final.load_state_dict(torch.load(final_path, map_location=device, weights_only=True))
 
+        # backbone stays on CPU (matches train_vlg.py pretrained-mode convention);
+        # cbl/norm/final go to device so forward passes stay on GPU
+        cbl.to(device)
         return FedVLGCBM(backbone, cbl, norm, final)
     except Exception as e:
         print(f"[load_model] failed: {e}")
