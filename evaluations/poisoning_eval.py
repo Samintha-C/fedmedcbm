@@ -226,8 +226,8 @@ def _build_test_loader(args):
         from training_utils import get_data, get_preprocess
         backbone_name = getattr(args, "backbone", "resnet50")
         preprocess = get_preprocess(backbone_name)
-        data_dir = getattr(args, "data_dir", "./data")
-        _, _, test_dataset = get_data(args.dataset, preprocess, data_dir)
+        # LF-CBM convention: "{dataset}_val" is the held-out test split
+        test_dataset = get_data(f"{args.dataset}_val", preprocess)
         return torch.utils.data.DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=4)
     except Exception as e:
         print(f"[build_test_loader] failed: {e}")
