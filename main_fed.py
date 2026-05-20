@@ -11,7 +11,8 @@ if _current_dir not in sys.path:
 from train_vlg import simulate_federated_training_vlg
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Return a configured ArgumentParser for the federated training CLI."""
     parser = argparse.ArgumentParser(description="Federated Label-Free Concept Bottleneck Model")
 
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet", "cub", "places365"], help="Dataset name")
@@ -128,19 +129,29 @@ def main():
     parser.add_argument("--dense", action="store_true", help="Train dense final layer (VLG)")
     parser.add_argument("--dense_lr", type=float, default=0.001, help="Learning rate for dense final layer (VLG)")
 
-    config_parser = argparse.ArgumentParser()
+    return parser
+
+
+def _parse_args(argv=None):
+    """Parse args with optional YAML config override. Used by main() and poisoning_eval."""
+    config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=str, default=None)
-    config_pre, remaining = config_parser.parse_known_args()
+    config_pre, remaining = config_parser.parse_known_args(argv)
+    parser = build_parser()
     if config_pre.config is not None:
         with open(config_pre.config, "r") as f:
             parser.set_defaults(**json.load(f))
-
     args = parser.parse_args(remaining)
     args.run_nec_eval = not getattr(args, "no_nec_eval", False)
     nm = getattr(args, "nec_measure_level", (5, 10, 15, 20, 25, 30))
     args.nec_measure_level = tuple(int(x) for x in (nm.split(",") if isinstance(nm, str) else nm))
     if args.final_layer_method is None:
         args.final_layer_method = "hybrid_saga"
+    return args
+
+
+def main():
+    args = _parse_args()
     simulate_federated_training_vlg(args)
 
 
