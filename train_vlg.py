@@ -79,23 +79,7 @@ def elasticnet_threshold(z, lam_l1, lam_l2):
     return soft_threshold(z, lam_l1) / (1.0 + lam_l2)
 
 
-def _apply_client_label_flip(labels, client_idx, poisoning_ctx):
-    """Return labels with source→target flip applied if client_idx is malicious."""
-    if poisoning_ctx is None:
-        return labels
-    atk = poisoning_ctx.client_attacks.get(client_idx)
-    if atk is None or atk.attack_type != "label_flip" or atk.label_flip is None:
-        return labels
-    from attacks.label_flip import apply_label_flip
-    lf = atk.label_flip
-    flipped = apply_label_flip(labels, lf.source_class, lf.target_class)
-    n_flipped = (labels == lf.source_class).sum().item()
-    if n_flipped:
-        print(f"  [attack] client {client_idx}: {n_flipped} labels flipped {lf.source_class}→{lf.target_class}")
-    return flipped
-
-
-def simulate_federated_training_vlg(args, poisoning_ctx=None):
+def simulate_federated_training_vlg(args):
     get_loss_vlg = _get_loss_vlg()
 
     set_seed(args.seed)
@@ -730,7 +714,7 @@ def simulate_federated_training_vlg(args, poisoning_ctx=None):
         for i in range(args.num_clients):
             n = client_data_sizes[i]
             c_feats = all_train_feats[offset:offset + n]
-            c_labels = _apply_client_label_flip(all_train_labels[offset:offset + n], i, poisoning_ctx)
+            c_labels = all_train_labels[offset:offset + n]
             offset += n
             client_concept_loaders.append(DataLoader(
                 TensorDataset(c_feats, c_labels),
@@ -908,7 +892,7 @@ def simulate_federated_training_vlg(args, poisoning_ctx=None):
         for i in range(args.num_clients):
             n = client_data_sizes[i]
             c_feats = all_train_feats[offset:offset + n]
-            c_labels = _apply_client_label_flip(all_train_labels[offset:offset + n], i, poisoning_ctx)
+            c_labels = all_train_labels[offset:offset + n]
             offset += n
             client_concept_loaders.append(DataLoader(
                 TensorDataset(c_feats, c_labels),
@@ -1051,15 +1035,13 @@ def simulate_federated_training_vlg(args, poisoning_ctx=None):
 
     elif vlg_final_method == "feddualavg":
         print("\n=== Phase 3: Federated Dual Averaging with Group Lasso (VLG) ===")
-        if poisoning_ctx is not None and poisoning_ctx.client_attacks:
-            print(f"  [poisoning] {len(poisoning_ctx.client_attacks)} malicious client(s), defense={poisoning_ctx.defense.mode}")
         # Reuse the normalized concept features already extracted in Phase 2.
         client_concept_loaders = []
         offset = 0
         for i in range(args.num_clients):
             n = client_data_sizes[i]
             c_feats = all_train_feats[offset:offset + n]
-            c_labels = _apply_client_label_flip(all_train_labels[offset:offset + n], i, poisoning_ctx)
+            c_labels = all_train_labels[offset:offset + n]
             offset += n
             client_concept_loaders.append(DataLoader(
                 TensorDataset(c_feats, c_labels),
@@ -1136,9 +1118,6 @@ def simulate_federated_training_vlg(args, poisoning_ctx=None):
         best_val_acc = 0.0
         best_fl_state = None
 
-        # Poisoning: effective aggregation weights (updated by defense each detection round)
-        _eff_weights = list(client_weights)
-
         for round_num in range(final_rounds):
             print(f"\n=== FedDualAvg Round {round_num + 1}/{final_rounds} ===")
             round_losses = []
@@ -1199,12 +1178,12 @@ def simulate_federated_training_vlg(args, poisoning_ctx=None):
                 round_losses.append(client_loss_sum / max(n_steps, 1))
                 print(f"  Client {i}: Loss = {round_losses[-1]:.4f}")
 
-            # Server: weighted average of dual deltas (uses _eff_weights for defense)
+            # Server: weighted average of dual deltas
             avg_delta_w = torch.zeros_like(z_weight)
             avg_delta_b = torch.zeros_like(z_bias)
             for i in range(args.num_clients):
-                avg_delta_w += _eff_weights[i] * client_z_deltas_w[i]
-                avg_delta_b += _eff_weights[i] * client_z_deltas_b[i]
+                avg_delta_w += client_weights[i] * client_z_deltas_w[i]
+                avg_delta_b += client_weights[i] * client_z_deltas_b[i]
 
             z_weight += eta_s * avg_delta_w
             z_bias += eta_s * avg_delta_b
@@ -1229,44 +1208,6 @@ def simulate_federated_training_vlg(args, poisoning_ctx=None):
             with torch.no_grad():
                 final_layer.weight.copy_(w_server)
                 final_layer.bias.copy_(b_server)
-
-            # Poisoning: detection + defense (runs after server primal recovery so
-            # detection uses the current model, and effective weights update for the
-            # next round's aggregation).
-            if (poisoning_ctx is not None
-                    and poisoning_ctx.defense.mode != "none"
-                    and (round_num + 1) % poisoning_ctx.defense.detection_interval == 0):
-                from attacks.detection import compute_intervention_scores, compute_suspicion, flag_clients
-                from attacks.defense import apply_defense
-                _all_client_scores = []
-                for _ci in range(args.num_clients):
-                    _vf_list, _vl_list = [], []
-                    for _vf, _vl in client_val_concept_loaders[_ci]:
-                        _vf_list.append(_vf); _vl_list.append(_vl)
-                    _vf_all = torch.cat(_vf_list).to(device)
-                    _vl_all = torch.cat(_vl_list).to(device)
-                    _all_client_scores.append(compute_intervention_scores(
-                        _vf_all, _vl_all, w_server, num_classes,
-                        fraction=poisoning_ctx.intervention_fraction,
-                        n_trials=poisoning_ctx.intervention_trials,
-                    ))
-                _suspicion, _class_means, _class_vars = compute_suspicion(_all_client_scores, num_classes)
-                _flagged = flag_clients(_suspicion, poisoning_ctx.defense.suspicion_threshold)
-                _eff_weights = apply_defense(
-                    poisoning_ctx.defense.mode, client_weights, _suspicion, _flagged,
-                    poisoning_ctx.defense.reweight_decay,
-                )
-                _det_entry = {
-                    "round": round_num + 1,
-                    "suspicion_scores": _suspicion,
-                    "flagged_clients": _flagged,
-                    "class_mean_scores": _class_means,
-                    "class_var_scores": _class_vars,
-                    "effective_weights": list(_eff_weights),
-                }
-                poisoning_ctx.detection_log.append(_det_entry)
-                print(f"  [detection] round {round_num+1}: suspicion={[f'{s:.3f}' for s in _suspicion]}")
-                print(f"  [detection] flagged={_flagged}  eff_weights={[f'{w:.3f}' for w in _eff_weights]}")
 
             # Sparsity stats
             nnz = (w_server.abs() > 1e-5).sum().item()
