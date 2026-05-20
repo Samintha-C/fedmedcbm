@@ -363,13 +363,11 @@ def _collect_predictions(
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     all_preds, all_labels = [], []
-    # backbone may live on CPU (matches train_vlg.py pretrained-mode convention)
-    bb_device = next(backbone.parameters()).device
     backbone.eval(); cbl.eval(); normalization.eval(); final_layer.eval()
     with torch.no_grad():
         for batch in test_loader:
-            imgs, labels = batch[0].to(bb_device), batch[1]
-            feats = backbone(imgs).to(device)
+            imgs, labels = batch[0].to(device), batch[1]
+            feats = backbone(imgs)
             concepts = cbl(feats)
             norm_concepts = normalization(concepts)
             logits = final_layer(norm_concepts)
