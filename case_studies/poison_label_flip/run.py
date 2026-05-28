@@ -98,6 +98,8 @@ def build_train_cmd(cfg: dict, save_dir: str, snapshot_dir: str,
 
     if cfg.get("use_clip_penultimate"):
         cmd.append("--use_clip_penultimate")
+    if cfg.get("iid"):
+        cmd.append("--iid")
     if annotation_dir:
         cmd += ["--annotation_dir", annotation_dir]
     if annotation_cache_dir:

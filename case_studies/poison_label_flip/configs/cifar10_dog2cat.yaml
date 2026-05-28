@@ -16,7 +16,8 @@ local_epochs: 5
 batch_size: 32
 lr: 0.001
 weight_decay: 1e-5
-alpha: 0.5
+iid: true       # case study: deterministic ~500 dogs per client
+alpha: 0.5      # ignored when iid: true
 seed: 42
 final_layer_method: feddualavg
 final_rounds: 200
