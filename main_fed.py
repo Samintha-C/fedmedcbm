@@ -128,6 +128,16 @@ def main():
     parser.add_argument("--dense", action="store_true", help="Train dense final layer (VLG)")
     parser.add_argument("--dense_lr", type=float, default=0.001, help="Learning rate for dense final layer (VLG)")
 
+    # ── Case-study / diagnostic hooks ────────────────────────────────────────
+    parser.add_argument("--label_flip_client", type=int, default=-1,
+        help="Client index whose labels are flipped (case study). -1 disables (default).")
+    parser.add_argument("--label_flip_map", type=str, default=None,
+        help='JSON string mapping source class name to target class name, '
+             'e.g. \'{"dog":"cat"}\'. Only used when --label_flip_client >= 0.')
+    parser.add_argument("--phase3_snapshot_dir", type=str, default=None,
+        help="If set, dump per-client final-layer primal weights at the last "
+             "Phase-3 round to this directory (feddualavg only).")
+
     config_parser = argparse.ArgumentParser()
     config_parser.add_argument("--config", type=str, default=None)
     config_pre, remaining = config_parser.parse_known_args()

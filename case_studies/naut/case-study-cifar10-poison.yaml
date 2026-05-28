@@ -1,0 +1,76 @@
+# Case study: CIFAR-10, 1/5 clients poisoned, dog->cat label flip
+# Runs case_studies/poison_label_flip/run.py end-to-end (train + diagnose).
+# Outputs (heatmaps, top-K table, divergence scores) written to PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-casestudy-cifar10-poison
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm-case-study
+    dataset: cifar10
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update && apt-get install -y git
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml matplotlib
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              LOCAL_SAVE=$WORKSPACE/saved_models
+              SNAPSHOT_DIR=/sc-rwx-vol/fedmedcbm/case_studies/cifar10_dog2cat/snapshots
+              OUT_DIR=/sc-rwx-vol/fedmedcbm/case_studies/cifar10_dog2cat/diagnostics
+              mkdir -p $LOCAL_SAVE $SNAPSHOT_DIR $OUT_DIR
+
+              cd $WORKSPACE/fedmedcbm
+
+              python case_studies/poison_label_flip/run.py \
+                --config case_studies/poison_label_flip/configs/cifar10_dog2cat.yaml \
+                --save_dir $LOCAL_SAVE \
+                --snapshot_dir $SNAPSHOT_DIR \
+                --out_dir $OUT_DIR \
+                --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
+                --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
+                --log_dir /sc-rwx-vol/fedmedcbm/job_logs
+
+              echo "Case study complete. Outputs in $OUT_DIR"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 6Gi
+      restartPolicy: Never
+  backoffLimit: 0

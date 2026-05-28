@@ -19,6 +19,7 @@ from glm_saga.elasticnet import IndexedTensorDataset, group_threshold
 from tqdm import tqdm
 
 from data import data_utils
+from data.data_utils import LabelFlipSubset
 from data.concept_dataset_vlg import AllOneConceptDataset, DinoConceptDataset, get_concept_dataloader
 from models.fed_vlgcbm import (
     Backbone, BackboneCLIP, ConceptLayer, NormalizationLayer, FinalLayer, FedVLGCBM,
@@ -333,10 +334,27 @@ def simulate_federated_training_vlg(args):
             num_workers=_p1_workers,
             shuffle=False
         )
+        # ── Label-flip hook (case study) ─────────────────────────────────────
+        _flip_client = getattr(args, "label_flip_client", -1)
+        _flip_map_int = {}
+        if _flip_client >= 0:
+            _flip_map_raw = getattr(args, "label_flip_map", None)
+            if _flip_map_raw:
+                import json as _json
+                _name_map = _json.loads(_flip_map_raw) if isinstance(_flip_map_raw, str) else _flip_map_raw
+                _name_to_idx = {c: i for i, c in enumerate(classes)}
+                _flip_map_int = {_name_to_idx[src]: _name_to_idx[tgt]
+                                 for src, tgt in _name_map.items()
+                                 if src in _name_to_idx and tgt in _name_to_idx}
+                print(f"[poison] Client {_flip_client} label flip map (indices): {_flip_map_int}")
+
         client_train_loaders = []
         client_data_sizes = []
         for i in range(args.num_clients):
             sub = Subset(base_cbl_dataset, client_indices[i])
+            if i == _flip_client and _flip_map_int:
+                sub = LabelFlipSubset(sub, _flip_map_int)
+                print(f"[poison] Wrapped client {i} dataset with LabelFlipSubset")
             client_train_loaders.append(DataLoader(
                 sub, batch_size=getattr(args, "cbl_batch_size", 32),
                 shuffle=True, num_workers=_p1_workers, pin_memory=_p1_pin
@@ -1178,6 +1196,13 @@ def simulate_federated_training_vlg(args):
                 round_losses.append(client_loss_sum / max(n_steps, 1))
                 print(f"  Client {i}: Loss = {round_losses[-1]:.4f}")
 
+                # Snapshot: retain per-client dual state from the last round
+                _snapshot_dir = getattr(args, "phase3_snapshot_dir", None)
+                if _snapshot_dir and round_num == final_rounds - 1:
+                    if not hasattr(args, "_snap_z_states"):
+                        args._snap_z_states = []
+                    args._snap_z_states.append((z_local_w.clone().cpu(), z_local_b.clone().cpu()))
+
             # Server: weighted average of dual deltas
             avg_delta_w = torch.zeros_like(z_weight)
             avg_delta_b = torch.zeros_like(z_bias)
@@ -1203,6 +1228,18 @@ def simulate_federated_training_vlg(args):
                     eta_tilde_server = eta_s * eta_c * server_step * dual_lam
             w_server = _prox(z_weight, eta_tilde_server)
             b_server = z_bias.clone()
+
+            # Write per-client primal snapshots at the last round
+            if getattr(args, "phase3_snapshot_dir", None) and round_num == final_rounds - 1:
+                _snap_dir = args.phase3_snapshot_dir
+                os.makedirs(_snap_dir, exist_ok=True)
+                for _ci, (_zw, _zb) in enumerate(getattr(args, "_snap_z_states", [])):
+                    _w_snap = _prox(_zw.to(device), eta_tilde_server).cpu()
+                    torch.save({"weight": _w_snap, "bias": _zb},
+                               os.path.join(_snap_dir, f"client_{_ci}_primal.pt"))
+                torch.save({"weight": w_server.cpu(), "bias": b_server.cpu()},
+                           os.path.join(_snap_dir, "global_primal.pt"))
+                print(f"[snapshot] Per-client primals saved to {_snap_dir}")
 
             # Load primal into final layer for evaluation
             with torch.no_grad():

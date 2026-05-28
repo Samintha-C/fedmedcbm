@@ -238,6 +238,29 @@ def split_dataset_for_federated(dataset, num_clients, iid=True, alpha=0.5, seed=
         return split_dataset_dirichlet(dataset, num_clients, alpha=alpha, seed=seed)
 
 
+class LabelFlipSubset(torch.utils.data.Dataset):
+    """Wraps a dataset and remaps labels according to flip_map.
+
+    Expects __getitem__ to return tuples where the last element is the integer
+    class label (matches DinoConceptDataset / AllOneConceptDataset convention).
+
+    Args:
+        dataset: base dataset returning (..., label) tuples
+        flip_map: {src_label_int: tgt_label_int}
+    """
+    def __init__(self, dataset, flip_map: dict):
+        self.dataset = dataset
+        self.flip_map = {int(k): int(v) for k, v in flip_map.items()}
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        *rest, label = self.dataset[idx]
+        label = self.flip_map.get(int(label), int(label))
+        return (*rest, label)
+
+
 def print_client_distribution(dataset, client_indices, num_classes=None):
     """
     Print the class distribution for each client (useful for debugging).

@@ -1,0 +1,50 @@
+# Case study: CIFAR-10, 1/5 clients poisoned, dog->cat label flip
+# All Phase 1-2 hyperparams match fedcbm-cifar10-c5-fda.yaml for comparability.
+
+dataset: cifar10
+concept_file: concept_files/cifar10_filtered.txt
+
+# Poisoning
+adversary_client_id: 0
+flip_map:
+  dog: cat
+
+# Federation
+num_clients: 5
+num_rounds: 5
+local_epochs: 5
+batch_size: 32
+lr: 0.001
+weight_decay: 1e-5
+alpha: 0.5
+seed: 42
+final_layer_method: feddualavg
+final_rounds: 200
+final_epochs: 3
+final_lr: 0.001
+dual_lam: 0.01
+dual_eta_s: 1.0
+dual_eta_c: 0.01
+
+# Backbone (matches fedcbm-cifar10-c5-fda.yaml)
+backbone: clip_RN50
+use_clip_penultimate: true
+clip_name: RN50
+
+# CBL
+cbl_loss_type: bce
+cbl_lr: 0.0005
+cbl_epochs: 5
+cbl_batch_size: 32
+cbl_optimizer: adam
+cbl_hidden_layers: 0
+cbl_pos_weight: 0.2
+cbl_twoway_tp: 4.0
+cbl_bb_lr_rate: 1.0
+ortho_lambda: 100
+val_split: 0.1
+
+# Diagnosis
+source_class: dog
+target_class: cat
+topk_concepts: 5
