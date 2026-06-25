@@ -1,0 +1,21 @@
+# Federated dense baseline (no CBL) — CIFAR-10
+# Backbone / partition match fedcbm-cifar10-c5-fda.yaml; Phase 3 budget matched.
+dataset: cifar10
+backbone: clip_RN50
+use_clip_penultimate: true
+clip_name: RN50
+
+num_clients: 5
+num_rounds: 5          # naming only (no Phase 1 here)
+alpha: 0.5
+iid: false
+seed: 42
+val_split: 0.1
+
+# Phase 3 FedAvg head (matched to CBM final-layer budget)
+final_rounds: 200
+final_epochs: 3
+final_lr: 0.001
+saga_batch_size: 512
+extract_batch_size: 256
+batch_size: 250
