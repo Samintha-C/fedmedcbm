@@ -1,0 +1,320 @@
+# Federated dense (non-CBM) baseline sweep — all 5 datasets.
+# Frozen backbone + FedAvg dense head. No CBL, no concepts, no DINO annotations.
+# One job per dataset; comment out datasets you don't want to run.
+# Models saved to: /sc-rwx-vol/fedmedcbm/models/{dataset}/baselines/fed_dense/
+
+# ─── cifar10 ─────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fed-dense-cifar10
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-dense-baseline
+    dataset: cifar10
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update && apt-get install -y git
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              LOCAL_SAVE=$WORKSPACE/saved_models && mkdir -p $LOCAL_SAVE
+
+              python baselines/fed_dense/run.py \
+                --config baselines/fed_dense/configs/cifar10.yaml \
+                --save_dir $LOCAL_SAVE --device cuda
+
+              MODEL_DIR=$(find $LOCAL_SAVE/fully_trained -maxdepth 1 -type d | tail -n +2 | head -1)
+              if [ -z "$MODEL_DIR" ]; then echo "ERROR: no model dir"; exit 1; fi
+              DEST=/sc-rwx-vol/fedmedcbm/models/cifar10/baselines/fed_dense
+              rm -rf $DEST && mkdir -p $DEST
+              cp -r "$MODEL_DIR" $DEST/
+              echo "Saved to $DEST/$(basename $MODEL_DIR)"
+          resources:
+            requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 6Gi}}
+      restartPolicy: Never
+  backoffLimit: 0
+
+---
+# ─── cifar100 ────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fed-dense-cifar100
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-dense-baseline
+    dataset: cifar100
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update && apt-get install -y git
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              LOCAL_SAVE=$WORKSPACE/saved_models && mkdir -p $LOCAL_SAVE
+
+              python baselines/fed_dense/run.py \
+                --config baselines/fed_dense/configs/cifar100.yaml \
+                --save_dir $LOCAL_SAVE --device cuda
+
+              MODEL_DIR=$(find $LOCAL_SAVE/fully_trained -maxdepth 1 -type d | tail -n +2 | head -1)
+              if [ -z "$MODEL_DIR" ]; then echo "ERROR: no model dir"; exit 1; fi
+              DEST=/sc-rwx-vol/fedmedcbm/models/cifar100/baselines/fed_dense
+              rm -rf $DEST && mkdir -p $DEST
+              cp -r "$MODEL_DIR" $DEST/
+              echo "Saved to $DEST/$(basename $MODEL_DIR)"
+          resources:
+            requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 6Gi}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-GeForce-RTX-1080Ti, NVIDIA-GeForce-RTX-2080Ti, NVIDIA-GeForce-RTX-3090, NVIDIA-A10, NVIDIA-A40, NVIDIA-A100-SXM4-80GB, NVIDIA-A100-PCIE-40GB]
+      restartPolicy: Never
+  backoffLimit: 0
+
+---
+# ─── CUB ─────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fed-dense-cub
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-dense-baseline
+    dataset: cub
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update && apt-get install -y git
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              # CUB is not torchvision-downloadable — symlink the PVC copy.
+              mkdir -p data && ln -sfn /sc-rwx-vol/fedmedcbm/datasets/CUB data/CUB
+              LOCAL_SAVE=$WORKSPACE/saved_models && mkdir -p $LOCAL_SAVE
+
+              python baselines/fed_dense/run.py \
+                --config baselines/fed_dense/configs/cub.yaml \
+                --save_dir $LOCAL_SAVE --device cuda
+
+              MODEL_DIR=$(find $LOCAL_SAVE/fully_trained -maxdepth 1 -type d | tail -n +2 | head -1)
+              if [ -z "$MODEL_DIR" ]; then echo "ERROR: no model dir"; exit 1; fi
+              DEST=/sc-rwx-vol/fedmedcbm/models/cub/baselines/fed_dense
+              rm -rf $DEST && mkdir -p $DEST
+              cp -r "$MODEL_DIR" $DEST/
+              echo "Saved to $DEST/$(basename $MODEL_DIR)"
+          resources:
+            requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 6Gi}}
+      restartPolicy: Never
+  backoffLimit: 0
+
+---
+# ─── ImageNet ────────────────────────────────────────────────────────────────
+# Dense feature extraction holds all train features in RAM (~10GB fp32) → 64Gi.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fed-dense-imagenet
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-dense-baseline
+    dataset: imagenet
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              ulimit -n 65536
+              apt-get update && apt-get install -y git
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              export IMAGENET_ROOT=/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC
+              LOCAL_SAVE=$WORKSPACE/saved_models && mkdir -p $LOCAL_SAVE
+
+              python baselines/fed_dense/run.py \
+                --config baselines/fed_dense/configs/imagenet.yaml \
+                --save_dir $LOCAL_SAVE --device cuda
+
+              MODEL_DIR=$(find $LOCAL_SAVE/fully_trained -maxdepth 1 -type d | tail -n +2 | head -1)
+              if [ -z "$MODEL_DIR" ]; then echo "ERROR: no model dir"; exit 1; fi
+              DEST=/sc-rwx-vol/fedmedcbm/models/imagenet/baselines/fed_dense
+              rm -rf $DEST && mkdir -p $DEST
+              cp -r "$MODEL_DIR" $DEST/
+              echo "Saved to $DEST/$(basename $MODEL_DIR)"
+          resources:
+            requests: {cpu: "4", memory: "64Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "64Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 12Gi}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-GeForce-RTX-3090, NVIDIA-A10, NVIDIA-A40, NVIDIA-A100-SXM4-80GB, NVIDIA-A100-PCIE-40GB]
+      restartPolicy: Never
+  backoffLimit: 0
+
+---
+# ─── Places365 ───────────────────────────────────────────────────────────────
+# Dense feature extraction holds all train features in RAM (~15GB fp32) → 64Gi.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fed-dense-places365
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-dense-baseline
+    dataset: places365
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              ulimit -n 65536
+              apt-get update && apt-get install -y git
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              export PLACES365_ROOT=/sc-rwx-vol/fedmedcbm/datasets/places365
+              LOCAL_SAVE=$WORKSPACE/saved_models && mkdir -p $LOCAL_SAVE
+
+              python baselines/fed_dense/run.py \
+                --config baselines/fed_dense/configs/places365.yaml \
+                --save_dir $LOCAL_SAVE --device cuda
+
+              MODEL_DIR=$(find $LOCAL_SAVE/fully_trained -maxdepth 1 -type d | tail -n +2 | head -1)
+              if [ -z "$MODEL_DIR" ]; then echo "ERROR: no model dir"; exit 1; fi
+              DEST=/sc-rwx-vol/fedmedcbm/models/places365/baselines/fed_dense
+              rm -rf $DEST && mkdir -p $DEST
+              cp -r "$MODEL_DIR" $DEST/
+              echo "Saved to $DEST/$(basename $MODEL_DIR)"
+          resources:
+            requests: {cpu: "4", memory: "64Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "64Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 10Gi}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-GeForce-RTX-3090, NVIDIA-A10, NVIDIA-A40, NVIDIA-A100-SXM4-80GB, NVIDIA-A100-PCIE-40GB]
+      restartPolicy: Never
+  backoffLimit: 0

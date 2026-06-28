@@ -37,6 +37,7 @@ _DEFAULTS = {
     "final_rounds": 200,
     "final_epochs": 3,
     "final_lr": 1e-3,
+    "final_weight_decay": 1e-4,
     "use_clip_penultimate": False,
     "feature_layer": "layer4",
 }

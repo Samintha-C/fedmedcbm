@@ -141,6 +141,8 @@ def train_fed_dense(args):
     final_rounds = getattr(args, "final_rounds", 200)
     final_epochs = getattr(args, "final_epochs", 3)
     final_lr = getattr(args, "final_lr", 1e-3)
+    final_wd = getattr(args, "final_weight_decay", 1e-4)
+    print(f"[dense] FedAvg head: lr={final_lr} weight_decay={final_wd}")
 
     metrics = {"rounds": [], "avg_client_loss": [], "val_accuracy": [], "best_val_accuracy": []}
     best_val_acc = 0.0
@@ -151,7 +153,7 @@ def train_fed_dense(args):
         for i in range(args.num_clients):
             client_heads[i].load_state_dict(head.state_dict())
             client_heads[i].train()
-            opt = torch.optim.Adam(client_heads[i].parameters(), lr=final_lr)
+            opt = torch.optim.Adam(client_heads[i].parameters(), lr=final_lr, weight_decay=final_wd)
             epoch_loss, n_batches = 0.0, 0
             for _ in range(final_epochs):
                 for feats, labels in client_loaders[i]:
@@ -227,6 +229,7 @@ def train_fed_dense(args):
         "final_rounds": final_rounds,
         "final_epochs": final_epochs,
         "final_lr": final_lr,
+        "final_weight_decay": final_wd,
     }
     save_metrics_txt(save_dir, metrics_txt)
     save_training_metrics(save_dir, metrics)

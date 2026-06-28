@@ -1,9 +1,9 @@
-# Federated dense baseline (no CBL) — CIFAR-10
-# Backbone / partition match fedcbm-cifar10-c5-fda.yaml; Phase 3 budget matched.
-dataset: cifar10
-backbone: clip_RN50
-use_clip_penultimate: true
-clip_name: RN50
+# Federated dense baseline (no CBL) — CUB-200
+# Backbone / partition match fedcbm-cub-c5-fda.yaml; Phase 3 budget matched.
+dataset: cub
+backbone: resnet18_cub
+feature_layer: features.final_pool
+clip_name: ViT-B/16
 
 num_clients: 5
 num_rounds: 5          # naming only (no Phase 1 here)

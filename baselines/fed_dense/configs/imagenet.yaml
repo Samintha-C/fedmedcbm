@@ -1,6 +1,7 @@
-# Federated dense baseline (no CBL) — CIFAR-100
-# Backbone / partition match fedcbm-cifar100-c5-fda.yaml; Phase 3 budget matched.
-dataset: cifar100
+# Federated dense baseline (no CBL) — ImageNet
+# Backbone / partition match fedcbm-imagenet-c5-fda.yaml; Phase 3 budget matched.
+# NOTE: IMAGENET_ROOT env var must be set by the job (see naut yaml).
+dataset: imagenet
 backbone: resnet50
 feature_layer: layer4
 clip_name: ViT-B/16
@@ -9,8 +10,8 @@ num_clients: 5
 num_rounds: 5          # naming only (no Phase 1 here)
 alpha: 0.5
 iid: false
-seed: 31
-val_split: 0.1
+seed: 42
+val_split: 0.05
 
 # Phase 3 FedAvg head (matched to CBM final-layer budget)
 final_rounds: 200
@@ -18,5 +19,6 @@ final_epochs: 3
 final_lr: 0.001
 final_weight_decay: 0.0001
 saga_batch_size: 512
-extract_batch_size: 256
+extract_batch_size: 512
 batch_size: 250
+num_workers: 4
