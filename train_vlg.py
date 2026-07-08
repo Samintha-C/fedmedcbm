@@ -642,6 +642,17 @@ def simulate_federated_training_vlg(args):
         torch.save(val_labels_all, os.path.join(save_dir, "val_concept_labels.pt"))
         norm_layer.save_model(save_dir)
 
+        # Local-only diagnostic (case study): fit an independent head per client on
+        # its own normalized features. Gated on flag → zero cost for normal runs.
+        _lo_dir = getattr(args, "local_only_diag_dir", None)
+        if _lo_dir:
+            from case_studies.poison_label_flip.local_only import fit_local_only_heads
+            fit_local_only_heads(
+                all_train_feats, all_train_labels, client_data_sizes,
+                num_concepts, num_classes, str(device), _lo_dir,
+                epochs=getattr(args, "local_only_epochs", 50),
+            )
+
         train_concept_loader = DataLoader(
             IndexedTensorDataset(all_train_feats, all_train_labels),
             batch_size=saga_bs, shuffle=True

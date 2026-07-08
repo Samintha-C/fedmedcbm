@@ -49,7 +49,7 @@ def _get_class_names(dataset: str, fed_root: str) -> list:
 
 def build_train_cmd(cfg: dict, save_dir: str, snapshot_dir: str,
                     annotation_dir: str, annotation_cache_dir: str,
-                    log_dir: str, fed_root: str) -> list:
+                    log_dir: str, fed_root: str, local_only_dir: str = None) -> list:
     flip_map_json = json.dumps(cfg["flip_map"])
 
     cmd = [
@@ -96,6 +96,10 @@ def build_train_cmd(cfg: dict, save_dir: str, snapshot_dir: str,
         "--phase3_snapshot_dir",  snapshot_dir,
     ]
 
+    if local_only_dir:
+        cmd += ["--local_only_diag_dir", local_only_dir,
+                "--local_only_epochs", str(cfg.get("local_only_epochs", 50))]
+
     if cfg.get("use_clip_penultimate"):
         cmd.append("--use_clip_penultimate")
     if cfg.get("iid"):
@@ -140,12 +144,15 @@ def main():
     )
     snapshot_dir = os.path.normpath(snapshot_dir)
     out_dir = args.out_dir or os.path.join(snapshot_dir, "diagnostics")
+    # Local-only heads live alongside the snapshots (sibling dir).
+    local_only_dir = os.path.normpath(os.path.join(snapshot_dir, "..", "local_only"))
+    local_only_out = os.path.join(local_only_dir, "diagnostics")
 
     if not args.skip_train:
         cmd = build_train_cmd(
             cfg, args.save_dir, snapshot_dir,
             args.annotation_dir, args.annotation_cache_dir,
-            args.log_dir, fed_root,
+            args.log_dir, fed_root, local_only_dir=local_only_dir,
         )
         print(f"\n[run] Training command:\n  {' '.join(cmd)}\n")
         result = subprocess.run(cmd, cwd=fed_root)
@@ -164,8 +171,7 @@ def main():
     concept_names = _load_concept_names(concept_file)
     class_names = _get_class_names(cfg["dataset"], fed_root)
 
-    run_diagnostics(
-        snapshot_dir=snapshot_dir,
+    common = dict(
         concept_names=concept_names,
         class_names=class_names,
         num_clients=cfg["num_clients"],
@@ -173,8 +179,17 @@ def main():
         source_class=cfg["source_class"],
         target_class=cfg["target_class"],
         topk=cfg.get("topk_concepts", 5),
-        out_dir=out_dir,
     )
+
+    # 1) Convergence-snapshot diagnostic (server-side detectability).
+    run_diagnostics(snapshot_dir=snapshot_dir, out_dir=out_dir, file_tag="primal", **common)
+
+    # 2) Local-only diagnostic (high-contrast "what each client's data wants").
+    if os.path.isdir(local_only_dir):
+        run_diagnostics(snapshot_dir=local_only_dir, out_dir=local_only_out,
+                        file_tag="localonly", **common)
+    else:
+        print(f"[run] No local-only heads at {local_only_dir} — skipping that diagnostic.")
 
 
 if __name__ == "__main__":

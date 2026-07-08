@@ -49,3 +49,4 @@ val_split: 0.1
 source_class: dog
 target_class: cat
 topk_concepts: 5
+local_only_epochs: 50   # epochs for each per-client standalone head fit

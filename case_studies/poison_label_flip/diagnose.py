@@ -20,13 +20,13 @@ import numpy as np
 import torch
 
 
-def _load_snapshots(snapshot_dir: str, num_clients: int) -> dict:
+def _load_snapshots(snapshot_dir: str, num_clients: int, file_tag: str = "primal") -> dict:
     snapshots = {}
     for i in range(num_clients):
-        path = os.path.join(snapshot_dir, f"client_{i}_primal.pt")
+        path = os.path.join(snapshot_dir, f"client_{i}_{file_tag}.pt")
         if os.path.exists(path):
             snapshots[f"client_{i}"] = torch.load(path, map_location="cpu")
-    global_path = os.path.join(snapshot_dir, "global_primal.pt")
+    global_path = os.path.join(snapshot_dir, f"global_{file_tag}.pt")
     if os.path.exists(global_path):
         snapshots["global"] = torch.load(global_path, map_location="cpu")
     return snapshots
@@ -39,8 +39,9 @@ def plot_weight_heatmaps(
     num_clients: int,
     adversary_client_id: int,
     out_dir: str,
+    file_tag: str = "primal",
 ):
-    snapshots = _load_snapshots(snapshot_dir, num_clients)
+    snapshots = _load_snapshots(snapshot_dir, num_clients, file_tag)
     if not snapshots:
         print("[diagnose] No snapshot files found.")
         return
@@ -100,8 +101,9 @@ def print_topk_concepts(
     target_class: str,
     k: int = 5,
     out_dir: str = None,
+    file_tag: str = "primal",
 ):
-    snapshots = _load_snapshots(snapshot_dir, num_clients)
+    snapshots = _load_snapshots(snapshot_dir, num_clients, file_tag)
     if not snapshots:
         return
 
@@ -151,10 +153,11 @@ def compute_divergence_scores(
     num_clients: int,
     adversary_client_id: int,
     out_dir: str = None,
+    file_tag: str = "primal",
 ) -> dict:
-    snapshots = _load_snapshots(snapshot_dir, num_clients)
+    snapshots = _load_snapshots(snapshot_dir, num_clients, file_tag)
     if "global" not in snapshots:
-        print("[diagnose] No global_primal.pt found; skipping divergence.")
+        print(f"[diagnose] No global_{file_tag}.pt found; skipping divergence.")
         return {}
 
     g = snapshots["global"]["weight"].float().flatten()
@@ -197,22 +200,23 @@ def run_diagnostics(
     target_class: str,
     topk: int = 5,
     out_dir: str = None,
+    file_tag: str = "primal",
 ):
     if out_dir is None:
         out_dir = os.path.join(snapshot_dir, "diagnostics")
 
     print(f"\n{'#'*70}")
-    print(f"# Poison Case Study Diagnostics")
+    print(f"# Poison Case Study Diagnostics  ({file_tag})")
     print(f"# Adversary: Client {adversary_client_id}  |  Flip: {source_class} -> {target_class}")
     print(f"{'#'*70}")
 
     plot_weight_heatmaps(snapshot_dir, concept_names, class_names,
-                         num_clients, adversary_client_id, out_dir)
+                         num_clients, adversary_client_id, out_dir, file_tag=file_tag)
 
     print_topk_concepts(snapshot_dir, concept_names, class_names,
                         num_clients, adversary_client_id,
-                        source_class, target_class, k=topk, out_dir=out_dir)
+                        source_class, target_class, k=topk, out_dir=out_dir, file_tag=file_tag)
 
-    compute_divergence_scores(snapshot_dir, num_clients, adversary_client_id, out_dir)
+    compute_divergence_scores(snapshot_dir, num_clients, adversary_client_id, out_dir, file_tag=file_tag)
 
     print(f"\n[diagnose] All outputs written to {out_dir}")

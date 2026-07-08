@@ -137,6 +137,12 @@ def main():
     parser.add_argument("--phase3_snapshot_dir", type=str, default=None,
         help="If set, dump per-client final-layer primal weights at the last "
              "Phase-3 round to this directory (feddualavg only).")
+    parser.add_argument("--local_only_diag_dir", type=str, default=None,
+        help="If set, after Phase 2 fit an independent dense head per client on its "
+             "own normalized concept features (no federation) and dump them here. "
+             "Stronger poison diagnostic than the convergence snapshot.")
+    parser.add_argument("--local_only_epochs", type=int, default=50,
+        help="Epochs for each per-client local-only head fit (--local_only_diag_dir).")
 
     config_parser = argparse.ArgumentParser()
     config_parser.add_argument("--config", type=str, default=None)
