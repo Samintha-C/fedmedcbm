@@ -14,7 +14,7 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 
 from data.data_utils import (
     get_data, get_classes, split_dataset_for_federated, print_client_distribution,
@@ -44,12 +44,17 @@ def _build_backbone(args, device):
 
 @torch.no_grad()
 def _extract_features(backbone, dataset, device, batch_size, num_workers):
-    """Run frozen backbone over a dataset, return (feats[N,D] cpu, labels[N] cpu)."""
+    """Run frozen backbone over a dataset, return (feats[N,D] fp16 cpu, labels[N] cpu).
+
+    Features are stored fp16 to halve resident RAM — critical for imagenet/places365
+    where the whole train set (~1.3-1.8M x 2048) lives in memory for FedAvg. pin_memory
+    is off so the large host buffers aren't page-locked.
+    """
     feats, labels = [], []
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True)
+                        num_workers=num_workers, pin_memory=False)
     for images, y in loader:
-        emb = backbone(images.to(device)).cpu()
+        emb = backbone(images.to(device)).half().cpu()
         feats.append(emb)
         labels.append(y)
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
@@ -90,46 +95,56 @@ def train_fed_dense(args):
     )
     print_client_distribution(train_dataset, client_indices, num_classes=num_classes)
 
-    # ── Phase 2a: per-client feature extraction (frozen backbone) ────────────
+    # ── Phase 2a: feature extraction (frozen backbone) ───────────────────────
+    # Extract the whole train set in ONE pass, then slice into clients by index.
+    # (Per-client extraction re-forked DataLoader workers against an ever-growing
+    # parent RSS, COW-duplicating already-extracted features → OOM on imagenet/places.)
     bs = getattr(args, "extract_batch_size", 256)
     nw = getattr(args, "num_workers", 2)
+    all_feats, all_labels = _extract_features(backbone, train_dataset, device, bs, nw)
+    print(f"[dense] extracted {all_feats.shape[0]} train features "
+          f"({all_feats.element_size() * all_feats.nelement() / 1024**3:.2f}GB fp16)")
+
     client_feats, client_labels, client_data_sizes = [], [], []
     for i in range(args.num_clients):
-        sub = Subset(train_dataset, client_indices[i])
-        f, y = _extract_features(backbone, sub, device, bs, nw)
-        client_feats.append(f)
-        client_labels.append(y)
-        client_data_sizes.append(len(sub))
-        print(f"[dense] client {i}: extracted {len(sub)} features")
+        idx = torch.as_tensor(client_indices[i], dtype=torch.long)
+        client_feats.append(all_feats[idx])
+        client_labels.append(all_labels[idx])
+        client_data_sizes.append(len(idx))
+    del all_feats, all_labels
     total_samples = sum(client_data_sizes)
     client_weights = [n / total_samples for n in client_data_sizes]
 
     val_feats, val_labels = _extract_features(backbone, val_dataset, device, bs, nw)
 
     # ── Phase 2b: federated normalization (parallel statistics) ──────────────
-    # Each client contributes local sum/sq-sum/count; server aggregates.
-    g_sum = torch.zeros(backbone_dim)
-    g_sq = torch.zeros(backbone_dim)
+    # Stats accumulated in fp32 from the fp16 blocks (one client cast at a time).
+    g_sum = torch.zeros(backbone_dim, dtype=torch.float32)
+    g_sq = torch.zeros(backbone_dim, dtype=torch.float32)
     g_n = 0
     for f in client_feats:
-        g_sum += f.sum(dim=0)
-        g_sq += (f ** 2).sum(dim=0)
+        ff = f.float()
+        g_sum += ff.sum(dim=0)
+        g_sq += (ff ** 2).sum(dim=0)
         g_n += f.shape[0]
+        del ff
     g_mean = g_sum / g_n
     g_var = (g_sq / g_n) - (g_mean ** 2)
     g_std = g_var.clamp(min=1e-8).sqrt()
     norm_layer = NormalizationLayer(g_mean, g_std, device=str(device))
 
-    def _normalize(t):
-        return (t - g_mean) / g_std
+    # Normalize in place (fp16), one block at a time — no second full-set copy.
+    for i in range(args.num_clients):
+        client_feats[i] = ((client_feats[i].float() - g_mean) / g_std).half()
+    val_feats = ((val_feats.float() - g_mean) / g_std).half()
 
     saga_bs = getattr(args, "saga_batch_size", 512)
     client_loaders = [
-        DataLoader(TensorDataset(_normalize(client_feats[i]), client_labels[i]),
+        DataLoader(TensorDataset(client_feats[i], client_labels[i]),
                    batch_size=saga_bs, shuffle=True)
         for i in range(args.num_clients)
     ]
-    val_loader = DataLoader(TensorDataset(_normalize(val_feats), val_labels),
+    val_loader = DataLoader(TensorDataset(val_feats, val_labels),
                             batch_size=saga_bs, shuffle=False)
 
     # ── Phase 3: federated dense head (genuine FedAvg) ───────────────────────
@@ -157,7 +172,7 @@ def train_fed_dense(args):
             epoch_loss, n_batches = 0.0, 0
             for _ in range(final_epochs):
                 for feats, labels in client_loaders[i]:
-                    feats, labels = feats.to(device), labels.to(device)
+                    feats, labels = feats.to(device).float(), labels.to(device)
                     loss = ce_loss(client_heads[i](feats), labels)
                     opt.zero_grad()
                     loss.backward()
@@ -183,7 +198,7 @@ def train_fed_dense(args):
         correct, total = 0, 0
         with torch.no_grad():
             for feats, labels in val_loader:
-                feats, labels = feats.to(device), labels.to(device)
+                feats, labels = feats.to(device).float(), labels.to(device)
                 preds = head(feats).argmax(dim=1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)

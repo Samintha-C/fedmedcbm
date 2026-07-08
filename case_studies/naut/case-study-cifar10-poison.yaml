@@ -10,7 +10,7 @@ metadata:
     experiment: fed-lfc-cbm-case-study
     dataset: cifar10
 spec:
-  ttlSecondsAfterFinished: 600
+  ttlSecondsAfterFinished: 86400
   template:
     spec:
       containers:
