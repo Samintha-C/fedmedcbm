@@ -100,6 +100,8 @@ def build_train_cmd(cfg: dict, save_dir: str, snapshot_dir: str,
         cmd += ["--local_only_diag_dir", local_only_dir,
                 "--local_only_epochs", str(cfg.get("local_only_epochs", 50))]
 
+    if cfg.get("feature_layer"):
+        cmd += ["--feature_layer", cfg["feature_layer"]]
     if cfg.get("use_clip_penultimate"):
         cmd.append("--use_clip_penultimate")
     if cfg.get("iid"):

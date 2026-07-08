@@ -1,0 +1,142 @@
+# Poison case-study sweep — cifar100 (leopard->tiger) + imagenet (Labrador->Golden).
+# Each job runs case_studies/poison_label_flip/run.py end-to-end (train + both
+# diagnostics: convergence-snapshot + local-only, with per-class-column divergence).
+# Outputs to /sc-rwx-vol/fedmedcbm/case_studies/{name}/{snapshots,local_only,diagnostics}/
+
+# ─── CIFAR-100: leopard -> tiger ─────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-casestudy-cifar100-poison
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm-case-study
+    dataset: cifar100
+spec:
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update && apt-get install -y git
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml matplotlib
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              cd $WORKSPACE/fedmedcbm
+              LOCAL_SAVE=$WORKSPACE/saved_models
+              CS=/sc-rwx-vol/fedmedcbm/case_studies/cifar100_leopard2tiger
+              mkdir -p $LOCAL_SAVE $CS/snapshots $CS/diagnostics
+
+              python case_studies/poison_label_flip/run.py \
+                --config case_studies/poison_label_flip/configs/cifar100_leopard2tiger.yaml \
+                --save_dir $LOCAL_SAVE \
+                --snapshot_dir $CS/snapshots \
+                --out_dir $CS/diagnostics \
+                --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
+                --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
+                --log_dir /sc-rwx-vol/fedmedcbm/job_logs
+
+              echo "cifar100 case study complete. Outputs in $CS"
+          resources:
+            requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 6Gi}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-GeForce-RTX-1080Ti, NVIDIA-GeForce-RTX-2080Ti, NVIDIA-GeForce-RTX-3090, NVIDIA-A10, NVIDIA-A40, NVIDIA-A100-SXM4-80GB, NVIDIA-A100-PCIE-40GB]
+      restartPolicy: Never
+  backoffLimit: 0
+
+---
+# ─── ImageNet: Labrador -> Golden Retriever ──────────────────────────────────
+# 64Gi + ulimit: full CBM pipeline over imagenet holds concept features in RAM.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-casestudy-imagenet-poison
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm-case-study
+    dataset: imagenet
+spec:
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              ulimit -n 65536
+              apt-get update && apt-get install -y git
+              export PIP_CACHE_DIR=/tmp/pip-cache && mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas pyyaml matplotlib
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              cd $WORKSPACE/fedmedcbm
+              export IMAGENET_ROOT=/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC
+              LOCAL_SAVE=$WORKSPACE/saved_models
+              CS=/sc-rwx-vol/fedmedcbm/case_studies/imagenet_lab2golden
+              mkdir -p $LOCAL_SAVE $CS/snapshots $CS/diagnostics
+
+              python case_studies/poison_label_flip/run.py \
+                --config case_studies/poison_label_flip/configs/imagenet_lab2golden.yaml \
+                --save_dir $LOCAL_SAVE \
+                --snapshot_dir $CS/snapshots \
+                --out_dir $CS/diagnostics \
+                --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
+                --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
+                --log_dir /sc-rwx-vol/fedmedcbm/job_logs
+
+              echo "imagenet case study complete. Outputs in $CS"
+          resources:
+            requests: {cpu: "4", memory: "64Gi", nvidia.com/gpu: "1"}
+            limits:   {cpu: "4", memory: "64Gi", nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: sc-rwx-vol, mountPath: /sc-rwx-vol}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: sc-rwx-vol, persistentVolumeClaim: {claimName: sc-rwx-vol}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 12Gi}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: [NVIDIA-GeForce-RTX-3090, NVIDIA-A10, NVIDIA-A40, NVIDIA-A100-SXM4-80GB, NVIDIA-A100-PCIE-40GB]
+      restartPolicy: Never
+  backoffLimit: 0

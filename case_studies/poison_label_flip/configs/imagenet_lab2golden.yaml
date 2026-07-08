@@ -1,0 +1,55 @@
+# Case study: ImageNet, 1/5 clients poisoned, Labrador->Golden Retriever flip.
+# Adjacent, highly confusable retriever breeds — the source class (Labrador) is
+# emptied on the adversary. Hyperparams match fedcbm-imagenet-c5-fda.yaml.
+# NOTE: with 1000 classes the GLOBAL divergence scalar dilutes a 2-class attack
+# 500x — rely on the per-class-column (source-class) divergence metric.
+
+dataset: imagenet
+concept_file: concept_files/imagenet_filtered.txt
+
+# Poisoning (class names must match get_classes("imagenet") EXACTLY)
+adversary_client_id: 0
+flip_map:
+  Labrador Retriever: Golden Retriever
+
+# Federation
+num_clients: 5
+num_rounds: 5
+local_epochs: 5
+batch_size: 64
+lr: 0.001
+weight_decay: 1e-5
+iid: true       # ensures the adversary holds Labrador samples to flip
+alpha: 0.5      # ignored when iid: true
+seed: 42
+final_layer_method: feddualavg
+final_rounds: 200
+final_epochs: 3
+final_lr: 0.001
+dual_lam: 0.0005   # imagenet-tuned
+dual_eta_s: 1.0
+dual_eta_c: 0.01
+
+# Backbone (matches fedcbm-imagenet-c5-fda.yaml)
+backbone: resnet50
+feature_layer: layer4
+clip_name: ViT-B/16
+
+# CBL
+cbl_loss_type: bce
+cbl_lr: 0.01
+cbl_epochs: 7
+cbl_batch_size: 64
+cbl_optimizer: adam
+cbl_hidden_layers: 0
+cbl_pos_weight: 8000.0
+cbl_twoway_tp: 4.0
+cbl_bb_lr_rate: 1.0
+ortho_lambda: 100
+val_split: 0.05
+
+# Diagnosis
+source_class: Labrador Retriever
+target_class: Golden Retriever
+topk_concepts: 5
+local_only_epochs: 20   # fewer epochs — imagenet is large

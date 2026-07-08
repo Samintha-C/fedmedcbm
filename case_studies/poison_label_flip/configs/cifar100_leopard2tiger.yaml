@@ -1,0 +1,54 @@
+# Case study: CIFAR-100, 1/5 clients poisoned, leopard->tiger label flip.
+# Both are big cats (shared concepts) — the source class (leopard) is emptied on
+# the adversary, collapsing its final-layer row. Hyperparams match
+# fedcbm-cifar100-c5-fda.yaml for comparability.
+
+dataset: cifar100
+concept_file: concept_files/cifar100_filtered.txt
+
+# Poisoning
+adversary_client_id: 0
+flip_map:
+  leopard: tiger
+
+# Federation
+num_clients: 5
+num_rounds: 5
+local_epochs: 5
+batch_size: 32
+lr: 0.001
+weight_decay: 1e-5
+iid: true       # ensures the adversary actually holds leopard samples to flip
+alpha: 0.5      # ignored when iid: true
+seed: 31
+final_layer_method: feddualavg
+final_rounds: 200
+final_epochs: 3
+final_lr: 0.001
+dual_lam: 0.005   # cifar100-tuned
+dual_eta_s: 1.0
+dual_eta_c: 0.01
+
+# Backbone (matches fedcbm-cifar100-c5-fda.yaml)
+backbone: resnet50
+feature_layer: layer4
+clip_name: ViT-B/16
+
+# CBL
+cbl_loss_type: bce
+cbl_lr: 0.0005
+cbl_epochs: 3
+cbl_batch_size: 32
+cbl_optimizer: adam
+cbl_hidden_layers: 0
+cbl_pos_weight: 0.2
+cbl_twoway_tp: 4.0
+cbl_bb_lr_rate: 1.0
+ortho_lambda: 100
+val_split: 0.1
+
+# Diagnosis
+source_class: leopard
+target_class: tiger
+topk_concepts: 5
+local_only_epochs: 50
