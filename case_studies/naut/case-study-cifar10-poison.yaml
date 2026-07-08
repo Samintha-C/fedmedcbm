@@ -39,15 +39,19 @@ spec:
               mkdir -p $LOCAL_SAVE $SNAPSHOT_DIR $OUT_DIR
 
               cd $WORKSPACE/fedmedcbm
-
               python case_studies/poison_label_flip/run.py \
                 --config case_studies/poison_label_flip/configs/cifar10_dog2cat.yaml \
-                --save_dir $LOCAL_SAVE \
-                --snapshot_dir $SNAPSHOT_DIR \
-                --out_dir $OUT_DIR \
-                --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
-                --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                --log_dir /sc-rwx-vol/fedmedcbm/job_logs
+                --skip_train \
+                --snapshot_dir /sc-rwx-vol/fedmedcbm/case_studies/cifar10_dog2cat/snapshots \
+                --out_dir /sc-rwx-vol/fedmedcbm/case_studies/cifar10_dog2cat/diagnostics
+              # python case_studies/poison_label_flip/run.py \
+              #   --config case_studies/poison_label_flip/configs/cifar10_dog2cat.yaml \
+              #   --save_dir $LOCAL_SAVE \
+              #   --snapshot_dir $SNAPSHOT_DIR \
+              #   --out_dir $OUT_DIR \
+              #   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
+              #   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
+              #   --log_dir /sc-rwx-vol/fedmedcbm/job_logs
 
               echo "Case study complete. Outputs in $OUT_DIR"
           resources:

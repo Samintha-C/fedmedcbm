@@ -190,6 +190,58 @@ def compute_divergence_scores(
     return scores
 
 
+def compute_column_divergence(
+    snapshot_dir: str,
+    class_names: list,
+    num_clients: int,
+    adversary_client_id: int,
+    focus_classes: list,
+    out_dir: str = None,
+    file_tag: str = "primal",
+) -> dict:
+    """Per-class-row cosine divergence from the global head, restricted to the
+    poisoned classes. The global scalar dilutes a 2-class attack across all classes;
+    this isolates it. Each class row W[c] is that class's weights over concepts."""
+    snapshots = _load_snapshots(snapshot_dir, num_clients, file_tag)
+    if "global" not in snapshots:
+        return {}
+
+    focus_idx = [(c, class_names.index(c)) for c in focus_classes if c in class_names]
+    g = snapshots["global"]["weight"].float()
+
+    scores = {}
+    print("\n=== Per-Class-Column Divergence from Global (poisoned classes only) ===")
+    header = f"  {'Client':<12}" + "".join(f"{cn:>16}" for cn, _ in focus_idx) + f"{'Flagged':>12}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for i in range(num_clients):
+        key = f"client_{i}"
+        if key not in snapshots:
+            continue
+        w = snapshots[key]["weight"].float()
+        row = {}
+        line = f"  Client {i:<6}"
+        for cn, ci in focus_idx:
+            gc = g[ci] / (g[ci].norm() + 1e-8)
+            cc = w[ci] / (w[ci].norm() + 1e-8)
+            div = 1.0 - float(torch.dot(gc, cc))
+            row[cn] = div
+            line += f"{div:>16.4f}"
+        line += f"{'✓ OUTLIER' if i == adversary_client_id else '':>12}"
+        scores[key] = row
+        print(line)
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "column_divergence.json")
+        with open(out_path, "w") as f:
+            json.dump(scores, f, indent=2)
+        print(f"[diagnose] Column divergence saved to {out_path}")
+
+    return scores
+
+
 def run_diagnostics(
     snapshot_dir: str,
     concept_names: list,
@@ -218,5 +270,9 @@ def run_diagnostics(
                         source_class, target_class, k=topk, out_dir=out_dir, file_tag=file_tag)
 
     compute_divergence_scores(snapshot_dir, num_clients, adversary_client_id, out_dir, file_tag=file_tag)
+
+    compute_column_divergence(snapshot_dir, class_names, num_clients, adversary_client_id,
+                              focus_classes=[source_class, target_class],
+                              out_dir=out_dir, file_tag=file_tag)
 
     print(f"\n[diagnose] All outputs written to {out_dir}")
