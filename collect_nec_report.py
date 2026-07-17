@@ -1,3 +1,4 @@
+
 """
 Bundle the federated dlam/NEC sweep results into a single self-contained PDF
 (accuracy-NEC curve + full operating-point table), plus the CSV.

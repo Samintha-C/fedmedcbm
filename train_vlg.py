@@ -610,29 +610,36 @@ def simulate_federated_training_vlg(args):
 
         # Step 2b: Extract normalized concept features for centralized methods and NEC eval
         # (hybrid_saga/fedavg need pooled features; fedavg_thresh extracts per-client features in Phase 3)
-        all_train_feats, all_train_labels = [], []
+        # Store as fp16 to halve peak RAM (~21GB → ~10.5GB for imagenet). Phase 3 casts per-batch.
+        # Pre-allocate and fill in-place to avoid the 2× peak from list+torch.cat.
+        all_train_feats = torch.empty(total_n, num_concepts, dtype=torch.float16)
+        all_train_labels = torch.empty(total_n, dtype=torch.long)
+        _p2_offset = 0
         with torch.no_grad():
             for i in range(args.num_clients):
                 for features, _, labels in phase2_loaders[i]:
                     features = features.to(device)
                     emb = global_model.backbone(features) if features.dim() == 4 else features
                     logits = norm_layer(global_model.cbl(emb)).cpu()
-                    all_train_feats.append(logits)
-                    all_train_labels.append(labels)
-        all_train_feats = torch.cat(all_train_feats, dim=0)
-        all_train_labels = torch.cat(all_train_labels, dim=0)
-        log_mem(f"after Phase 2 train feat extraction ({all_train_feats.shape[0]} samples, {all_train_feats.element_size() * all_train_feats.nelement() / 1024**3:.2f}GB tensor)")
+                    _bs = logits.size(0)
+                    all_train_feats[_p2_offset:_p2_offset + _bs] = logits.half()
+                    all_train_labels[_p2_offset:_p2_offset + _bs] = labels
+                    _p2_offset += _bs
+        log_mem(f"after Phase 2 train feat extraction ({all_train_feats.shape[0]} samples, {all_train_feats.element_size() * all_train_feats.nelement() / 1024**3:.2f}GB tensor fp16)")
 
-        val_feats, val_labels_all = [], []
+        _val_n = len(phase2_val_loader.dataset)
+        val_feats = torch.empty(_val_n, num_concepts, dtype=torch.float16)
+        val_labels_all = torch.empty(_val_n, dtype=torch.long)
+        _p2_offset = 0
         with torch.no_grad():
             for features, _, labels in phase2_val_loader:
                 features = features.to(device)
                 emb = global_model.backbone(features) if features.dim() == 4 else features
                 logits = norm_layer(global_model.cbl(emb)).cpu()
-                val_feats.append(logits)
-                val_labels_all.append(labels)
-        val_feats = torch.cat(val_feats, dim=0)
-        val_labels_all = torch.cat(val_labels_all, dim=0)
+                _bs = logits.size(0)
+                val_feats[_p2_offset:_p2_offset + _bs] = logits.half()
+                val_labels_all[_p2_offset:_p2_offset + _bs] = labels
+                _p2_offset += _bs
 
         # Save concept features for reproducibility
         os.makedirs(save_dir, exist_ok=True)
@@ -654,11 +661,11 @@ def simulate_federated_training_vlg(args):
             )
 
         train_concept_loader = DataLoader(
-            IndexedTensorDataset(all_train_feats, all_train_labels),
+            IndexedTensorDataset(all_train_feats.float(), all_train_labels),
             batch_size=saga_bs, shuffle=True
         )
         val_concept_loader = DataLoader(
-            TensorDataset(val_feats, val_labels_all),
+            TensorDataset(val_feats.float(), val_labels_all),
             batch_size=saga_bs, shuffle=False
         )
 
@@ -816,7 +823,7 @@ def simulate_federated_training_vlg(args):
                 n_batches = 0
                 for epoch in range(final_epochs):
                     for feats, labels in client_concept_loaders[i]:
-                        feats, labels = feats.to(device), labels.to(device)
+                        feats, labels = feats.to(device).float(), labels.to(device)
                         loss = ce_loss(client_final_layers[i](feats), labels)
                         opt.zero_grad()
                         loss.backward()
@@ -871,7 +878,7 @@ def simulate_federated_training_vlg(args):
                 for i in range(args.num_clients):
                     client_correct, client_total = 0, 0
                     for feats, labels in client_val_concept_loaders[i]:
-                        feats, labels = feats.to(device), labels.to(device)
+                        feats, labels = feats.to(device).float(), labels.to(device)
                         preds = final_layer(feats).argmax(dim=1)
                         client_correct += (preds == labels).sum().item()
                         client_total += labels.size(0)
@@ -990,7 +997,7 @@ def simulate_federated_training_vlg(args):
                 n_batches = 0
                 for epoch in range(final_epochs):
                     for feats, labels in client_concept_loaders[i]:
-                        feats, labels = feats.to(device), labels.to(device)
+                        feats, labels = feats.to(device).float(), labels.to(device)
                         loss = ce_loss(client_final_layers[i](feats), labels)
                         opt.zero_grad()
                         loss.backward()
@@ -1026,7 +1033,7 @@ def simulate_federated_training_vlg(args):
                 for i in range(args.num_clients):
                     client_correct, client_total = 0, 0
                     for feats, labels in client_val_concept_loaders[i]:
-                        feats, labels = feats.to(device), labels.to(device)
+                        feats, labels = feats.to(device).float(), labels.to(device)
                         preds = final_layer(feats).argmax(dim=1)
                         client_correct += (preds == labels).sum().item()
                         client_total += labels.size(0)
@@ -1163,7 +1170,7 @@ def simulate_federated_training_vlg(args):
 
                 for epoch in range(final_epochs):
                     for feats, labels in client_concept_loaders[i]:
-                        feats, labels = feats.to(device), labels.to(device)
+                        feats, labels = feats.to(device).float(), labels.to(device)
 
                         # Step counter for eta_tilde schedule
                         if round_num < dual_warmup_rounds:
@@ -1273,7 +1280,7 @@ def simulate_federated_training_vlg(args):
                 for i in range(args.num_clients):
                     client_correct, client_total = 0, 0
                     for feats, labels in client_val_concept_loaders[i]:
-                        feats, labels = feats.to(device), labels.to(device)
+                        feats, labels = feats.to(device).float(), labels.to(device)
                         preds = final_layer(feats).argmax(dim=1)
                         client_correct += (preds == labels).sum().item()
                         client_total += labels.size(0)

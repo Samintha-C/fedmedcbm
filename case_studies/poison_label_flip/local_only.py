@@ -28,7 +28,7 @@ def _fit_head(feats, labels, num_concepts, num_classes, device,
     head.train()
     for _ in range(epochs):
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device).float(), y.to(device)
             loss = ce(head(x), y)
             opt.zero_grad()
             loss.backward()
