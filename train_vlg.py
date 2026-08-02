@@ -649,6 +649,23 @@ def simulate_federated_training_vlg(args):
         torch.save(val_labels_all, os.path.join(save_dir, "val_concept_labels.pt"))
         norm_layer.save_model(save_dir)
 
+        # Case-study diagnostic: save clean per-class mean concept activations so the
+        # poison explainer can rank concepts by CONTRIBUTION (activation × weight),
+        # not raw |weight|. Uses the held-out val set, whose labels are never poisoned.
+        _diag_dirs = [d for d in (getattr(args, "phase3_snapshot_dir", None),
+                                  getattr(args, "local_only_diag_dir", None)) if d]
+        if _diag_dirs:
+            _vf = val_feats.float()
+            class_mean_act = torch.zeros(num_classes, num_concepts)
+            for _c in range(num_classes):
+                _mask = (val_labels_all == _c)
+                if _mask.any():
+                    class_mean_act[_c] = _vf[_mask].mean(dim=0)
+            for _d in _diag_dirs:
+                os.makedirs(_d, exist_ok=True)
+                torch.save(class_mean_act, os.path.join(_d, "class_mean_activations.pt"))
+            print(f"[diagnostic] Saved per-class mean activations to {len(_diag_dirs)} dir(s)")
+
         # Local-only diagnostic (case study): fit an independent head per client on
         # its own normalized features. Gated on flag → zero cost for normal runs.
         _lo_dir = getattr(args, "local_only_diag_dir", None)

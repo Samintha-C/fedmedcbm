@@ -102,6 +102,7 @@ def print_topk_concepts(
     k: int = 5,
     out_dir: str = None,
     file_tag: str = "primal",
+    class_mean_act=None,
 ):
     snapshots = _load_snapshots(snapshot_dir, num_clients, file_tag)
     if not snapshots:
@@ -111,9 +112,18 @@ def print_topk_concepts(
     tgt_idx = class_names.index(target_class) if target_class in class_names else None
     focus_indices = [i for i in [src_idx, tgt_idx] if i is not None]
 
+    # Rank by CONTRIBUTION (mean activation × weight) when a clean per-class
+    # activation profile is available: this reflects what actually drives the
+    # class prediction. Ranking by raw |weight| alone surfaces high-weight
+    # concepts that may never fire, which looks like noise even for honest
+    # clients. Fall back to |weight| when no activation profile is provided.
+    use_contrib = class_mean_act is not None
+    rank_desc = "contribution (activation×weight)" if use_contrib else "raw |weight|"
+
     lines = []
     lines.append(f"\n{'='*70}")
     lines.append(f"Top-{k} concepts for '{source_class}' and '{target_class}' per client")
+    lines.append(f"ranked by {rank_desc}")
     lines.append(f"{'='*70}")
 
     keys = [f"client_{i}" for i in range(num_clients) if f"client_{i}" in snapshots]
@@ -132,8 +142,12 @@ def print_topk_concepts(
         for cls_idx in focus_indices:
             cls_name = class_names[cls_idx]
             row = w[cls_idx]  # [num_concepts]
-            topk_vals, topk_idxs = torch.topk(row.abs(), k=min(k, len(concept_names)))
-            top_concepts = [(concept_names[i], float(row[i])) for i in topk_idxs]
+            if use_contrib:
+                score = class_mean_act[cls_idx].to(row.dtype) * row  # contribution
+            else:
+                score = row
+            topk_vals, topk_idxs = torch.topk(score.abs(), k=min(k, len(concept_names)))
+            top_concepts = [(concept_names[i], float(score[i])) for i in topk_idxs]
             formatted = ", ".join(f"{c} ({v:+.3f})" for c, v in top_concepts)
             lines.append(f"    [{cls_name:>10}]: {formatted}")
 
@@ -265,9 +279,17 @@ def run_diagnostics(
     plot_weight_heatmaps(snapshot_dir, concept_names, class_names,
                          num_clients, adversary_client_id, out_dir, file_tag=file_tag)
 
+    # Clean per-class mean activations (saved by train_vlg.py) let the explainer
+    # rank by contribution instead of raw |weight|. Optional: |weight| fallback.
+    class_mean_act = None
+    _cma_path = os.path.join(snapshot_dir, "class_mean_activations.pt")
+    if os.path.isfile(_cma_path):
+        class_mean_act = torch.load(_cma_path, map_location="cpu").float()
+
     print_topk_concepts(snapshot_dir, concept_names, class_names,
                         num_clients, adversary_client_id,
-                        source_class, target_class, k=topk, out_dir=out_dir, file_tag=file_tag)
+                        source_class, target_class, k=topk, out_dir=out_dir,
+                        file_tag=file_tag, class_mean_act=class_mean_act)
 
     compute_divergence_scores(snapshot_dir, num_clients, adversary_client_id, out_dir, file_tag=file_tag)
 
