@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Label-free-CBM
 from data import data_utils
 from evaluate_steerability import load_full_model, load_concepts
 from torch.utils.data import DataLoader
+from visualizations.contribution_panel import RC as CONTRIB_RC, draw_contribution_panel
 
 
 # ── Loading ──────────────────────────────────────────────────────────────────
@@ -183,20 +184,43 @@ def select_diverse_concepts(W, val_normed, concepts, n=8):
 
 def plot_concept_contributions(val_normed, val_labels, W, b, concepts, classes,
                                pil_dataset, image_indices, max_display=7,
-                               output_dir=None):
-    """For each selected image, show the top concept contributions to predicted class."""
-    n_images = len(image_indices)
-    fig, axes = plt.subplots(n_images, 2, figsize=(12, 3.2 * n_images),
-                              gridspec_kw={"width_ratios": [1, 2.5]})
-    if n_images == 1:
-        axes = axes[np.newaxis, :]
+                               output_dir=None, min_contribution=1e-2,
+                               show_others=False, show_prediction=True):
+    """For each selected image, show the top concept contributions to predicted class.
 
+    Concepts whose contribution is below ``min_contribution`` in magnitude are
+    dropped rather than drawn as flat 0.00 bars, and the "Sum of N others" row is
+    off by default: both are visual noise on sparse final layers where only a
+    handful of concepts carry any weight at all.
+    """
+    n_images = len(image_indices)
+    with plt.rc_context(CONTRIB_RC):
+        fig, axes = plt.subplots(n_images, 2, figsize=(12, 3.0 * n_images),
+                                  gridspec_kw={"width_ratios": [1, 2.5]})
+        if n_images == 1:
+            axes = axes[np.newaxis, :]
+        _draw_contribution_rows(
+            axes, val_normed, val_labels, W, b, concepts, classes, pil_dataset,
+            image_indices, max_display, min_contribution, show_others,
+            show_prediction,
+        )
+        plt.tight_layout()
+
+    if output_dir:
+        path = os.path.join(output_dir, "concept_contributions.pdf")
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        print(f"  Saved: {path}")
+    plt.close(fig)
+
+
+def _draw_contribution_rows(axes, val_normed, val_labels, W, b, concepts, classes,
+                            pil_dataset, image_indices, max_display,
+                            min_contribution, show_others, show_prediction):
     for row, img_idx in enumerate(image_indices):
         a = val_normed[img_idx]              # [C]
         logits = a @ W.T + b                  # [K]
         pred_class = logits.argmax().item()
         gt_class = val_labels[img_idx].item()
-        conf = F.softmax(logits, dim=0)
 
         # Contribution of each concept to predicted class
         contributions = (a * W[pred_class]).cpu().numpy()  # [C]
@@ -209,62 +233,35 @@ def plot_concept_contributions(val_normed, val_labels, W, b, concepts, classes,
         eligible_sorted = eligible[np.argsort(np.abs(contributions[eligible]))[::-1]]
         top_idxs = eligible_sorted[:max_display]
 
-        # Remaining = everything not shown (both positive-but-not-top and negative-a concepts)
-        shown_mask = np.zeros(len(contributions), dtype=bool)
-        shown_mask[top_idxs] = True
-        remaining = contributions[~shown_mask].sum()
-        n_remaining = (~shown_mask).sum()
+        # Drop concepts that contribute nothing. A sparse final layer leaves most
+        # of the eligible set at exactly 0.00, which renders as a stack of empty
+        # ticks (e.g. "motor", "mottled brown plumage" on an ImageNet quill).
+        top_idxs = top_idxs[np.abs(contributions[top_idxs]) >= min_contribution]
 
         values = contributions[top_idxs]
         names = [concepts[ci] if ci < len(concepts) else f"concept_{ci}" for ci in top_idxs]
-        names.append(f"Sum of {n_remaining} others")
-        values = np.append(values, remaining)
 
-        # Image panel
-        ax_img = axes[row, 0]
+        if show_others:
+            shown_mask = np.zeros(len(contributions), dtype=bool)
+            shown_mask[top_idxs] = True
+            names.append(f"Sum of {(~shown_mask).sum()} others")
+            values = np.append(values, contributions[~shown_mask].sum())
+
         img = pil_dataset[img_idx][0]
         if not isinstance(img, Image.Image):
             if isinstance(img, torch.Tensor):
                 img = img.permute(1, 2, 0).numpy()
                 img = (img * 255).clip(0, 255).astype(np.uint8)
                 img = Image.fromarray(img)
-        ax_img.imshow(img)
-        ax_img.axis("off")
 
         gt_name = classes[gt_class] if gt_class < len(classes) else str(gt_class)
         pred_name = classes[pred_class] if pred_class < len(classes) else str(pred_class)
-        ax_img.set_title(f"GT: {gt_name}", fontsize=9)
 
-        # Bar chart panel
-        ax_bar = axes[row, 1]
-        y_pos = np.arange(len(values))
-        colors = ["#E74C3C" if v > 0 else "#3498DB" for v in values]
-        ax_bar.barh(y_pos, values, color=colors, edgecolor="none", height=0.65)
-        ax_bar.set_yticks(y_pos)
-        ax_bar.set_yticklabels(names, fontsize=8)
-        ax_bar.invert_yaxis()
-        ax_bar.set_xlabel("Concept contribution", fontsize=9)
-        ax_bar.set_title(
-            f"Pred: {pred_name}  |  Conf: {conf[pred_class]:.3f}  |  "
-            f"Logit: {logits[pred_class]:.2f}  |  Bias: {b[pred_class]:.2f}",
-            fontsize=9,
+        draw_contribution_panel(
+            axes[row, 0], axes[row, 1], img, names, values,
+            gt_name=gt_name,
+            pred_name=pred_name if show_prediction else None,
         )
-
-        # Annotate bars
-        for i, v in enumerate(values):
-            ax_bar.text(v + 0.02 * np.sign(v), i, f"{v:+.2f}",
-                        va="center", fontsize=7, color=colors[i])
-
-        ax_bar.spines["top"].set_visible(False)
-        ax_bar.spines["right"].set_visible(False)
-
-    plt.tight_layout()
-
-    if output_dir:
-        path = os.path.join(output_dir, "concept_contributions.pdf")
-        fig.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  Saved: {path}")
-    plt.close(fig)
 
 
 def select_diverse_images(val_normed, val_labels, W, b, classes, n=6):
@@ -307,6 +304,14 @@ def main():
                         help="Manual image indices for Viz 2 (overrides auto-selection)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--max_display", type=int, default=7,
+        help="Max concept bars per image (Viz 2)")
+    parser.add_argument("--min_contribution", type=float, default=1e-2,
+        help="Drop concepts contributing less than this in magnitude (Viz 2)")
+    parser.add_argument("--show_others", action="store_true",
+        help="Add the 'Sum of N others' bar back (Viz 2)")
+    parser.add_argument("--hide_prediction", action="store_true",
+        help="Drop the 'Predicted: <class>' title above the bars (Viz 2)")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -352,6 +357,10 @@ def main():
     plot_concept_contributions(
         val_normed, val_labels, W, b, concepts, classes,
         pil_dataset, image_indices, output_dir=output_dir,
+        max_display=args.max_display,
+        min_contribution=args.min_contribution,
+        show_others=args.show_others,
+        show_prediction=not args.hide_prediction,
     )
 
     print(f"\nAll visualizations saved to {output_dir}")
