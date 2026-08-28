@@ -128,11 +128,11 @@ def _latest_run_metrics(run_parent):
     return None
 
 
-def collect_dlamsweep(base_dir):
-    """Scan {base_dir}/{dataset}/dlamsweep/lam*/{run}/metrics.txt → {dataset: [points]}."""
+def collect_dlamsweep(base_dir, sweep_name="dlamsweep"):
+    """Scan {base_dir}/{dataset}/{sweep_name}/lam*/{run}/metrics.txt → {dataset: [points]}."""
     data = {}
     for ds in DATASETS:
-        sweep_dir = os.path.join(base_dir, ds, "dlamsweep")
+        sweep_dir = os.path.join(base_dir, ds, sweep_name)
         if not os.path.isdir(sweep_dir):
             continue
         points = []
@@ -159,6 +159,48 @@ def collect_runs_dir(runs_dir, label):
             points.append(pt)
             print(f"  {label} λ={pt['dual_lam']}: NEC={pt['nec']:.2f}  acc={pt['accuracy_pct']:.2f}%")
     return {label: sorted(points, key=lambda p: p["nec"])} if points else {}
+
+
+# ── Printed summaries ───────────────────────────────────────────────────────
+def print_table(data, title):
+    """Every collected point, grouped by dataset and sorted by NEC."""
+    print(f"\n{'='*78}\n{title}\n{'='*78}")
+    if not data:
+        print("  (no points)")
+        return
+    for ds, points in data.items():
+        print(f"\n{LABELS.get(ds, ds)}   ({len(points)} points)")
+        print(f"  {'lambda':>12} {'NEC':>8} {'acc %':>8} {'nnz':>10} {'classes':>8}  run")
+        print(f"  {'-'*12} {'-'*8} {'-'*8} {'-'*10} {'-'*8}  {'-'*30}")
+        for p in points:
+            lam = p["dual_lam"]
+            lam_s = f"{lam:g}" if lam is not None else "?"
+            print(f"  {lam_s:>12} {p['nec']:>8.2f} {p['accuracy_pct']:>8.2f} "
+                  f"{p['nnz']:>10} {p['num_classes']:>8}  {p['run'][:30]}")
+
+
+def print_paper_table(data, targets=(5, 10, 20, 30, 50), tol=0.35):
+    """Accuracy at the nearest achieved NEC to each standardized target.
+
+    This is the shape the paper's NEC table wants, so the numbers can be copied
+    straight across. A target with no point within `tol` relative distance is
+    reported as a dash rather than silently snapped to a far-away NEC.
+    """
+    print(f"\n{'='*78}\nPAPER TABLE: accuracy (%) at standardized NEC targets\n{'='*78}")
+    head = f"  {'Dataset':<12}" + "".join(f"{'NEC ' + str(t):>14}" for t in targets)
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for ds, points in data.items():
+        row = f"  {LABELS.get(ds, ds):<12}"
+        for t in targets:
+            best = min(points, key=lambda p: abs(p["nec"] - t)) if points else None
+            if best is None or abs(best["nec"] - t) / t > tol:
+                row += f"{'--':>14}"
+            else:
+                row += f"{best['accuracy_pct']:>9.1f} ({best['nec']:.0f})"
+        print(row)
+    print("\n  Parenthesised value is the ACHIEVED NEC, not the target.")
+    print(f"  Dash: no run within {tol:.0%} of the target NEC.")
 
 
 # ── Outputs ─────────────────────────────────────────────────────────────────
@@ -220,6 +262,13 @@ def main():
                         help="Recursively scan this dir for metrics.txt and treat as one curve.")
     parser.add_argument("--label", default="runs",
                         help="Curve label for --runs_dir mode.")
+    parser.add_argument("--sweep_name", default="dlamsweep",
+                        help="Sweep subdirectory under {base_dir}/{dataset}/ "
+                             "(e.g. dlamsweep_iid)")
+    parser.add_argument("--targets", type=float, nargs="+", default=[5, 10, 20, 30, 50],
+                        help="Standardized NEC targets for the paper table")
+    parser.add_argument("--no_plot", action="store_true",
+                        help="Skip the figure; print tables and write CSV only")
     parser.add_argument("--output_dir",
                         default="/sc-rwx-vol/fedmedcbm/eval_results/visualizations/fed_nec")
     args = parser.parse_args()
@@ -228,14 +277,19 @@ def main():
     if args.runs_dir:
         data = collect_runs_dir(args.runs_dir, args.label)
     else:
-        data = collect_dlamsweep(args.base_dir)
+        data = collect_dlamsweep(args.base_dir, args.sweep_name)
 
     if not data:
         print("No federated NEC points found.")
         return
 
-    write_csv(data, os.path.join(args.output_dir, "federated_nec.csv"))
-    plot_curve(data, os.path.join(args.output_dir, "federated_nec_curve.png"))
+    label = args.label if args.runs_dir else args.sweep_name
+    print_table(data, f"ALL COLLECTED POINTS  [{label}]")
+    print_paper_table(data, targets=tuple(args.targets))
+
+    write_csv(data, os.path.join(args.output_dir, f"federated_nec_{label}.csv"))
+    if not args.no_plot:
+        plot_curve(data, os.path.join(args.output_dir, f"federated_nec_curve_{label}.png"))
     print("\nDone.")
 
 

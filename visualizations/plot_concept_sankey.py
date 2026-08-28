@@ -245,6 +245,64 @@ def flows_from_checkpoint(load_dir, class_names, top_k, min_weight, dataset=None
     return flows
 
 
+def shared_flows_from_checkpoint(load_dir, top_shared, min_weight, max_classes,
+                                 dataset=None, stats_only=False):
+    """Find the most REUSED concepts across the whole head, then return their flows.
+
+    Selecting classes first (as --classes does) hides reuse: a concept feeding
+    five classes looks exclusive if only one of them is drawn. This scans every
+    class, ranks concepts by how many classes they reach above min_weight, and
+    emits flows only for the top ones.
+    """
+    import torch
+
+    final_sd = torch.load(os.path.join(load_dir, "final.pt"), map_location="cpu")
+    W = final_sd["weight"].float()                      # [num_classes, num_concepts]
+    with open(os.path.join(load_dir, "concepts.txt")) as f:
+        concepts = [l.strip() for l in f if l.strip()]
+    classes = _class_names(load_dir, W.shape[0], dataset)
+
+    live = W.abs() > min_weight                          # [K, C]
+    per_concept = live.sum(dim=0)                        # classes reached, per concept
+    per_class = live.sum(dim=1)                          # concepts used, per class
+
+    print(f"Head: {W.shape[0]} classes x {W.shape[1]} concepts, "
+          f"threshold |w|>{min_weight}")
+    print(f"  nonzero weights: {int(live.sum())}  "
+          f"(NEC = {float(live.sum())/W.shape[0]:.2f} concepts/class)")
+    print(f"  concepts used by >=1 class: {int((per_concept > 0).sum())}")
+    hist = {}
+    for n in per_concept.tolist():
+        if n > 0:
+            hist[int(n)] = hist.get(int(n), 0) + 1
+    print("  concept reuse histogram (classes reached -> #concepts):")
+    for n in sorted(hist):
+        print(f"    {n:>3} class(es): {hist[n]:>4} concepts")
+    print(f"  concepts reaching >1 class: {int((per_concept > 1).sum())}")
+    print(f"  concepts per class: min={int(per_class.min())} "
+          f"max={int(per_class.max())} mean={float(per_class.float().mean()):.2f}")
+
+    if stats_only:
+        return []
+
+    order = torch.argsort(per_concept, descending=True)
+    flows = []
+    for ci in order[:top_shared]:
+        if per_concept[ci] < 2:
+            break  # nothing reused left
+        cname = concepts[ci] if ci < len(concepts) else f"concept_{int(ci)}"
+        rows = torch.nonzero(live[:, ci]).flatten()
+        # Keep the strongest classes if a concept reaches very many
+        rows = sorted(rows.tolist(), key=lambda k: -abs(float(W[k, ci])))[:max_classes]
+        for k in rows:
+            kname = classes[k] if k < len(classes) else str(k)
+            flows.append((cname, kname, float(W[k, ci])))
+    if not flows:
+        print("\nNo concept reaches more than one class above the threshold: "
+              "the head's class supports are fully disjoint.")
+    return flows
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -268,11 +326,24 @@ def main():
                    help="Append the summed weight to each node label")
     p.add_argument("--sankeymatic", action="store_true",
                    help="Print SankeyMATIC text instead of rendering")
+    p.add_argument("--shared_top", type=int, default=None,
+                   help="Ignore --classes; scan the whole head and draw the N most "
+                        "REUSED concepts with every class they reach")
+    p.add_argument("--max_classes", type=int, default=6,
+                   help="With --shared_top, cap the classes drawn per concept")
+    p.add_argument("--stats", action="store_true",
+                   help="Print concept-reuse statistics for the head and exit")
     args = p.parse_args()
 
     if args.spec:
         with open(args.spec) as f:
             flows = [tuple(x) for x in json.load(f)["flows"]]
+    elif args.stats or args.shared_top:
+        flows = shared_flows_from_checkpoint(
+            args.load_dir, args.shared_top or 0, args.min_weight,
+            args.max_classes, dataset=args.dataset, stats_only=args.stats)
+        if args.stats or not flows:
+            return
     else:
         if not args.classes:
             raise SystemExit("--classes is required with --load_dir")
