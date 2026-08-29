@@ -1,0 +1,14 @@
+pups [0.7338] wolf
+mate [0.3812] wolf
+pointed ears [0.3491] wolf
+small pointed face [0.2293] fox
+orange or red fur [0.2280] fox
+small pointed nose [0.2218] fox
+large pointy ears [0.2125] fox
+black markings around the eyes [0.2014] fox
+mate [0.1470] fox
+thief [0.3486] raccoon
+black mask around the eyes [0.3419] raccoon
+her young [0.2916] raccoon
+5 7 black rings on the tail [0.2737] raccoon
+stocky body [0.2278] raccoon

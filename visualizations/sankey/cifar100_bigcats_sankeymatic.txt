@@ -1,0 +1,18 @@
+short muzzle [0.3089] leopard
+large spotted body [0.3013] leopard
+carnivore [0.2763] leopard
+africa [0.2610] leopard
+good night vision [0.2153] leopard
+big head [0.1734] leopard
+long mane around the head [0.2223] lion
+pride of lions [0.2069] lion
+mane [0.1983] lion
+black spots on the coat [0.1976] lion
+tawny or yellowish color [0.1831] lion
+lioness [0.1805] lion
+striped fur [0.4997] tiger
+carnivore [0.2633] tiger
+large muscular body [0.2162] tiger
+pointed ears [0.1431] tiger
+sharp claws [0.1127] tiger
+striped coat [0.1057] tiger

@@ -1,0 +1,24 @@
+small lithe body [0.8710] cat
+cat toy [0.4819] cat
+cat bed [0.2802] cat
+pointed ears [0.2388] cat
+scratching post [0.2342] cat
+fur [0.1833] cat
+four legged mammal [0.6378] dog
+wet nose [0.6331] dog
+nose [0.5760] dog
+collar [0.4164] dog
+toy [0.2650] dog
+rider [0.0707] dog
+antlers [0.3092] deer
+deer stand [0.2588] deer
+nature [0.2465] deer
+long ears [0.2366] deer
+forest [0.2040] deer
+woods [0.2039] deer
+large body [0.4946] horse
+mane and tail [0.4585] horse
+bridle [0.3146] horse
+halter [0.3005] horse
+rider [0.2808] horse
+pasture [0.2671] horse

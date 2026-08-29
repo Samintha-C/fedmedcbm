@@ -1,0 +1,24 @@
+engines on the wings [0.5469] airplane
+landing gear [0.4313] airplane
+wings [0.3738] airplane
+engines [0.3226] airplane
+runway [0.2888] airplane
+copilot [0.2269] airplane
+four round black tires [0.6132] automobile
+windshield [0.5762] automobile
+side windows [0.5300] automobile
+taillights [0.3586] automobile
+large metal body [0.1282] automobile
+steering wheel [0.1007] automobile
+large sails or engines [0.3107] ship
+pointed front end [0.3052] ship
+boat [0.3040] ship
+the ocean [0.3000] ship
+watercraft [0.2944] ship
+large size [0.2808] ship
+four wheels [0.5615] truck
+cab for the driver [0.5084] truck
+large rectangular body [0.4945] truck
+bed for carrying cargo [0.3988] truck
+two headlights [0.2626] truck
+trailer [0.1477] truck

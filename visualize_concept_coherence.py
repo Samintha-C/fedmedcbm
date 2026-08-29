@@ -11,8 +11,8 @@ Usage:
         --load_dir /path/to/checkpoint \
         --dataset cifar10 \
         --output_dir /path/to/output \
-        --top_k 5 \
-        --num_concepts 8 \
+        --top_k 4 \
+        --num_concepts 12 \
         --num_images 6
 """
 import argparse
@@ -34,7 +34,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Label-free-CBM
 from data import data_utils
 from evaluate_steerability import load_full_model, load_concepts
 from torch.utils.data import DataLoader
-from visualizations.contribution_panel import RC as CONTRIB_RC, draw_contribution_panel
+from visualizations.contribution_panel import (RC as CONTRIB_RC, LABEL_COLOR as CONTRIB_LABEL_COLOR,
+                                                draw_contribution_panel)
 
 
 # ── Loading ──────────────────────────────────────────────────────────────────
@@ -96,43 +97,68 @@ def load_and_extract(load_dir, dataset_name, device="cpu", batch_size=128):
 # ── Visualization 1: Top-k images per concept ───────────────────────────────
 
 def plot_topk_images_per_concept(val_normed, concepts, pil_dataset, concept_indices,
-                                 top_k=5, output_dir=None):
-    """For each selected concept, show the top-k images with highest activation."""
+                                 top_k=4, output_dir=None, width=5.5,
+                                 label_fontsize=11, value_fontsize=10,
+                                 filename="topk_images_per_concept.pdf"):
+    """For each selected concept, show the top-k images with highest activation.
+
+    Drawn at the paper's printed width so \\includegraphics does not scale the text
+    down. The concept name sits ABOVE its row rather than beside it, and every
+    thumbnail is rendered in a square box of identical size regardless of the
+    source aspect ratio, so rows are visually comparable.
+    """
     n_concepts = len(concept_indices)
-    fig, axes = plt.subplots(n_concepts, top_k, figsize=(2.2 * top_k, 2.5 * n_concepts))
-    if n_concepts == 1:
-        axes = axes[np.newaxis, :]
+    cell = width / top_k
+    # "activation: 0.98" at 10pt is ~1.1in wide, so the cell must be at least that
+    # or adjacent labels collide; top_k=4 over 5.5in gives 1.375in cells.
+    # Extra height per row carries the heading above and the values below.
+    fig, axes = plt.subplots(n_concepts, top_k,
+                             figsize=(width, n_concepts * (cell + 0.78)))
+    axes = np.atleast_2d(axes)
+    if n_concepts == 1 and axes.shape[0] != 1:
+        axes = axes.reshape(1, -1)
 
-    for row, cidx in enumerate(concept_indices):
-        activations = val_normed[:, cidx]  # [N]
-        topk_vals, topk_idxs = activations.topk(top_k)
-        cname = concepts[cidx] if cidx < len(concepts) else f"concept_{cidx}"
+    with plt.rc_context(CONTRIB_RC):
+        for row, cidx in enumerate(concept_indices):
+            activations = val_normed[:, cidx]
+            topk_vals, topk_idxs = activations.topk(top_k)
+            cname = concepts[cidx] if cidx < len(concepts) else f"concept_{cidx}"
 
-        for col in range(top_k):
-            ax = axes[row, col]
-            img_idx = topk_idxs[col].item()
-            img = pil_dataset[img_idx][0]
-            if not isinstance(img, Image.Image):
-                if isinstance(img, torch.Tensor):
-                    img = img.permute(1, 2, 0).numpy()
-                    img = (img * 255).clip(0, 255).astype(np.uint8)
-                    img = Image.fromarray(img)
+            for col in range(top_k):
+                ax = axes[row, col]
+                img = pil_dataset[topk_idxs[col].item()][0]
+                if not isinstance(img, Image.Image):
+                    if isinstance(img, torch.Tensor):
+                        img = img.permute(1, 2, 0).numpy()
+                        img = (img * 255).clip(0, 255).astype(np.uint8)
+                        img = Image.fromarray(img)
+                # Square centre crop then a fixed resize: CUB photos vary in
+                # aspect ratio, and without this the thumbnails differ in size.
+                w, h = img.size
+                m = min(w, h)
+                img = img.crop(((w - m) // 2, (h - m) // 2,
+                                (w + m) // 2, (h + m) // 2)).resize((224, 224))
+                ax.imshow(img)
+                # Below the image: the row heading owns the space above. Split
+                # over two lines because "activation: 0.99" at 10pt is ~1.35in,
+                # which fills the whole cell and touches the neighbouring label.
+                ax.text(0.5, -0.04, f"activation\n{topk_vals[col]:.2f}",
+                        transform=ax.transAxes, ha="center", va="top",
+                        linespacing=1.25,
+                        fontsize=value_fontsize, color=CONTRIB_LABEL_COLOR)
+                ax.axis("off")
 
-            ax.imshow(img)
-            # Per-image activation value above
-            ax.text(0.5, 1.02, f"{topk_vals[col]:.2f}", transform=ax.transAxes,
-                    ha="center", va="bottom", fontsize=8)
-            ax.axis("off")
-
-        # Concept name as text to the LEFT of the row (works with axis off)
-        axes[row, 0].text(-0.05, 0.5, f"C{cidx}: {cname}", transform=axes[row, 0].transAxes,
-                          ha="right", va="center", fontsize=10, fontweight="bold")
-
-    fig.suptitle("Top-k activated images per concept neuron", fontsize=13, y=1.01)
-    plt.tight_layout()
+            # Concept name ABOVE the row, spanning its full width.
+            left = axes[row, 0].get_position().x0
+            right = axes[row, -1].get_position().x1
+            top = axes[row, 0].get_position().y1
+            fig.text((left + right) / 2, top + 0.012,
+                     f"C{cidx}: {cname}", ha="center", va="bottom",
+                     fontsize=label_fontsize, fontweight="bold",
+                     color=CONTRIB_LABEL_COLOR)
 
     if output_dir:
-        path = os.path.join(output_dir, "topk_images_per_concept.pdf")
+        path = os.path.join(output_dir, filename)
         fig.savefig(path, dpi=200, bbox_inches="tight")
         print(f"  Saved: {path}")
     plt.close(fig)
@@ -295,7 +321,9 @@ def main():
     parser.add_argument("--load_dir", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--top_k", type=int, default=5, help="Images per concept (Viz 1)")
+    parser.add_argument("--top_k", type=int, default=4,
+                        help="Images per concept (Viz 1). Above 4 the per-image "
+                             "activation labels collide at the 5.5in paper width.")
     parser.add_argument("--num_concepts", type=int, default=8, help="Concepts to show (Viz 1)")
     parser.add_argument("--num_images", type=int, default=6, help="Images to explain (Viz 2)")
     parser.add_argument("--concept_indices", type=int, nargs="+", default=None,
@@ -340,6 +368,16 @@ def main():
         val_normed, concepts, pil_dataset, concept_indices,
         top_k=args.top_k, output_dir=output_dir,
     )
+
+    # Also emit one file per concept. The paper includes single concepts at
+    # \textwidth (main text and appendix show different ones), and cropping them
+    # out of the combined sheet by hand is what shrank the fonts previously.
+    for ci in concept_indices:
+        plot_topk_images_per_concept(
+            val_normed, concepts, pil_dataset, [ci],
+            top_k=args.top_k, output_dir=output_dir,
+            filename=f"concept_c{ci}.pdf",
+        )
 
     # ── Viz 2: Concept contributions per image ─────────────────────────────
     if args.image_indices:
