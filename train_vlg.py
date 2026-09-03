@@ -1086,6 +1086,175 @@ def simulate_federated_training_vlg(args):
         total_w = final_layer.weight.data.numel()
         print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
 
+    elif vlg_final_method == "fedprox":
+        # FedProx (Li et al. 2020) as the Phase-3 aggregator: FedAvg plus a
+        # proximal term mu/2 ||w - w_global||^2 on each client's local objective,
+        # anchoring local solutions to the previous global iterate.
+        #
+        # This exists to separate two claims the paper needs to keep apart:
+        #   1. the concept bottleneck composes with standard FL aggregators, and
+        #   2. getting accuracy AND sparsity together needs composite optimization.
+        # Run with --fedprox_l1_lam 0 (default) it is dense and should reach
+        # roughly FedAvg-dense accuracy, supporting (1). Run with a non-zero
+        # threshold it applies the same post-hoc soft-threshold as fedavg_l1, and
+        # is expected to collapse the same way — which isolates post-hoc
+        # thresholding, not the choice of aggregator, as the cause.
+        l1_lam = float(getattr(args, "fedprox_l1_lam", 0.0))
+        mu = float(getattr(args, "fedprox_mu", 0.01))
+        mode = f"+ L1 thresh λ={l1_lam}" if l1_lam > 0 else "(dense)"
+        print(f"\n=== Phase 3: FedProx {mode}, μ={mu} ===")
+
+        client_concept_loaders = []
+        offset = 0
+        for i in range(args.num_clients):
+            n = client_data_sizes[i]
+            c_feats = all_train_feats[offset:offset + n]
+            c_labels = all_train_labels[offset:offset + n]
+            offset += n
+            client_concept_loaders.append(DataLoader(
+                TensorDataset(c_feats, c_labels),
+                batch_size=saga_bs, shuffle=True
+            ))
+
+        # Per-client val concept features (mirrors fedavg_l1).
+        client_val_concept_loaders = []
+        client_val_sizes = []
+        if _pretrained_mode:
+            n_val_total = val_feats.shape[0]
+            base_val = n_val_total // args.num_clients
+            rem_val = n_val_total % args.num_clients
+            offset_val = 0
+            for i in range(args.num_clients):
+                n_v = base_val + (1 if i < rem_val else 0)
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(val_feats[offset_val:offset_val + n_v],
+                                  val_labels_all[offset_val:offset_val + n_v]),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(n_v)
+                offset_val += n_v
+        else:
+            for i in range(args.num_clients):
+                idx = torch.tensor(_val_indices_thresh[i], dtype=torch.long)
+                client_val_concept_loaders.append(DataLoader(
+                    TensorDataset(val_feats[idx], val_labels_all[idx]),
+                    batch_size=saga_bs, shuffle=False
+                ))
+                client_val_sizes.append(len(idx))
+        total_val = sum(client_val_sizes)
+        client_val_weights = [n / total_val for n in client_val_sizes]
+
+        final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+        client_final_layers = [FinalLayer(num_concepts, num_classes, device=str(device))
+                               for _ in range(args.num_clients)]
+        ce_loss = nn.CrossEntropyLoss()
+
+        final_rounds = getattr(args, "final_rounds", 5)
+        final_epochs = getattr(args, "final_epochs", 3)
+        final_lr = getattr(args, "final_lr", 1e-3)
+
+        prox_metrics = {
+            "rounds": [], "client_losses": [], "avg_client_loss": [],
+            "val_accuracy": [], "best_val_accuracy": [],
+            "nnz_weights": [], "concepts_alive": [],
+            "threshold_lam": l1_lam, "fedprox_mu": mu,
+        }
+        best_val_acc = 0.0
+        best_fl_state = None
+
+        for round_num in range(final_rounds):
+            print(f"\n=== FedProx Round {round_num + 1}/{final_rounds} ===")
+            # Anchor for this round's proximal term: the global iterate as it
+            # stood before any client trained. Detached so it is a constant.
+            global_anchor = [p.detach().clone() for p in final_layer.parameters()]
+            round_losses = []
+            for i in range(args.num_clients):
+                client_final_layers[i].load_state_dict(final_layer.state_dict())
+                client_final_layers[i].train()
+                opt = torch.optim.Adam(client_final_layers[i].parameters(), lr=final_lr)
+                epoch_loss = 0.0
+                n_batches = 0
+                for epoch in range(final_epochs):
+                    for feats, labels in client_concept_loaders[i]:
+                        feats, labels = feats.to(device).float(), labels.to(device)
+                        ce = ce_loss(client_final_layers[i](feats), labels)
+                        prox = torch.zeros((), device=device)
+                        for p, g in zip(client_final_layers[i].parameters(), global_anchor):
+                            prox = prox + (p - g).pow(2).sum()
+                        loss = ce + 0.5 * mu * prox
+                        opt.zero_grad()
+                        loss.backward()
+                        opt.step()
+                        # Log the CE term only, so losses stay comparable with
+                        # the other aggregators (whose objective has no prox).
+                        epoch_loss += ce.item()
+                        n_batches += 1
+                round_losses.append(epoch_loss / max(n_batches, 1))
+                print(f"  Client {i}: Loss = {round_losses[-1]:.4f}")
+
+            # Server: weighted FedAvg of client final layers (FedProx changes the
+            # local objective, not the aggregation rule).
+            global_fl_state = {}
+            for key in final_layer.state_dict().keys():
+                param = client_final_layers[0].state_dict()[key]
+                if param.dtype.is_floating_point:
+                    global_fl_state[key] = torch.zeros_like(param)
+                    for i in range(args.num_clients):
+                        global_fl_state[key] += client_weights[i] * client_final_layers[i].state_dict()[key]
+                else:
+                    global_fl_state[key] = param.clone()
+
+            if l1_lam > 0:
+                # Same post-hoc threshold as fedavg_l1; bias left unregularized.
+                for key in global_fl_state:
+                    if "weight" in key:
+                        global_fl_state[key] = soft_threshold(global_fl_state[key], l1_lam)
+
+            final_layer.load_state_dict(global_fl_state)
+
+            final_layer.eval()
+            val_acc = 0.0
+            with torch.no_grad():
+                for i in range(args.num_clients):
+                    client_correct, client_total = 0, 0
+                    for feats, labels in client_val_concept_loaders[i]:
+                        feats, labels = feats.to(device).float(), labels.to(device)
+                        preds = final_layer(feats).argmax(dim=1)
+                        client_correct += (preds == labels).sum().item()
+                        client_total += labels.size(0)
+                    val_acc += client_val_weights[i] * (client_correct / max(client_total, 1))
+            print(f"  Val Accuracy: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_fl_state = {k: v.clone() for k, v in final_layer.state_dict().items()}
+
+            nnz_round = int((final_layer.weight.data.abs() > 1e-5).sum().item())
+            concepts_alive_round = int(
+                (final_layer.weight.data.abs().sum(dim=0) > 1e-5).sum().item()
+            )
+
+            prox_metrics["rounds"].append(round_num + 1)
+            prox_metrics["client_losses"].append(round_losses)
+            prox_metrics["avg_client_loss"].append(sum(round_losses) / len(round_losses))
+            prox_metrics["val_accuracy"].append(float(val_acc))
+            prox_metrics["best_val_accuracy"].append(float(best_val_acc))
+            prox_metrics["nnz_weights"].append(nnz_round)
+            prox_metrics["concepts_alive"].append(concepts_alive_round)
+            update_log(_log_path, {"status": "in_progress", "phase": "final_layer_fedprox",
+                                   "round": round_num + 1, "total_rounds": final_rounds,
+                                   "val_accuracy": float(val_acc), "best_val_accuracy": float(best_val_acc),
+                                   "fedprox_mu": mu, "threshold_lam": l1_lam,
+                                   "nnz_weights": nnz_round,
+                                   "concepts_alive": concepts_alive_round})
+
+        if best_fl_state is not None:
+            final_layer.load_state_dict(best_fl_state)
+        global_model.final_layer = final_layer
+
+        nnz = (final_layer.weight.data.abs() > 1e-5).sum().item()
+        total_w = final_layer.weight.data.numel()
+        print(f"Final layer sparsity: {nnz}/{total_w} non-zero ({nnz/total_w:.4f})")
+
     elif vlg_final_method == "feddualavg":
         print("\n=== Phase 3: Federated Dual Averaging with Group Lasso (VLG) ===")
         # Reuse the normalized concept features already extracted in Phase 2.
@@ -1382,6 +1551,11 @@ def simulate_federated_training_vlg(args):
         metrics_txt_data["fedavg_l1_lam"] = float(args.fedavg_l1_lam)
         metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
         metrics_txt_data["final_lr"] = getattr(args, "final_lr", 1e-3)
+    elif vlg_final_method == "fedprox":
+        metrics_txt_data["fedprox_mu"] = float(getattr(args, "fedprox_mu", 0.01))
+        metrics_txt_data["fedprox_l1_lam"] = float(getattr(args, "fedprox_l1_lam", 0.0))
+        metrics_txt_data["final_rounds"] = getattr(args, "final_rounds", 5)
+        metrics_txt_data["final_lr"] = getattr(args, "final_lr", 1e-3)
     elif vlg_final_method == "feddualavg":
         metrics_txt_data["dual_eta_s"] = args.dual_eta_s
         metrics_txt_data["dual_eta_c"] = args.dual_eta_c
@@ -1452,6 +1626,8 @@ def simulate_federated_training_vlg(args):
         training_metrics["final_layer_phase"] = thresh_metrics
     elif vlg_final_method == "fedavg_l1":
         training_metrics["final_layer_phase"] = l1_metrics
+    elif vlg_final_method == "fedprox":
+        training_metrics["final_layer_phase"] = prox_metrics
     elif vlg_final_method == "feddualavg":
         training_metrics["final_layer_phase"] = dual_metrics
     elif vlg_final_method in ("hybrid_saga", "fedavg"):

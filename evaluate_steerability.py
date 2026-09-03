@@ -208,6 +208,16 @@ def run_intervention_experiment(a_tilde, dino_gt, targets, W_f, b_f, device, max
     if n_excluded > 0:
         print(f"  Excluding {n_excluded}/{C} concepts from intervention "
               f"(mu_pos<{min_pos_value} or <{min_pos_samples} positives)")
+    if n_excluded == C:
+        # Every concept filtered out means nothing is ever intervened on, and
+        # the run still produces a plausible-looking flat curve. Almost always
+        # the DINO labels failed to load rather than a genuine property of the
+        # model, so fail rather than emit a figure that means nothing.
+        raise RuntimeError(
+            f"All {C} concepts were excluded from intervention: no concept has "
+            f"{min_pos_samples}+ positive DINO labels in the test split. The "
+            "annotations were most likely not loaded; check --annotation_dir."
+        )
 
     # Per-sample importance ranks: sort by concept prediction error (descending).
     # Intervene first on concepts where the model's activation is furthest from

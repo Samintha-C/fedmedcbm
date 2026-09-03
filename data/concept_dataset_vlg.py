@@ -42,6 +42,13 @@ class DinoConceptDataset(Dataset):
         self.preprocess = preprocess
         self.confidence_threshold = confidence_threshold
         self.dir = os.path.join(annotation_dir, f"{dataset_name}_{split_suffix}")
+        # Some archives extracted a level too deep, leaving
+        # {dataset}_{split}/{dataset}_{split}/*.json. Descend so the whole split
+        # is not silently read as all-negative (this happened to imagenet_val).
+        _nested = os.path.join(self.dir, f"{dataset_name}_{split_suffix}")
+        if not os.path.isfile(os.path.join(self.dir, "0.json")) and os.path.isdir(_nested):
+            print(f"[DinoConceptDataset] descending into nested annotation dir: {_nested}")
+            self.dir = _nested
         self.dataset_name = dataset_name
         self.split_suffix = split_suffix
         self.cache_dir = cache_dir
@@ -132,10 +139,28 @@ class DinoConceptDataset(Dataset):
             row = torch.tensor([c in present for c in concepts], dtype=torch.bool)
             return local_idx, row
 
+        n_missing = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
             for local_idx, row in pool.map(_load_one, enumerate(indices)):
-                if row is not None:
+                if row is None:
+                    n_missing += 1
+                else:
                     stacked[local_idx] = row
+
+        # A missing JSON yields an all-negative row, which is indistinguishable
+        # downstream from "no concept present". Left silent, a wholly missing
+        # split reads as a valid all-negative one and quietly invalidates any
+        # experiment built on it, so say so loudly.
+        if n_missing:
+            pct = 100.0 * n_missing / max(n, 1)
+            msg = (f"[DinoConceptDataset] {n_missing}/{n} ({pct:.1f}%) annotation "
+                   f"files missing under {ann_dir}; those rows are all-negative")
+            if pct > 50.0:
+                raise FileNotFoundError(
+                    msg + ". Refusing to continue: concept targets would be "
+                    "almost entirely empty. Check the annotation directory layout."
+                )
+            print("WARNING: " + msg)
         return stacked
 
     def _feature_cache_path(self, backbone_name: str) -> Optional[str]:
