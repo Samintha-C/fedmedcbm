@@ -88,17 +88,17 @@ CFG = {
         concepts="concept_files/places365_filtered.txt",
         bb="--backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4",
         args="--val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 "
-             "--cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 4",
+             "--cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8",
         data=f"export PLACES365_ROOT={DATA}/places365",
-        check=f"{DATA}/places365/data_256_standard", mem="64Gi", dshm="8Gi"),
+        check=f"{DATA}/places365/data_256_standard", mem="64Gi", dshm="16Gi", cpu="12"),
     "imagenet": dict(
         concepts="concept_files/imagenet_filtered.txt",
         bb="--backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4",
         args="--val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 "
-             "--cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 4",
+             "--cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8",
         data=f"export IMAGENET_ROOT={DATA}/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC",
         check=f"{DATA}/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC/val",
-        mem="64Gi", dshm="8Gi"),
+        mem="64Gi", dshm="16Gi", cpu="12"),
 }
 
 COMMON = ("--num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 "
@@ -245,11 +245,11 @@ spec:
               if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
           resources:
             requests:
-              cpu: "4"
+              cpu: "{cpu}"
               memory: "{mem}"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "4"
+              cpu: "{cpu}"
               memory: "{mem}"
               nvidia.com/gpu: "1"
           volumeMounts:
@@ -298,6 +298,7 @@ def main():
             ds=ds, concepts=cfg["concepts"], bb=cfg["bb"], args=cfg["args"],
             common=COMMON, data=cfg["data"] or ": # no dataset setup needed",
             check=cfg["check"], mem=cfg["mem"], dshm=cfg["dshm"],
+            cpu=cfg.get("cpu", "4"),
             calls="\n".join(calls), classes=CLASSES[ds], ncells=n,
         ))
     print("".join(out), end="")

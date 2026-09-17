@@ -26,7 +26,7 @@ import argparse
 import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from gen_seed_main import CFG, LAMS, SEEDS, CLASSES, COMMON, DATA  # noqa: E402
+from gen_seed_main import CFG, LAMS, SEEDS, CLASSES, COMMON, DATA  # noqa  # noqa: E402
 
 # COMMON hardcodes --device cuda; Phase 3 here is CPU.
 COMMON_CPU = COMMON.replace("--device cuda", "--device cpu")
@@ -39,7 +39,7 @@ JOB = """---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fedcbm-p3cpu-{ds}-{ptag}-s{seed}
+  name: fedcbm-p3{tag}-{ds}-{ptag}-s{seed}
   namespace: wenglab-interpretable-ai
   labels:
     experiment: fed-lfc-cbm
@@ -114,10 +114,10 @@ spec:
           resources:
             requests:
               cpu: "{cpu}"
-              memory: "{mem}"
+              memory: "{mem}"{gpuline}
             limits:
               cpu: "{cpu}"
-              memory: "{mem}"
+              memory: "{mem}"{gpuline}
           volumeMounts:
             - name: sc-rwx-vol
               mountPath: /sc-rwx-vol
@@ -130,7 +130,7 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: "8Gi"
+            sizeLimit: "8Gi"{affinity}
       restartPolicy: Never
 """
 
@@ -140,8 +140,9 @@ HEADER = """# CPU-only Phase 3 (NEC~5) arms, one Job each so they run in paralle
 # No GPU is requested, so these pods are outside the GPU-utilisation policy.
 # Each arm needs its matching nec50 arm already on the PVC and exits 1 if not.
 #
-# UNTESTED: --device cpu has not been exercised for Phase 3 in this repo.
-# Validate on cifar10 first, it is minutes rather than hours.
+# MEASURED 2026-09-16: CPU Phase 3 is ~5.6x slower than GPU (3.9 min/round vs
+# ~0.7), i.e. ~13h for 200 rounds instead of ~2h20m. Use --gpu unless the pod
+# is specifically being kept off the GPU-utilisation policy and 13h is fine.
 """
 
 
@@ -150,11 +151,31 @@ def main():
     ap.add_argument("--datasets", nargs="+", default=["places365"])
     ap.add_argument("--partitions", nargs="+", default=["iid", "dir"],
                     choices=["iid", "dir"])
+    ap.add_argument("--gpu", action="store_true",
+                    help="request a GPU and use --device cuda; CPU Phase 3 measured\n                         ~5.6x slower (3.9 min/round vs 0.7)")
     ap.add_argument("--seeds", nargs="+", type=int, default=None,
                     help="default: whatever gen_seed_main.SEEDS lists")
     a = ap.parse_args()
 
     tag2part = {"dir": ("dirichlet", "--alpha 0.5"), "iid": ("iid", "--iid")}
+    AFF = ('''
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-A10
+                      - NVIDIA-A40
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-PCIE-40GB''')
+    tag = "gpu" if a.gpu else "cpu"
+    common = COMMON if a.gpu else COMMON_CPU
+    gpuline = '\n              nvidia.com/gpu: "1"' if a.gpu else ""
+    affinity = AFF if a.gpu else ""
     out = [HEADER]
     for ds in a.datasets:
         cfg = CFG[ds]
@@ -168,7 +189,7 @@ def main():
                 out.append(JOB.format(
                     ds=ds, ptag=ptag, seed=seed, lam=lam, flag=flag,
                     concepts=cfg["concepts"], bb=cfg["bb"], args=cfg["args"],
-                    common=COMMON_CPU,
+                    common=common, tag=tag, gpuline=gpuline, affinity=affinity,
                     data=cfg["data"] or ": # no dataset setup needed",
                     classes=CLASSES[ds], cpu=CPU, mem=MEM[ds],
                 ))
