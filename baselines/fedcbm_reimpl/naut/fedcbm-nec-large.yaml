@@ -7,10 +7,10 @@
 # Variant: nec.
 # One Job per dataset; seeds 42, 31, 7; both partitions per seed.
 # RESUMABLE: a seed is skipped if its output already has metrics.json.
-# Output: /sc-rwx-vol/fedmedcbm/models/FEDCBM_NEC/<dataset>/s<seed>/<run>/metrics.json
+# Output: /sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED_NEC/<dataset>/s<seed>/<run>/metrics.json
 #   partitions.<iid|dirichlet>.global_test_mean_client_acc   (F-CM reference protocol)
 #   partitions.<iid|dirichlet>.personalized_test_acc_weighted (per-client test splits)
-# Submit only after fedcbm-strong-places365/imagenet have finished.
+# Submit only after fedcbm-balanced-places365/imagenet have finished.
 ---
 apiVersion: batch/v1
 kind: Job
@@ -59,7 +59,7 @@ spec:
               if [ $RC -ne 0 ]; then echo "ERROR: selftest failed, not running"; exit 1; fi
 
               DS=places365
-              OUT=/sc-rwx-vol/fedmedcbm/models/FEDCBM_NEC/$DS
+              OUT=/sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED_NEC/$DS
               mkdir -p $OUT
               export PLACES365_ROOT=/sc-rwx-vol/fedmedcbm/datasets/places365
               : # not CIFAR
@@ -82,7 +82,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cuda --bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_STRONG/$DS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0
+                  --save_dir "$SAVE" --device cuda --bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED/$DS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -181,7 +181,7 @@ spec:
               if [ $RC -ne 0 ]; then echo "ERROR: selftest failed, not running"; exit 1; fi
 
               DS=imagenet
-              OUT=/sc-rwx-vol/fedmedcbm/models/FEDCBM_NEC/$DS
+              OUT=/sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED_NEC/$DS
               mkdir -p $OUT
               export IMAGENET_ROOT=/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC
               : # not CIFAR
@@ -204,7 +204,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cuda --bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_STRONG/$DS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0
+                  --save_dir "$SAVE" --device cuda --bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED/$DS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)

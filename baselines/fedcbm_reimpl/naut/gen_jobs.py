@@ -10,16 +10,24 @@ and stops if it fails. CIFAR-10, CIFAR-100 and CUB also compare Stage A on 8
 real concepts against the reference; Places365 and ImageNet skip that (the
 reference's numpy loop is too slow at their size).
 
-Two variants:
-  faithful  the reference as published (F-CM's defaults).
-  strong    our stronger FedCBM for labels as imbalanced as ours: balanced hinge
-            + per-concept bias, with standardization and step size {0.01, 0.1}
-            chosen on validation (mean client head accuracy on the full val set,
-            IID partition). See core.train_cav_bank.
+Variants:
+  faithful  the reference as published (F-CM's defaults). On our per-image DINO
+            labels (1-6% positive) it predicts every concept absent; appendix only.
+  balanced  THE REPRESENTATIVE FedCBM BASELINE. Algorithm 1 of Yang & Long
+            unchanged (bias-free subgradient SVM, lr 0.01, 200 rounds, CAV
+            projection, private heads); each concept's positives and negatives get
+            equal total weight, as in the concept sets of FedCBM's source for Broden
+            (Abid et al. 2022, CCE: |P| = |N| = 100). That is the only change.
+  nec       nec.py on the balanced bank: the paper's C-tuned dense heads
+            ({0.01, 0.1, 1.0}) plus NEC-matched sparse heads.
+  personal  ours with private per-client heads (ours_personal.py).
+The earlier "strong" variant (balanced + bias + standardization, lr chosen on
+val; FEDCBM_STRONG) is retired; its flags are in each run's args.json.
 
 Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py faithful > baselines/fedcbm_reimpl/naut/fedcbm-reimpl.yaml
-    python baselines/fedcbm_reimpl/naut/gen_jobs.py strong   > baselines/fedcbm_reimpl/naut/fedcbm-strong.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py balanced > baselines/fedcbm_reimpl/naut/fedcbm-balanced.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py nec      > baselines/fedcbm_reimpl/naut/fedcbm-nec.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py personal > baselines/fedcbm_reimpl/naut/ours-personal.yaml
 """
 
@@ -39,13 +47,12 @@ LFC_COMMIT = "fa2869d"
 REF_CHECK = {"cifar10": 8, "cifar100": 8, "cub": 8, "places365": 0, "imagenet": 0}
 VARIANTS = {
     "faithful": dict(job="fedcbm-reimpl", out="FEDCBM_REIMPL", flags="", refcheck=True),
-    "strong": dict(job="fedcbm-strong", out="FEDCBM_STRONG", refcheck=False,
-                   flags="--svm_balanced --svm_bias --svm_standardize no yes "
-                         "--svm_lr 0.01 0.1 --variant_name strong"),
-    # NEC-constrained heads on the strong run's saved concept bank (nec.py).
-    # Needs FEDCBM_STRONG/<ds>/s<seed> to exist: submit after the strong job.
-    "nec": dict(job="fedcbm-nec", out="FEDCBM_NEC", refcheck=False, script="nec.py",
-                flags="--bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_STRONG/$DS "
+    "balanced": dict(job="fedcbm-balanced", out="FEDCBM_BALANCED", refcheck=False,
+                     flags="--svm_balanced --variant_name balanced"),
+    # Heads on the balanced run's saved concept bank (nec.py). Needs
+    # FEDCBM_BALANCED/<ds>/s<seed>: submit per dataset after its balanced job.
+    "nec": dict(job="fedcbm-nec", out="FEDCBM_BALANCED_NEC", refcheck=False, script="nec.py",
+                flags="--bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED/$DS "
                       "--nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0"),
     # Ours with private per-client heads (ours_personal.py): our federated CBL from
     # the tab:main run of each (seed, partition), then nec.py's heads. $RUNS is set

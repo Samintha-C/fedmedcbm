@@ -165,11 +165,12 @@ def main():
 
 
 def variant_check(seed: int = 0) -> bool:
-    """The stronger variant must fix the failure the reference shows on our
-    data. Synthetic data shaped like ours: non-negative pooled features with a
-    large shared mean, concepts 1-6% positive. The bias-free reference then
-    scores every image 'absent' (balanced accuracy ~0.5); balanced + bias +
-    standardize should not."""
+    """The balanced variant (the representative baseline: Algorithm 1 with
+    CCE-style balanced concept sets, no bias, no standardization) must fix the
+    failure the reference shows on our data. Synthetic data shaped like ours:
+    non-negative pooled features with a large shared mean, concepts 1-6%
+    positive. The bias-free reference then scores every image 'absent'
+    (balanced accuracy ~0.5); balancing alone should not."""
     rng = np.random.default_rng(seed)
     n, d, c = 4000, 64, 10
     a = rng.normal(size=(d, c))
@@ -187,7 +188,7 @@ def variant_check(seed: int = 0) -> bool:
     feats, conc = torch.from_numpy(h), torch.from_numpy(cc)
     res = {}
     for name, kw in (("reference", {}),
-                     ("variant", {"balanced": True, "bias": True, "stats": core.feature_stats(feats)})):
+                     ("variant", {"balanced": True})):
         out = core.train_cav_bank(feats, conc, rounds=200, lr=0.01, l2=1e-4, device="cpu",
                                   chunk=1000, log_every=0, **kw)
         z = core.project(torch.from_numpy(ht), out["W"], b=out["b"], stats=out["stats"])
