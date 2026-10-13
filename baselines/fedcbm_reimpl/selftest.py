@@ -159,6 +159,7 @@ def main():
         print(f"  -> {'PASS' if c_ok and b_ok else 'FAIL'}")
 
     ok &= variant_check()
+    ok &= nec_check()
     print("ALL PASS" if ok else "SOME CHECKS FAILED")
     sys.exit(0 if ok else 1)
 
@@ -194,6 +195,39 @@ def variant_check(seed: int = 0) -> bool:
     good = res["reference"] < 0.6 and res["variant"] > 0.8
     print(f"variant check (synthetic, 1-6% positives): concept balanced accuracy "
           f"reference {res['reference']:.3f}, variant {res['variant']:.3f} -> {'PASS' if good else 'FAIL'}")
+    return good
+
+
+
+def nec_check(seed: int = 0) -> bool:
+    """The sparse path must land near each NEC target, its accuracy must rise
+    with the budget, and at a generous budget it must come close to the dense
+    head. Synthetic: 8 classes, 40 concept scores, each class driven by 4 of them."""
+    rng = np.random.default_rng(seed)
+    k, f, n = 8, 40, 3000
+    proto = np.zeros((k, f))
+    for c in range(k):
+        proto[c, rng.choice(f, 4, replace=False)] = rng.normal(2.0, 0.5, 4)
+
+    def sample(m):
+        y = rng.integers(0, k, m)
+        return (proto[y] + rng.normal(size=(m, f))).astype(np.float32), y
+
+    z, y = sample(n)
+    zt, yt = sample(1500)
+    z, y, zt, yt = map(torch.from_numpy, (z, y, zt, yt))
+    targets = [2, 4, 10]
+    res = core.fit_sparse_path(z, y, targets, iters=200)
+    dense = core.fit_head(z.double(), y, C=1.0, max_iter=200, dtype=torch.float64)
+    acc_d = core.accuracy(dense, zt.double(), yt)
+    accs = {t: core.accuracy(res[t]["head"], zt, yt) for t in targets}
+    necs = {t: res[t]["nec"] for t in targets}
+    hit = all(abs(necs[t] - t) <= max(1.0, 0.25 * t) for t in targets)
+    mono = accs[2] <= accs[10] + 0.01
+    close = accs[10] >= acc_d - 0.03
+    good = hit and mono and close
+    print(f"nec check (synthetic): NEC achieved {necs}, acc { {t: round(a, 3) for t, a in accs.items()} } "
+          f"vs dense {acc_d:.3f} -> {'PASS' if good else 'FAIL'}")
     return good
 
 

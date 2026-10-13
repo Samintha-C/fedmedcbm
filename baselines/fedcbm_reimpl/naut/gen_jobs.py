@@ -39,6 +39,11 @@ VARIANTS = {
     "strong": dict(job="fedcbm-strong", out="FEDCBM_STRONG", refcheck=False,
                    flags="--svm_balanced --svm_bias --svm_standardize no yes "
                          "--svm_lr 0.01 0.1 --variant_name strong"),
+    # NEC-constrained heads on the strong run's saved concept bank (nec.py).
+    # Needs FEDCBM_STRONG/<ds>/s<seed> to exist: submit after the strong job.
+    "nec": dict(job="fedcbm-nec", out="FEDCBM_NEC", refcheck=False, script="nec.py",
+                flags="--bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_STRONG/$DS "
+                      "--nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0"),
 }
 # torchvision downloads CIFAR from Toronto at ~80 KB/s (35 min each). Keep one
 # copy on the PVC and seed the pod's cache from it; the first job populates it.
@@ -129,7 +134,7 @@ spec:
                 echo "############ FedCBM reimpl | $DS | seed $SEED ############"
                 SAVE=$WORKSPACE/out_s$SEED
                 set +e
-                python baselines/fedcbm_reimpl/run.py --dataset $DS --concept_file {concepts} {bb} \\
+                python baselines/fedcbm_reimpl/{script} --dataset $DS --concept_file {concepts} {bb} \\
                   --val_split {val_split} --num_workers {workers} --seed $SEED --num_clients 5 --alpha 0.5 \\
                   --partitions iid dirichlet \\
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \\
@@ -203,7 +208,7 @@ def main():
         refcheck = (f"\\\n                  --fcm_repo $WORKSPACE/F-CMs --reference_check_concepts {k}"
                     if k else "")
         out.append(JOB.format(
-            ds=ds, job=v["job"], out=v["out"], flags=v["flags"],
+            ds=ds, job=v["job"], out=v["out"], flags=v["flags"], script=v.get("script", "run.py"),
             cifar_in=cifar_in, cifar_out=cifar_out,
             lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
             val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),

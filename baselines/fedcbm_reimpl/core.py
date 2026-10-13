@@ -329,3 +329,102 @@ def concept_accuracy(z: torch.Tensor, concepts: torch.Tensor, trainable: torch.T
     t = trainable.cpu()
     return {"concept_accuracy_mean": float(acc[t].mean()),
             "concept_balanced_accuracy_mean": float(torch.nanmean(bal[t]))}
+
+
+# ── NEC-constrained heads ──────────────────────────────────────────────────────
+@torch.no_grad()
+def fit_sparse_path(z: torch.Tensor, y: torch.Tensor, targets: Sequence[float], alpha: float = 0.99,
+                    n_lambda: int = 40, min_ratio: float = 1e-3, iters: int = 100,
+                    tol: float = 1e-6) -> Dict[float, Dict[str, object]]:
+    """One client's sparse head at each NEC target, from an elastic-net path.
+
+    Objective (glm_saga's, as in VLG-CBM's sparse layer):
+        mean CE + lam * ((1 - alpha)/2 ||W||^2 + alpha ||W||_1), intercept free,
+    over the classes this client holds, on its projected scores standardized
+    with its OWN mean/std (the analogue of the normalized concept activations
+    our sparse layer sees). Solved by FISTA with step 1/L, warm-started down a
+    geometric lam path from lam_max (all-zero W). NEC = nonzeros / classes held.
+    For each target, the path point whose NEC is nearest is returned, mapped
+    back to raw projected scores (the zero pattern is unchanged).
+    """
+    classes = torch.unique(y.cpu())
+    dev = z.device
+    k = classes.numel()
+    if k < 2:
+        return {t: {"head": Head(torch.zeros(0), torch.zeros(0), classes, constant=int(classes[0])),
+                    "nec": 0.0, "lam": float("nan")} for t in targets}
+    tgt = torch.searchsorted(classes.to(dev), y.to(dev))
+    n, f = z.shape
+    mu, sd = z.mean(dim=0), z.std(dim=0).clamp(min=1e-6)
+    zs = (z - mu) / sd
+    Y = F.one_hot(tgt, k).float()
+    # Lipschitz constant of the mean-CE gradient: 0.5 * sigma_max(zs)^2 / n.
+    v = torch.randn(f, device=dev)
+    for _ in range(30):
+        v = zs.T @ (zs @ v)
+        v = v / v.norm()
+    s2 = float((zs @ v).norm() ** 2) / n
+    prior = Y.mean(dim=0).clamp(min=1e-12)
+    W = torch.zeros(k, f, device=dev)
+    b = prior.log() - prior.log().mean()
+    G0 = (torch.softmax(zs @ W.T + b, dim=1) - Y).T @ zs / n
+    lam_max = float(G0.abs().max()) / alpha
+    lams = [lam_max * r for r in torch.logspace(0, float(np.log10(min_ratio)), n_lambda).tolist()]
+    path = []
+    for lam in lams:
+        L = 0.5 * s2 + lam * (1 - alpha)
+        Wy, by, t_m = W.clone(), b.clone(), 1.0
+        for _ in range(iters):
+            P = torch.softmax(zs @ Wy.T + by, dim=1) - Y
+            gW = P.T @ zs / n + lam * (1 - alpha) * Wy
+            gb = P.mean(dim=0)
+            W_new = Wy - gW / L
+            W_new = torch.sign(W_new) * torch.clamp(W_new.abs() - lam * alpha / L, min=0.0)
+            b_new = by - gb / L
+            t_n = (1 + (1 + 4 * t_m * t_m) ** 0.5) / 2
+            Wy = W_new + ((t_m - 1) / t_n) * (W_new - W)
+            by = b_new + ((t_m - 1) / t_n) * (b_new - b)
+            delta = float((W_new - W).abs().max())
+            W, b, t_m = W_new, b_new, t_n
+            if delta < tol:
+                break
+        nec = float((W != 0).sum()) / k
+        path.append((lam, nec, W.clone(), b.clone()))
+        if nec > 1.5 * max(targets):
+            break
+    out = {}
+    for t in targets:
+        lam, nec, Wt, bt = min(path, key=lambda p: abs(p[1] - t))
+        Wr = Wt / sd
+        out[t] = {"head": Head(weight=Wr, bias=bt - Wr @ mu, classes=classes), "nec": nec, "lam": lam}
+    return out
+
+
+def support_stats(heads: Sequence[Head], num_classes: int, num_concepts: int) -> Dict[str, float]:
+    """What an auditor of the federation reads, per class: the UNION of the
+    clients' supports (distinct concepts used for that class anywhere) and the
+    mean pairwise Jaccard overlap of the supports of clients that hold it."""
+    masks, holds = [], []
+    for h in heads:
+        m = torch.zeros(num_classes, num_concepts, dtype=torch.bool)
+        held = torch.zeros(num_classes, dtype=torch.bool)
+        if h.constant is None:
+            m[h.classes] = (h.weight != 0).cpu()
+            held[h.classes] = True
+        masks.append(m)
+        holds.append(held)
+    union = torch.zeros(num_classes, num_concepts, dtype=torch.bool)
+    for m in masks:
+        union |= m
+    any_held = torch.stack(holds).any(dim=0)
+    jac = []
+    for i in range(len(masks)):
+        for j in range(i + 1, len(masks)):
+            both = holds[i] & holds[j]
+            inter = (masks[i] & masks[j]).sum(dim=1).float()
+            uni = (masks[i] | masks[j]).sum(dim=1).float()
+            ok = both & (uni > 0)
+            if ok.any():
+                jac.append((inter[ok] / uni[ok]))
+    return {"union_nec": float(union.sum(dim=1)[any_held].float().mean()),
+            "support_jaccard": float(torch.cat(jac).mean()) if jac else float("nan")}

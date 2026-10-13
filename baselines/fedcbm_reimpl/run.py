@@ -44,7 +44,7 @@ from models.fed_vlgcbm import Backbone, BackboneCLIP  # noqa: E402
 from training_utils import get_preprocess  # noqa: E402
 
 
-def parse():
+def build_parser():
     ap = argparse.ArgumentParser()
     # data / backbone: same names and meaning as main_fed.py
     ap.add_argument("--dataset", required=True)
@@ -87,7 +87,11 @@ def parse():
     # optional: compare against the F-CM reference on real data (small datasets only)
     ap.add_argument("--fcm_repo", default=None)
     ap.add_argument("--reference_check_concepts", type=int, default=0)
-    return ap.parse_args()
+    return ap
+
+
+def parse():
+    return build_parser().parse_args()
 
 
 def _step(label, t0):
