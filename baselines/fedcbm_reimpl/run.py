@@ -69,8 +69,15 @@ def parse():
     # FedCBM: defaults are the F-CM reference config (conf/learning/FedCBM.yaml,
     # trainer.max_epochs 200)
     ap.add_argument("--svm_rounds", type=int, default=200)
-    ap.add_argument("--svm_lr", type=float, default=0.01)
+    ap.add_argument("--svm_lr", type=float, nargs="+", default=[0.01],
+                    help="one value = fixed; several = grid, chosen on validation")
     ap.add_argument("--svm_l2", type=float, default=1e-4)
+    # Stronger variant (all off = the reference). See core.train_cav_bank.
+    ap.add_argument("--svm_balanced", action="store_true")
+    ap.add_argument("--svm_bias", action="store_true")
+    ap.add_argument("--svm_standardize", nargs="+", choices=["no", "yes"], default=["no"],
+                    help="one value = fixed; both = part of the validation grid")
+    ap.add_argument("--variant_name", default="faithful")
     ap.add_argument("--head_C", type=float, default=1.0)
     ap.add_argument("--head_max_iter", type=int, default=200)
     ap.add_argument("--head_tol", type=float, default=1e-4)
@@ -155,8 +162,10 @@ def load_data(args, device):
                 tr=tr, va=va, te=te)
 
 
-def reference_check(args, d, rows, stage_a, out):
-    """Real-data check against the F-CM reference on a few concepts (Stage A)."""
+def reference_check(args, d, rows, stage_a, lr, out):
+    """Real-data check against the F-CM reference on a few concepts (Stage A).
+    Only meaningful for the faithful configuration (the reference has no bias,
+    weighting or standardization)."""
     import numpy as np
     from selftest import load_reference
     ref = load_reference(args.fcm_repo)
@@ -169,11 +178,67 @@ def reference_check(args, d, rows, stage_a, out):
     for j in pick.tolist():
         y = np.where(tr._annotation_cache[rows, j].numpy(), 1.0, -1.0).astype(np.float32)
         w_ref = ref._train_single_cav([(h, y, h.shape[0])], h.shape[1], args.svm_rounds, 1,
-                                      args.svm_lr, args.svm_l2).w
+                                      lr, args.svm_l2).w
         w = stage_a["W"][j].cpu().numpy()
         res[d["concepts"][j]] = float(np.abs(w - w_ref).max() / max(np.abs(w_ref).max(), 1e-12))
         print(f"[reference check] {d['concepts'][j]!r}: max rel |w - w_ref| = {res[d['concepts'][j]]:.2e}")
     out["reference_check_stage_a"] = res
+
+
+def proj(feats, stage_a, args, rows=None):
+    return core.project(feats, stage_a["W"], rows=rows, chunk=args.chunk,
+                        b=stage_a["b"], stats=stage_a["stats"])
+
+
+def eval_partition(p, ci, vi, stage_a, d, args, z_val, y_val, z_test, y_test):
+    """Fit one private head per client and score it four ways: its own train
+    and val split, the full (global) val set, the global test set, and its own
+    class-matched test split."""
+    tr, va, te = d["tr"], d["va"], d["te"]
+    heads, rec, train_labels = [], {"clients": []}, []
+    for m in range(args.num_clients):
+        idx = torch.as_tensor(ci[m], dtype=torch.long)
+        y = tr._target_cache[idx]
+        train_labels.append(y)
+        z = proj(tr._feature_cache, stage_a, args, rows=idx)
+        th = time.time()
+        head = core.fit_head(z, y, C=args.head_C, max_iter=max(50, args.head_max_iter), tol=args.head_tol)
+        vidx = torch.as_tensor(vi[m], dtype=torch.long)
+        zv = proj(va._feature_cache, stage_a, args, rows=vidx)
+        rec["clients"].append({
+            "n_train": int(idx.numel()), "n_classes_held": int(torch.unique(y).numel()),
+            "train_acc": core.accuracy(head, z, y),
+            "val_acc": core.accuracy(head, zv, va._target_cache[vidx]),
+            "global_val_acc": core.accuracy(head, z_val, y_val),
+            "global_test_acc": core.accuracy(head, z_test, y_test),
+            "head_fit_seconds": round(time.time() - th, 1)})
+        heads.append(head)
+        del z, zv
+        torch.cuda.empty_cache()
+        print(f"[{p}] client {m}: {rec['clients'][-1]}", flush=True)
+
+    mean = lambda k: sum(c[k] for c in rec["clients"]) / len(rec["clients"])
+    # Reference protocol: every head on the one global test set, mean over clients.
+    rec["global_test_mean_client_acc"] = mean("global_test_acc")
+    rec["global_val_mean_client_acc"] = mean("global_val_acc")
+    # Personalized protocol: each head on its own class-matched test split.
+    split = core.personalized_test_split(te._target_cache, train_labels, len(d["classes"]), seed=args.seed)
+    correct, total, per = 0, 0, []
+    for m, ix in enumerate(split):
+        ix = ix.to(z_test.device)
+        a = core.accuracy(heads[m], z_test[ix], y_test[ix]) if ix.numel() else float("nan")
+        per.append(a)
+        rec["clients"][m]["personal_test_acc"] = a
+        rec["clients"][m]["n_personal_test"] = int(ix.numel())
+        if ix.numel():
+            correct += a * ix.numel()
+            total += ix.numel()
+    rec["personalized_test_acc_weighted"] = correct / max(total, 1)
+    rec["personalized_test_acc_macro"] = sum(x for x in per if x == x) / max(sum(x == x for x in per), 1)
+    print(f"[{p}] global-test mean client acc {rec['global_test_mean_client_acc']:.4f}  "
+          f"personalized acc {rec['personalized_test_acc_weighted']:.4f}  "
+          f"(global-val {rec['global_val_mean_client_acc']:.4f})", flush=True)
+    return rec
 
 
 def main():
@@ -181,20 +246,23 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = False  # keep Stage A in true fp32, like the reference
     tag = datetime.datetime.now().strftime("%b%d-%H:%M").lower()
-    save_dir = os.path.join(args.save_dir, f"fedcbm-reimpl-{args.dataset}-s{args.seed}-{tag}")
+    save_dir = os.path.join(args.save_dir, f"fedcbm-{args.variant_name}-{args.dataset}-s{args.seed}-{tag}")
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, "args.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
     t0 = time.time()
+    faithful = not (args.svm_balanced or args.svm_bias or "yes" in args.svm_standardize)
 
     d = load_data(args, device)
     tr, va, te = d["tr"], d["va"], d["te"]
-    num_classes = len(d["classes"])
     out = {"dataset": args.dataset, "seed": args.seed, "num_clients": args.num_clients,
-           "num_concepts": len(d["concepts"]), "num_classes": num_classes,
-           "method": "FedCBM (Yang & Long 2023), F-CM reference reimplementation, torch port",
+           "num_concepts": len(d["concepts"]), "num_classes": len(d["classes"]),
+           "variant": args.variant_name, "faithful_to_reference": faithful,
+           "method": "FedCBM (Yang & Long 2023), F-CM reference reimplementation, torch port"
+                     + ("" if faithful else "; stronger variant (see fedcbm block)"),
            "fedcbm": {k: getattr(args, k) for k in
-                      ("svm_rounds", "svm_lr", "svm_l2", "head_C", "head_max_iter", "head_tol")},
+                      ("svm_rounds", "svm_lr", "svm_l2", "svm_balanced", "svm_bias", "svm_standardize",
+                       "head_C", "head_max_iter", "head_tol")},
            "partitions": {}}
 
     # ── client partitions (same call and seed as train_vlg.py) ────────────────
@@ -216,7 +284,6 @@ def main():
     assert all(torch.equal(helds[0], h) for h in helds), "partitions hold different rows"
     rows = None if helds[0].numel() == len(d["train_ds"]) else helds[0]
 
-    # ── Stage A: federated concept bank ───────────────────────────────────────
     feats, conc = tr._feature_cache, tr._annotation_cache
     need = feats.numel() * feats.element_size() + conc.numel() * conc.element_size()
     resident = args.resident == "yes" or (
@@ -226,72 +293,70 @@ def main():
         feats, conc = feats.to(device), conc.to(device)
     print(f"[Stage A] N={feats.shape[0] if rows is None else rows.numel()} D={feats.shape[1]} "
           f"C={conc.shape[1]}  resident_on_gpu={resident} ({need / 1024**3:.1f} GiB)")
-    t = time.time()
-    stage_a = core.train_cav_bank(feats, conc, rows=rows, rounds=args.svm_rounds, lr=args.svm_lr,
-                                  l2=args.svm_l2, device=str(device), chunk=args.chunk)
+    stats = core.feature_stats(tr._feature_cache, rows) if "yes" in args.svm_standardize else None
+
+    # ── Stage A grid, chosen on validation ────────────────────────────────────
+    # Selection: mean over clients of each head's accuracy on the full val set,
+    # on the IID partition (where the global and per-client tasks coincide).
+    # Only that partition's heads are fit per configuration; the others are fit
+    # once, for the winner. One configuration = no selection (faithful default).
+    sel_part = "iid" if "iid" in parts else next(iter(parts))
+    y_val, y_test = va._target_cache.to(device), te._target_cache.to(device)
+    grid, best = [], None
+    for std in args.svm_standardize:
+        for lr in args.svm_lr:
+            cfg = {"lr": lr, "standardize": std == "yes"}
+            t = time.time()
+            stage_a = core.train_cav_bank(feats, conc, rows=rows, rounds=args.svm_rounds, lr=lr,
+                                          l2=args.svm_l2, device=str(device), chunk=args.chunk,
+                                          balanced=args.svm_balanced, bias=args.svm_bias,
+                                          stats=stats if cfg["standardize"] else None)
+            t = _step(f"Stage A {cfg}", t)
+            z_val = proj(va._feature_cache, stage_a, args)
+            z_test = proj(te._feature_cache, stage_a, args)
+            cval = core.concept_accuracy(z_val, va._annotation_cache, stage_a["trainable"], chunk=args.chunk)
+            ci, vi, _ = parts[sel_part]
+            rec = eval_partition(sel_part, ci, vi, stage_a, d, args, z_val, y_val, z_test, y_test)
+            entry = {**cfg, "selection_partition": sel_part,
+                     "global_val_mean_client_acc": rec["global_val_mean_client_acc"],
+                     "concept_balanced_accuracy_val": cval["concept_balanced_accuracy_mean"],
+                     "stage_a": {k: stage_a[k] for k in ("final_objective_mean", "final_hinge_mean",
+                                                         "final_active_fraction_mean")}}
+            grid.append(entry)
+            print(f"[grid] {entry}", flush=True)
+            if best is None or rec["global_val_mean_client_acc"] > best[0]:
+                best = (rec["global_val_mean_client_acc"], cfg, stage_a, rec, z_val, z_test)
+            else:
+                del stage_a, z_val, z_test
+            torch.cuda.empty_cache()
     del feats, conc
     torch.cuda.empty_cache()
-    t = _step("Stage A", t)
-    W = stage_a["W"]
+    _, cfg, stage_a, rec, z_val, z_test = best
+    out["selected"] = cfg
+    out["grid"] = grid
+    print(f"[grid] selected {cfg}", flush=True)
+
     out["stage_a"] = {k: stage_a[k] for k in ("final_objective_mean", "final_hinge_mean",
                                               "final_active_fraction_mean", "history")}
     out["stage_a"]["trained_concepts"] = int(stage_a["trainable"].sum())
-    torch.save({"W": W.cpu().half(), "concepts": d["concepts"], "trainable": stage_a["trainable"]},
-               os.path.join(save_dir, "cav_bank.pt"))
+    torch.save({"W": stage_a["W"].cpu().half(),
+                "b": None if stage_a["b"] is None else stage_a["b"].cpu(),
+                "stats": stage_a["stats"], "concepts": d["concepts"], "trainable": stage_a["trainable"],
+                "selected": cfg}, os.path.join(save_dir, "cav_bank.pt"))
     if args.fcm_repo and args.reference_check_concepts > 0:
-        reference_check(args, d, rows if rows is not None else torch.arange(len(d["train_ds"])),
-                        stage_a, out)
-
-    z_test = core.project(te._feature_cache, W, chunk=args.chunk)
-    y_test = te._target_cache.to(z_test.device)
+        if faithful:
+            reference_check(args, d, rows if rows is not None else torch.arange(len(d["train_ds"])),
+                            stage_a, cfg["lr"], out)
+        else:
+            print("[reference check] skipped: the stronger variant has no reference counterpart")
     out["concept_metrics_test"] = core.concept_accuracy(z_test, te._annotation_cache,
                                                         stage_a["trainable"], chunk=args.chunk)
     print(f"[concepts] test {out['concept_metrics_test']}")
 
-    # ── Stage B: one private head per client, per partition ──────────────────
+    # ── Stage B for every partition (the selection partition is already done) ─
     for p, (ci, vi, _) in parts.items():
-        heads, rec = [], {"clients": []}
-        train_labels = []
-        for m in range(args.num_clients):
-            idx = torch.as_tensor(ci[m], dtype=torch.long)
-            y = tr._target_cache[idx]
-            train_labels.append(y)
-            z = core.project(tr._feature_cache, W, rows=idx, chunk=args.chunk)
-            th = time.time()
-            head = core.fit_head(z, y, C=args.head_C, max_iter=max(50, args.head_max_iter),
-                                 tol=args.head_tol)
-            vidx = torch.as_tensor(vi[m], dtype=torch.long)
-            zv = core.project(va._feature_cache, W, rows=vidx, chunk=args.chunk)
-            rec["clients"].append({
-                "n_train": int(idx.numel()), "n_classes_held": int(torch.unique(y).numel()),
-                "train_acc": core.accuracy(head, z, y), "val_acc": core.accuracy(head, zv, va._target_cache[vidx]),
-                "global_test_acc": core.accuracy(head, z_test, y_test),
-                "head_fit_seconds": round(time.time() - th, 1)})
-            heads.append(head)
-            del z, zv
-            torch.cuda.empty_cache()
-            print(f"[{p}] client {m}: {rec['clients'][-1]}", flush=True)
-
-        # Reference protocol: every head on the one global test set, mean over clients.
-        g = [c["global_test_acc"] for c in rec["clients"]]
-        rec["global_test_mean_client_acc"] = sum(g) / len(g)
-        # Personalized protocol: each head on its own class-matched test split.
-        split = core.personalized_test_split(te._target_cache, train_labels, num_classes, seed=args.seed)
-        correct, total, per = 0, 0, []
-        for m, ix in enumerate(split):
-            ix = ix.to(z_test.device)
-            a = core.accuracy(heads[m], z_test[ix], y_test[ix]) if ix.numel() else float("nan")
-            per.append(a)
-            rec["clients"][m]["personal_test_acc"] = a
-            rec["clients"][m]["n_personal_test"] = int(ix.numel())
-            if ix.numel():
-                correct += a * ix.numel()
-                total += ix.numel()
-        rec["personalized_test_acc_weighted"] = correct / max(total, 1)
-        rec["personalized_test_acc_macro"] = sum(x for x in per if x == x) / max(sum(x == x for x in per), 1)
-        out["partitions"][p] = rec
-        print(f"[{p}] global-test mean client acc {rec['global_test_mean_client_acc']:.4f}  "
-              f"personalized acc {rec['personalized_test_acc_weighted']:.4f}", flush=True)
+        out["partitions"][p] = rec if p == sel_part else eval_partition(
+            p, ci, vi, stage_a, d, args, z_val, y_val, z_test, y_test)
 
     out["total_seconds"] = round(time.time() - t0, 1)
     with open(os.path.join(save_dir, "metrics.json"), "w") as f:

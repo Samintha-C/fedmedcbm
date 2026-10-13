@@ -10,8 +10,16 @@ and stops if it fails. CIFAR-10, CIFAR-100 and CUB also compare Stage A on 8
 real concepts against the reference; Places365 and ImageNet skip that (the
 reference's numpy loop is too slow at their size).
 
+Two variants:
+  faithful  the reference as published (F-CM's defaults).
+  strong    our stronger FedCBM for labels as imbalanced as ours: balanced hinge
+            + per-concept bias, with standardization and step size {0.01, 0.1}
+            chosen on validation (mean client head accuracy on the full val set,
+            IID partition). See core.train_cav_bank.
+
 Usage:
-    python baselines/fedcbm_reimpl/naut/gen_jobs.py > baselines/fedcbm_reimpl/naut/fedcbm-reimpl.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py faithful > baselines/fedcbm_reimpl/naut/fedcbm-reimpl.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py strong   > baselines/fedcbm_reimpl/naut/fedcbm-strong.yaml
 """
 
 import os
@@ -26,6 +34,15 @@ SEEDS = [42, 31, 7]
 FCM_COMMIT = "31cbb14"
 LFC_COMMIT = "fa2869d"
 REF_CHECK = {"cifar10": 8, "cifar100": 8, "cub": 8, "places365": 0, "imagenet": 0}
+VARIANTS = {
+    "faithful": dict(job="fedcbm-reimpl", out="FEDCBM_REIMPL", flags="", refcheck=True),
+    "strong": dict(job="fedcbm-strong", out="FEDCBM_STRONG", refcheck=False,
+                   flags="--svm_balanced --svm_bias --svm_standardize no yes "
+                         "--svm_lr 0.01 0.1 --variant_name strong"),
+}
+# torchvision downloads CIFAR from Toronto at ~80 KB/s (35 min each). Keep one
+# copy on the PVC and seed the pod's cache from it; the first job populates it.
+CIFAR_CACHE = "/sc-rwx-vol/fedmedcbm/datasets/torchvision_cifar"
 
 
 def pick(flag, s):
@@ -50,11 +67,11 @@ JOB = """---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fedcbm-reimpl-{ds}
+  name: {job}-{ds}
   namespace: wenglab-interpretable-ai
   labels:
     experiment: fed-lfc-cbm
-    task: fedcbm-reimpl
+    task: {job}
     dataset: {ds}
 spec:
   ttlSecondsAfterFinished: 86400
@@ -94,9 +111,10 @@ spec:
               if [ $RC -ne 0 ]; then echo "ERROR: selftest failed, not running"; exit 1; fi
 
               DS={ds}
-              OUT=/sc-rwx-vol/fedmedcbm/models/FEDCBM_REIMPL/$DS
+              OUT=/sc-rwx-vol/fedmedcbm/models/{out}/$DS
               mkdir -p $OUT
               {data}
+              {cifar_in}
               CHK="{check}"
               if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
                 echo "ERROR: raw images not reachable at $CHK"; exit 1
@@ -116,12 +134,13 @@ spec:
                   --partitions iid dirichlet \\
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \\
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \\
-                  --save_dir "$SAVE" --device cuda {refcheck}
+                  --save_dir "$SAVE" --device cuda {flags}{refcheck}
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
                 mkdir -p "$D" && cp -r "$MD" "$D/"
                 echo "[ok] -> $D"
+                {cifar_out}
               done
 
               echo ""
@@ -170,13 +189,23 @@ spec:
 
 
 def main():
-    out = [HEADER]
+    variant = sys.argv[1] if len(sys.argv) > 1 else "faithful"
+    v = VARIANTS[variant]
+    out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n# One Job per dataset;")
+           .replace("FEDCBM_REIMPL", v["out"])]
     for ds, cfg in CFG.items():
-        k = REF_CHECK[ds]
+        k = REF_CHECK[ds] if v["refcheck"] else 0
+        cifar = ds.startswith("cifar")
+        cifar_in = (f'mkdir -p /root/.cache {CIFAR_CACHE} && cp -rn {CIFAR_CACHE}/. /root/.cache/ 2>/dev/null || true'
+                    if cifar else ": # not CIFAR")
+        cifar_out = (f'cp -rn /root/.cache/cifar-* {CIFAR_CACHE}/ 2>/dev/null || true'
+                     if cifar else ": # not CIFAR")
         refcheck = (f"\\\n                  --fcm_repo $WORKSPACE/F-CMs --reference_check_concepts {k}"
                     if k else "")
         out.append(JOB.format(
-            ds=ds, lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
+            ds=ds, job=v["job"], out=v["out"], flags=v["flags"],
+            cifar_in=cifar_in, cifar_out=cifar_out,
+            lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
             val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
             data=cfg["data"] or ": # no dataset setup needed", check=cfg["check"],
             seeds=" ".join(map(str, SEEDS)), nseeds=len(SEEDS), refcheck=refcheck,

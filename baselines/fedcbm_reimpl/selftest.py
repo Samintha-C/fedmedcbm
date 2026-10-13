@@ -158,8 +158,43 @@ def main():
               f"  (ref heads re-fit here: {np.mean(ref_accs):.4f})")
         print(f"  -> {'PASS' if c_ok and b_ok else 'FAIL'}")
 
+    ok &= variant_check()
     print("ALL PASS" if ok else "SOME CHECKS FAILED")
     sys.exit(0 if ok else 1)
+
+
+def variant_check(seed: int = 0) -> bool:
+    """The stronger variant must fix the failure the reference shows on our
+    data. Synthetic data shaped like ours: non-negative pooled features with a
+    large shared mean, concepts 1-6% positive. The bias-free reference then
+    scores every image 'absent' (balanced accuracy ~0.5); balanced + bias +
+    standardize should not."""
+    rng = np.random.default_rng(seed)
+    n, d, c = 4000, 64, 10
+    a = rng.normal(size=(d, c))
+    rates = np.linspace(0.01, 0.06, c)
+
+    def sample(m, cut=None):
+        h = np.maximum(1.5 + rng.normal(size=(m, d)), 0.0).astype(np.float32)
+        logit = (h - 1.5) @ a
+        if cut is None:  # each concept's own positive rate
+            cut = np.array([np.quantile(logit[:, j], 1 - rates[j]) for j in range(c)])
+        return h, (logit > cut).astype(np.float32), cut
+
+    h, cc, cut = sample(n)
+    ht, ct, _ = sample(2000, cut)
+    feats, conc = torch.from_numpy(h), torch.from_numpy(cc)
+    res = {}
+    for name, kw in (("reference", {}),
+                     ("variant", {"balanced": True, "bias": True, "stats": core.feature_stats(feats)})):
+        out = core.train_cav_bank(feats, conc, rounds=200, lr=0.01, l2=1e-4, device="cpu",
+                                  chunk=1000, log_every=0, **kw)
+        z = core.project(torch.from_numpy(ht), out["W"], b=out["b"], stats=out["stats"])
+        res[name] = core.concept_accuracy(z, torch.from_numpy(ct), out["trainable"])["concept_balanced_accuracy_mean"]
+    good = res["reference"] < 0.6 and res["variant"] > 0.8
+    print(f"variant check (synthetic, 1-6% positives): concept balanced accuracy "
+          f"reference {res['reference']:.3f}, variant {res['variant']:.3f} -> {'PASS' if good else 'FAIL'}")
+    return good
 
 
 if __name__ == "__main__":

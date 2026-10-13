@@ -73,6 +73,9 @@ def train_cav_bank(
     chunk: int = 32768,
     log_every: int = 50,
     log: Callable[[str], None] = print,
+    balanced: bool = False,
+    bias: bool = False,
+    stats: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, object]:
     """Stage A on every training row the clients hold.
 
@@ -81,6 +84,18 @@ def train_cav_bank(
     reference sums the per-client subgradients and divides by the total count,
     which equals one pass over the union of the clients' rows, so the client
     split does not enter Stage A at all.
+
+    Defaults reproduce the reference exactly. The three options below are our
+    STRONGER variant, for labels as imbalanced as ours (~1-6% positive), where
+    the bias-free reference collapses to scoring every image "absent":
+      balanced  weight each concept's positives by n / (2 n_pos) and negatives by
+                n / (2 n_neg) (sklearn's class_weight="balanced"), as training a
+                CAV on equal-sized concept and random sets does. Needs each
+                concept's global positive count: one C-vector per client.
+      bias      an unregularized intercept per concept, as in the original
+                CAV / linear-SVM recipe (the reference drops it).
+      stats     {"mean", "std"} from feature_stats(): standardize features first,
+                with statistics aggregated from per-client sums.
     """
     if rows is not None:
         feats, concepts = feats[rows], concepts[rows]
@@ -94,29 +109,50 @@ def train_cav_bank(
     mask = trainable.to(device, torch.float32).unsqueeze(1)
 
     w = torch.zeros(c, d, dtype=torch.float32, device=device)
+    b = torch.zeros(c, dtype=torch.float32, device=device)
     history: List[Dict[str, float]] = []
+    mu = sd = None
+    if stats is not None:
+        mu, sd = stats["mean"].to(device), stats["std"].to(device)
+    if balanced:
+        posf = pos.to(device, torch.float32)
+        w_pos = torch.where(posf > 0, n / (2.0 * posf.clamp(min=1)), torch.zeros_like(posf))
+        w_neg = torch.where(posf < n, n / (2.0 * (n - posf).clamp(min=1)), torch.zeros_like(posf))
 
-    def one_pass(w_cur: torch.Tensor, want_grad: bool):
+    def one_pass(w_cur: torch.Tensor, b_cur: torch.Tensor, want_grad: bool):
         g = torch.zeros_like(w_cur) if want_grad else None
+        gb = torch.zeros_like(b_cur) if want_grad else None
         hinge = torch.zeros(c, dtype=torch.float64, device=device)
         active = torch.zeros(c, dtype=torch.float64, device=device)
         for s, e in _rows(n, chunk):
             x = feats[s:e].to(device, non_blocking=True).float()
+            if mu is not None:
+                x = (x - mu) / sd
             # Out of place: when concepts are already float on `device`, .to()/.float()
             # return the SAME storage, and an in-place mul_/sub_ would overwrite the
             # labels every round (caught by selftest on CPU).
             y = concepts[s:e].to(device, dtype=torch.float32, non_blocking=True) * 2.0 - 1.0
-            margin = y * (x @ w_cur.T)
+            score = x @ w_cur.T
+            if bias:
+                score = score + b_cur
+            margin = y * score
             act = margin < 1.0
             hinge += torch.clamp(1.0 - margin, min=0.0).sum(dim=0, dtype=torch.float64)
             active += act.sum(dim=0, dtype=torch.float64)
             if want_grad:
-                g.addmm_((-(y * act)).T, x)
-        return g, hinge / n, active / n
+                coef = -(y * act)
+                if balanced:
+                    coef = coef * torch.where(y > 0, w_pos, w_neg)
+                g.addmm_(coef.T, x)
+                if bias:
+                    gb += coef.sum(dim=0)
+        return g, gb, hinge / n, active / n
 
     for r in range(1, rounds + 1):
-        g, hinge, _ = one_pass(w, want_grad=True)
+        g, gb, hinge, _ = one_pass(w, b, want_grad=True)
         w = (w - lr * (g / n + l2 * w)) * mask
+        if bias:
+            b = (b - lr * (gb / n)) * mask.squeeze(1)
         if log_every and (r == 1 or r == rounds or r % log_every == 0):
             # hinge here is at the PRE-update w of round r (one pass per round).
             t = trainable.to(device)
@@ -125,11 +161,13 @@ def train_cav_bank(
                 f"{hinge[t].mean().item():.5f}  mean ||w||^2*l2 {reg[t].mean().item():.3e}")
             history.append({"round": r, "mean_hinge_pre_step": float(hinge[t].mean())})
 
-    _, hinge, active = one_pass(w, want_grad=False)
+    _, _, hinge, active = one_pass(w, b, want_grad=False)
     t = trainable.to(device)
     obj = hinge + l2 * (w * w).sum(dim=1).double()
     return {
         "W": w,
+        "b": b if bias else None,
+        "stats": stats,
         "trainable": trainable,
         "pos_counts": pos,
         "final_objective_mean": float(obj[t].mean()),
@@ -140,19 +178,51 @@ def train_cav_bank(
 
 
 @torch.no_grad()
+def feature_stats(feats: torch.Tensor, rows: Optional[torch.Tensor] = None,
+                  chunk: int = 65536) -> Dict[str, torch.Tensor]:
+    """Mean and std over the clients' rows, from summed per-row statistics
+    (what clients would send as sum / sum of squares). Same formula as our
+    Phase-2 normalization: std = sqrt(max(E[x^2] - E[x]^2, 1e-8))."""
+    n = feats.shape[0] if rows is None else rows.numel()
+    s1 = torch.zeros(feats.shape[1], dtype=torch.float64)
+    s2 = torch.zeros(feats.shape[1], dtype=torch.float64)
+    for s, e in _rows(n, chunk):
+        x = (feats[s:e] if rows is None else feats[rows[s:e]]).double().cpu()
+        s1 += x.sum(dim=0)
+        s2 += (x * x).sum(dim=0)
+    mean = s1 / n
+    std = (s2 / n - mean * mean).clamp(min=1e-8).sqrt()
+    return {"mean": mean.float(), "std": std.float()}
+
+
+@torch.no_grad()
 def project(feats: torch.Tensor, w: torch.Tensor, rows: Optional[torch.Tensor] = None,
-            chunk: int = 32768, out_device: Optional[str] = None) -> torch.Tensor:
-    """z = h W^T / ||w||^2 per concept; a zero-norm row divides by 1 (reference)."""
+            chunk: int = 32768, out_device: Optional[str] = None,
+            b: Optional[torch.Tensor] = None,
+            stats: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+    """z = (h W^T + b) / ||w||^2 per concept; a zero-norm row divides by 1
+    (reference). b and stats are only set by the stronger variant; with them
+    unset this is exactly the reference projection. The sign of z is the
+    concept prediction; a per-concept offset in z is absorbed by the heads'
+    class intercepts, so it does not change what a head can fit."""
     device = w.device
     out_device = out_device or str(device)
     norms = (w * w).sum(dim=1)
     denom = torch.where(norms > 1e-12, norms, torch.ones_like(norms))
+    mu = sd = None
+    if stats is not None:
+        mu, sd = stats["mean"].to(device), stats["std"].to(device)
     idx = rows if rows is not None else None
     n = feats.shape[0] if idx is None else idx.shape[0]
     out = torch.empty(n, w.shape[0], dtype=torch.float32, device=out_device)
     for s, e in _rows(n, chunk):
-        x = feats[s:e] if idx is None else feats[idx[s:e]]
-        out[s:e] = ((x.to(device).float() @ w.T) / denom).to(out_device)
+        x = (feats[s:e] if idx is None else feats[idx[s:e]]).to(device).float()
+        if mu is not None:
+            x = (x - mu) / sd
+        score = x @ w.T
+        if b is not None:
+            score = score + b
+        out[s:e] = (score / denom).to(out_device)
     return out
 
 
