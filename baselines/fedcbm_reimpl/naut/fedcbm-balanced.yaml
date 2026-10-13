@@ -126,8 +126,18 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
+                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads)
                       - NVIDIA-GeForce-RTX-3090
                       - NVIDIA-A10
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-L4
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
                       - NVIDIA-A40
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
@@ -248,8 +258,18 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
+                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads)
                       - NVIDIA-GeForce-RTX-3090
                       - NVIDIA-A10
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-L4
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
                       - NVIDIA-A40
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
@@ -370,8 +390,18 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
+                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads)
                       - NVIDIA-GeForce-RTX-3090
                       - NVIDIA-A10
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-L4
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
                       - NVIDIA-A40
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
@@ -492,8 +522,18 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
+                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads)
                       - NVIDIA-GeForce-RTX-3090
                       - NVIDIA-A10
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-L4
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
                       - NVIDIA-A40
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
@@ -614,8 +654,18 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
+                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads)
                       - NVIDIA-GeForce-RTX-3090
                       - NVIDIA-A10
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-L4
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
                       - NVIDIA-A40
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
