@@ -20,6 +20,7 @@ Two variants:
 Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py faithful > baselines/fedcbm_reimpl/naut/fedcbm-reimpl.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py strong   > baselines/fedcbm_reimpl/naut/fedcbm-strong.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py personal > baselines/fedcbm_reimpl/naut/ours-personal.yaml
 """
 
 import os
@@ -28,9 +29,11 @@ import sys
 
 _FED = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.join(_FED, "naut"))
-from gen_seed_main import CFG  # noqa: E402
+from gen_seed_main import CFG, LAMS  # noqa: E402
+from gen_seed_main import SEEDS as SEED_MAIN_SEEDS  # noqa: E402
 
 SEEDS = [42, 31, 7]
+MODELS = "/sc-rwx-vol/fedmedcbm/models"
 FCM_COMMIT = "31cbb14"
 LFC_COMMIT = "fa2869d"
 REF_CHECK = {"cifar10": 8, "cifar100": 8, "cub": 8, "places365": 0, "imagenet": 0}
@@ -44,6 +47,13 @@ VARIANTS = {
     "nec": dict(job="fedcbm-nec", out="FEDCBM_NEC", refcheck=False, script="nec.py",
                 flags="--bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_STRONG/$DS "
                       "--nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0"),
+    # Ours with private per-client heads (ours_personal.py): our federated CBL from
+    # the tab:main run of each (seed, partition), then nec.py's heads. $RUNS is set
+    # per seed by run_dirs() below.
+    "personal": dict(job="ours-personal", out="OURS_PERSONAL", refcheck=False, script="ours_personal.py",
+                     flags="--runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0",
+                     note="# Ours, personalized: our federated CBL + private sparse heads per client\n"
+                          "# (ours_personal.py), the counterpart of the nec variant.\n"),
 }
 # torchvision downloads CIFAR from Toronto at ~80 KB/s (35 min each). Keep one
 # copy on the PVC and seed the pod's cache from it; the first job populates it.
@@ -53,6 +63,24 @@ CIFAR_CACHE = "/sc-rwx-vol/fedmedcbm/datasets/torchvision_cifar"
 def pick(flag, s):
     m = re.search(rf"--{flag}\s+(\S+)", s)
     return m.group(1) if m else None
+
+
+def run_dirs(ds):
+    """Shell `case` setting $RUNS to the tab:main run of each (seed, partition):
+    the base seed's NEC~50 run is in dlamsweep[_iid]/lam<lambda>, the two seeds
+    added by gen_seed_main.py are in SEED_MAIN/<ds>/<part>_s<seed>_nec50."""
+    base = (set(SEEDS) - set(SEED_MAIN_SEEDS[ds])).pop()
+    lines = ["", "case $SEED in"]
+    for seed in SEEDS:
+        if seed == base:
+            iid = f"{MODELS}/{ds}/dlamsweep_iid/lam{LAMS[ds]['iid'][50]}"
+            dr = f"{MODELS}/{ds}/dlamsweep/lam{LAMS[ds]['dirichlet'][50]}"
+        else:
+            iid = f"{MODELS}/SEED_MAIN/{ds}/iid_s{seed}_nec50"
+            dr = f"{MODELS}/SEED_MAIN/{ds}/dir_s{seed}_nec50"
+        lines.append(f'  {seed}) RUNS="iid={iid} dirichlet={dr}" ;;')
+    lines.append("esac")
+    return "\n                ".join(lines)
 
 
 HEADER = """# FedCBM (Yang & Long 2023) on our data and protocol: the F-CM authors'
@@ -132,7 +160,7 @@ spec:
                 fi
                 echo ""
                 echo "############ FedCBM reimpl | $DS | seed $SEED ############"
-                SAVE=$WORKSPACE/out_s$SEED
+                SAVE=$WORKSPACE/out_s$SEED{runs}
                 set +e
                 python baselines/fedcbm_reimpl/{script} --dataset $DS --concept_file {concepts} {bb} \\
                   --val_split {val_split} --num_workers {workers} --seed $SEED --num_clients 5 --alpha 0.5 \\
@@ -196,7 +224,7 @@ spec:
 def main():
     variant = sys.argv[1] if len(sys.argv) > 1 else "faithful"
     v = VARIANTS[variant]
-    out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n# One Job per dataset;")
+    out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n{v.get('note', '')}# One Job per dataset;")
            .replace("FEDCBM_REIMPL", v["out"])]
     for ds, cfg in CFG.items():
         k = REF_CHECK[ds] if v["refcheck"] else 0
@@ -209,6 +237,7 @@ def main():
                     if k else "")
         out.append(JOB.format(
             ds=ds, job=v["job"], out=v["out"], flags=v["flags"], script=v.get("script", "run.py"),
+            runs=run_dirs(ds) if variant == "personal" else "",
             cifar_in=cifar_in, cifar_out=cifar_out,
             lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
             val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),

@@ -19,6 +19,13 @@ def main(root):
     if not runs:
         print(f"no metrics.json under {root}")
         return
+    nec_runs = [m for m in runs if "sparse" in m]
+    runs = [m for m in runs if "partitions" in m]
+    for m in nec_runs:  # nec.py output: sparse heads per NEC target + dense C grid
+        for t, by_p in m["sparse"].items():
+            print(f"  {m['dataset']} s{m['seed']} NEC {float(t):g}: " + "   ".join(
+                f"{p}: {100 * r['global_test_mean_client_acc']:.2f} | {100 * r['personalized_test_acc_weighted']:.2f} "
+                f"(achieved {r['nec_mean_over_clients']:.1f}, union {r['union_nec']:.1f})" for p, r in by_p.items()))
     agg = {}
     for m in runs:
         cells = []
