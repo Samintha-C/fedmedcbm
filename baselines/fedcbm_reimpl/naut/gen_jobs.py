@@ -69,6 +69,12 @@ VARIANTS = {
     "head-posaware": dict(job="ours-head-posaware", out="OURS_HEAD_POSAWARE", refcheck=False,
                           script="ours_head.py", cpu_small=True, flags="--runs $RUNS",
                           note="# Ours, improved head, on the posaware concept layers (SEED_POSAWARE).\n"),
+    # Diagnosis of the ImageNet NEC5 drop (2026-10-15): own vs per-class support, 20 vs 100
+    # refit rounds, lam fixed at x1.0. Seed 42 only; apply the imagenet job alone.
+    "head-diag": dict(job="ours-head-diag", out="OURS_HEAD_DIAG", refcheck=False, script="ours_head.py",
+                      cpu_small=True, seeds=[42],
+                      flags="--runs $RUNS --lam_mults 1.0 --refit_rounds 20 100 --supports perclass own",
+                      note="# Diagnosis: own vs per-class support, refit 20 vs 100 rounds (seed 42).\n"),
 }
 # CUB has no NEC~5 lambda in gen_seed_main.LAMS; these are the CUB_NEC5 bracket's.
 CUB_NEC5_LAMS = {"iid": "0.020", "dirichlet": "0.019"}
@@ -306,12 +312,12 @@ def main():
             ds=ds, job=v["job"], out=v["out"],
             flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
             runs=(run_dirs(ds, posaware=variant == "head-posaware")
-                  if variant in ("personal", "head", "head-posaware") else ""),
+                  if variant in ("personal", "head", "head-posaware", "head-diag") else ""),
             cifar_in=cifar_in, cifar_out=cifar_out,
             lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
             val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
             data=cfg["data"] or ": # no dataset setup needed", check=cfg["check"],
-            seeds=" ".join(map(str, SEEDS)), nseeds=len(SEEDS), refcheck=refcheck,
+            seeds=" ".join(map(str, v.get("seeds", SEEDS))), nseeds=len(v.get("seeds", SEEDS)), refcheck=refcheck,
             cpu=str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), mem=cfg["mem"], dshm=cfg["dshm"])
         out.append(to_cpu(job) if cpu_only else job)
     print("".join(out), end="")

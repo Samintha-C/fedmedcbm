@@ -107,6 +107,11 @@ def main():
     ap.add_argument("--runs", nargs="+", required=True, metavar="PARTITION=DIR")
     ap.add_argument("--lam_targets", nargs="+", required=True, metavar="NEC:LAM",
                     help="per partition: iid.5:0.022 iid.50:0.0013 dirichlet.5:... (or NEC:LAM for both)")
+    ap.add_argument("--lam_mults", type=float, nargs="+", default=[0.6, 1.0, 1.6])
+    ap.add_argument("--refit_rounds", type=int, nargs="+", default=[20],
+                    help="extra refit lengths to report (20 = the method)")
+    ap.add_argument("--supports", nargs="+", choices=["perclass", "own"], default=["perclass"],
+                    help="perclass = top-k by |dual| (the method); own = FedDualAvg's own support")
     ap.add_argument("--check_rows", type=int, default=4096)
     ap.add_argument("--check_tol", type=float, default=1e-2)
     ap.add_argument("--acc_tol", type=float, default=0.005)
@@ -169,7 +174,7 @@ def main():
 
         for target, base in sorted(lam_t[p].items()):
             cands = []
-            for m in (0.6, 1.0, 1.6):
+            for m in args.lam_mults:
                 W, b, zw = feddualavg(z, y, zv, yv, nk, base * m, clients)
                 nec = float((W.abs() > 1e-5).sum()) / nk
                 cands.append((abs(nec - target), m, nec, W, b, zw))
@@ -187,6 +192,16 @@ def main():
                    "logit_adjust": {"per_client": pacc(la),
                                     "global_test_mean": sum(gacc(*h) for h in la) / len(la)},
                    "union_nec": float((Wr * M != 0).sum()) / nk}
+            variants = {}
+            for sup in args.supports:
+                Ms = M if sup == "perclass" else (W.abs() > 1e-5).float()
+                for R in args.refit_rounds:
+                    Wv, bv = (Wr, br) if (sup == "perclass" and R == 20) else refit(W, b, Ms, z, y, nk, clients, rounds=R)
+                    variants[f"{sup}_{R}"] = {"nec": float((Wv * Ms != 0).sum()) / nk, "global_test": gacc(Wv, bv),
+                                              "per_client": pacc([(Wv, bv)] * len(ci))}
+            res["refit_variants"] = variants
+            print(f"[{p}] NEC~{target} refit variants: " + " | ".join(
+                f"{k} {v['global_test']:.2f}@{v['nec']:.1f}" for k, v in variants.items()), flush=True)
             rec["targets"][str(target)] = res
             print(f"[{p}] NEC~{target}: fda {res['fda']['global_test']:.2f}@{nec:.1f} (lam x{m}) | "
                   f"per-class+refit {res['perclass_refit']['global_test']:.2f} (per-client "
