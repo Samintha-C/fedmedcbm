@@ -182,10 +182,9 @@ def main():
             M = torch.zeros_like(zw)
             M.scatter_(1, zw.abs().topk(min(target, zw.shape[1]), dim=1).indices, 1.0)
             Wr, br = refit(W, b, M, z, y, nk, clients)
-            la = []
-            for l in labels:
-                pm = (torch.bincount(l.to(device), minlength=nk).float() + 1) / (len(l) + nk)
-                la.append((Wr, br + pm.log() - prior.log()))
+            shifts = [((torch.bincount(l.to(device), minlength=nk).float() + 1) / (len(l) + nk)).log() - prior.log()
+                      for l in labels]  # per-client logit adjustment: log p_m(y) - log p(y)
+            la = [(Wr, br + sh) for sh in shifts]
             res = {"lam": base * m, "fda": {"nec": nec, "global_test": gacc(W, b)},
                    "perclass_refit": {"nec": float((Wr * M != 0).sum()) / nk, "global_test": gacc(Wr, br),
                                       "per_client": pacc([(Wr, br)] * len(ci))},
@@ -198,10 +197,11 @@ def main():
                 for R in args.refit_rounds:
                     Wv, bv = (Wr, br) if (sup == "perclass" and R == 20) else refit(W, b, Ms, z, y, nk, clients, rounds=R)
                     variants[f"{sup}_{R}"] = {"nec": float((Wv * Ms != 0).sum()) / nk, "global_test": gacc(Wv, bv),
-                                              "per_client": pacc([(Wv, bv)] * len(ci))}
+                                              "per_client": pacc([(Wv, bv)] * len(ci)),
+                                              "logit_adj_per_client": pacc([(Wv, bv + sh) for sh in shifts])}
             res["refit_variants"] = variants
             print(f"[{p}] NEC~{target} refit variants: " + " | ".join(
-                f"{k} {v['global_test']:.2f}@{v['nec']:.1f}" for k, v in variants.items()), flush=True)
+                f"{k} {v['global_test']:.2f}@{v['nec']:.1f} (logit-adj per-client {v['logit_adj_per_client']:.2f})" for k, v in variants.items()), flush=True)
             rec["targets"][str(target)] = res
             print(f"[{p}] NEC~{target}: fda {res['fda']['global_test']:.2f}@{nec:.1f} (lam x{m}) | "
                   f"per-class+refit {res['perclass_refit']['global_test']:.2f} (per-client "
