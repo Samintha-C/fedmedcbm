@@ -47,11 +47,11 @@ LFC_COMMIT = "fa2869d"
 REF_CHECK = {"cifar10": 8, "cifar100": 8, "cub": 8, "places365": 0, "imagenet": 0}
 VARIANTS = {
     "faithful": dict(job="fedcbm-reimpl", out="FEDCBM_REIMPL", flags="", refcheck=True),
-    "balanced": dict(job="fedcbm-balanced", out="FEDCBM_BALANCED", refcheck=False,
+    "balanced": dict(job="fedcbm-balanced", out="FEDCBM_BALANCED", refcheck=False, cpu_small=True,
                      flags="--svm_balanced --variant_name balanced"),
     # Heads on the balanced run's saved concept bank (nec.py). Needs
     # FEDCBM_BALANCED/<ds>/s<seed>: submit per dataset after its balanced job.
-    "nec": dict(job="fedcbm-nec", out="FEDCBM_BALANCED_NEC", refcheck=False, script="nec.py",
+    "nec": dict(job="fedcbm-nec", out="FEDCBM_BALANCED_NEC", refcheck=False, script="nec.py", cpu_small=True,
                 flags="--bank_root /sc-rwx-vol/fedmedcbm/models/FEDCBM_BALANCED/$DS "
                       "--nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0"),
     # Ours with private per-client heads (ours_personal.py): our federated CBL from
@@ -61,10 +61,53 @@ VARIANTS = {
                      flags="--runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0",
                      note="# Ours, personalized: our federated CBL + private sparse heads per client\n"
                           "# (ours_personal.py), the counterpart of the nec variant.\n"),
+    # Our improved head (ours_head.py) on the tab:main runs, and on the --cbl_agg posaware
+    # reruns (naut/gen_seed_main.py posaware -> SEED_POSAWARE; submit after those finish).
+    "head": dict(job="ours-head", out="OURS_HEAD", refcheck=False, script="ours_head.py", cpu_small=True,
+                 flags="--runs $RUNS",
+                 note="# Ours, improved head: FedDualAvg -> per-class budget -> refit, + logit adjustment.\n"),
+    "head-posaware": dict(job="ours-head-posaware", out="OURS_HEAD_POSAWARE", refcheck=False,
+                          script="ours_head.py", cpu_small=True, flags="--runs $RUNS",
+                          note="# Ours, improved head, on the posaware concept layers (SEED_POSAWARE).\n"),
 }
+# CUB has no NEC~5 lambda in gen_seed_main.LAMS; these are the CUB_NEC5 bracket's.
+CUB_NEC5_LAMS = {"iid": "0.020", "dirichlet": "0.019"}
+
+
+def lam_targets(ds):
+    out = []
+    for part in ("iid", "dirichlet"):
+        for nec in (5, 50):
+            lam = LAMS[ds][part][nec] or (CUB_NEC5_LAMS[part] if ds == "cub" and nec == 5 else None)
+            out.append(f"{part}.{nec}:{lam}")
+    return " --lam_targets " + " ".join(out)
 # torchvision downloads CIFAR from Toronto at ~80 KB/s (35 min each). Keep one
 # copy on the PVC and seed the pod's cache from it; the first job populates it.
 CIFAR_CACHE = "/sc-rwx-vol/fedmedcbm/datasets/torchvision_cifar"
+# GPUs on Nautilus are often all taken. These datasets' backbone features are
+# cached on the PVC, so what is left (Stage A, per-client heads) runs on CPU in
+# minutes; variants with cpu_small=True get CPU-only Jobs for them.
+CPU_DATASETS = ("cifar10", "cifar100", "cub")
+CPU_CORES = 8
+
+
+def to_cpu(job):
+    """The same Job without a GPU: no GPU request, no GPU-type affinity,
+    --device cpu, and torch's thread count pinned to the CPU limit (in a
+    container it otherwise sees every host core and oversubscribes)."""
+    def sub(old, new, count):
+        nonlocal job
+        assert job.count(old) == count, f"to_cpu: expected {count}x {old!r}"
+        job = job.replace(old, new)
+    sub('              nvidia.com/gpu: "1"\n', "", 2)
+    sub("--device cuda", "--device cpu", 1)
+    sub("              export PIP_CACHE_DIR=/tmp/pip-cache\n",
+        f"              export OMP_NUM_THREADS={CPU_CORES} MKL_NUM_THREADS={CPU_CORES}\n"
+        "              export PIP_CACHE_DIR=/tmp/pip-cache\n", 1)
+    head, tail = job.split("      affinity:\n", 1)
+    job = head + "      restartPolicy: Never" + tail.split("      restartPolicy: Never", 1)[1]
+    assert "nvidia" not in job, "to_cpu: GPU reference left"
+    return job
 
 
 def pick(flag, s):
@@ -72,14 +115,17 @@ def pick(flag, s):
     return m.group(1) if m else None
 
 
-def run_dirs(ds):
+def run_dirs(ds, posaware=False):
     """Shell `case` setting $RUNS to the tab:main run of each (seed, partition):
     the base seed's NEC~50 run is in dlamsweep[_iid]/lam<lambda>, the two seeds
     added by gen_seed_main.py are in SEED_MAIN/<ds>/<part>_s<seed>_nec50."""
     base = (set(SEEDS) - set(SEED_MAIN_SEEDS[ds])).pop()
     lines = ["", "case $SEED in"]
     for seed in SEEDS:
-        if seed == base:
+        if posaware:
+            iid = f"{MODELS}/SEED_POSAWARE/{ds}/iid_s{seed}_nec50"
+            dr = f"{MODELS}/SEED_POSAWARE/{ds}/dir_s{seed}_nec50"
+        elif seed == base:
             iid = f"{MODELS}/{ds}/dlamsweep_iid/lam{LAMS[ds]['iid'][50]}"
             dr = f"{MODELS}/{ds}/dlamsweep/lam{LAMS[ds]['dirichlet'][50]}"
         else:
@@ -241,9 +287,13 @@ spec:
 def main():
     variant = sys.argv[1] if len(sys.argv) > 1 else "faithful"
     v = VARIANTS[variant]
-    out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n{v.get('note', '')}# One Job per dataset;")
+    note = v.get("note", "")
+    if v.get("cpu_small"):
+        note += f"# {', '.join(CPU_DATASETS)}: CPU only ({CPU_CORES} cores), see CPU_DATASETS in gen_jobs.py.\n"
+    out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n{note}# One Job per dataset;")
            .replace("FEDCBM_REIMPL", v["out"])]
     for ds, cfg in CFG.items():
+        cpu_only = bool(v.get("cpu_small")) and ds in CPU_DATASETS
         k = REF_CHECK[ds] if v["refcheck"] else 0
         cifar = ds.startswith("cifar")
         cifar_in = (f'mkdir -p /root/.cache {CIFAR_CACHE} && cp -rn {CIFAR_CACHE}/. /root/.cache/ 2>/dev/null || true'
@@ -252,15 +302,18 @@ def main():
                      if cifar else ": # not CIFAR")
         refcheck = (f"\\\n                  --fcm_repo $WORKSPACE/F-CMs --reference_check_concepts {k}"
                     if k else "")
-        out.append(JOB.format(
-            ds=ds, job=v["job"], out=v["out"], flags=v["flags"], script=v.get("script", "run.py"),
-            runs=run_dirs(ds) if variant == "personal" else "",
+        job = JOB.format(
+            ds=ds, job=v["job"], out=v["out"],
+            flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
+            runs=(run_dirs(ds, posaware=variant == "head-posaware")
+                  if variant in ("personal", "head", "head-posaware") else ""),
             cifar_in=cifar_in, cifar_out=cifar_out,
             lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
             val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
             data=cfg["data"] or ": # no dataset setup needed", check=cfg["check"],
             seeds=" ".join(map(str, SEEDS)), nseeds=len(SEEDS), refcheck=refcheck,
-            cpu=cfg.get("cpu", "4"), mem=cfg["mem"], dshm=cfg["dshm"]))
+            cpu=str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), mem=cfg["mem"], dshm=cfg["dshm"])
+        out.append(to_cpu(job) if cpu_only else job)
     print("".join(out), end="")
 
 

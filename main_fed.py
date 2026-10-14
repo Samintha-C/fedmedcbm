@@ -109,6 +109,11 @@ def main():
     parser.add_argument("--cbl_auto_weight", action="store_true", help="Automatically weight positive examples by neg/pos ratio per concept (VLG). Matches VLG-CBM --cbl_auto_weight flag.")
     parser.add_argument("--cbl_twoway_tp", type=float, default=4.0, help="TwoWay loss Tp (VLG)")
     parser.add_argument("--cbl_finetune", action="store_true", help="Finetune backbone in CBL (VLG)")
+    parser.add_argument("--cbl_agg", type=str, default="fedavg", choices=["fedavg", "posaware"],
+        help="Phase-1 aggregation of the CBL output layer. fedavg: every row averaged with "
+             "client sample weights (default). posaware: row c averaged with weights "
+             "proportional to each client's positive DINO labels for concept c, so a client "
+             "that never saw concept c does not pull its row toward 'absent'.")
     parser.add_argument("--ortho_lambda", type=float, default=0.0,
         help="Weight orthogonality regularization coefficient for CBL training (VLG). "
              "Penalises aligned concept projection vectors via off-diagonal Gram-matrix loss. "

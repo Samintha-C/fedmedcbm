@@ -171,10 +171,23 @@ def simulate_federated_training_vlg(args):
         global_model.cbl.to(device)
         # backbone stays on CPU; will be moved to device only for final evaluation
 
-        # Uniform client split of pre-extracted train features
-        base = num_train // args.num_clients
-        rem = num_train % args.num_clients
-        client_data_sizes = [base + (1 if i < rem else 0) for i in range(args.num_clients)]
+        # Client split of the pre-extracted train features. The source run saved its
+        # Phase-2 rows client by client (client 0's block first), so its recorded
+        # client_data_sizes recover the true partition. Equal chunks are only a
+        # fallback: under Dirichlet they cut across clients and dilute the skew.
+        client_data_sizes = None
+        _tm_path = os.path.join(load_dir, "training_metrics.json")
+        if os.path.exists(_tm_path):
+            with open(_tm_path) as _f:
+                _sizes = json.load(_f).get("client_data_sizes")
+            if _sizes and len(_sizes) == args.num_clients and sum(_sizes) == num_train:
+                client_data_sizes = [int(s) for s in _sizes]
+                print(f"Client blocks from {_tm_path}: {client_data_sizes}")
+        if client_data_sizes is None:
+            base = num_train // args.num_clients
+            rem = num_train % args.num_clients
+            client_data_sizes = [base + (1 if i < rem else 0) for i in range(args.num_clients)]
+            print(f"WARNING: no matching client_data_sizes in {load_dir}; equal chunks {client_data_sizes}")
         total_samples = sum(client_data_sizes)
         client_weights = [n / total_samples for n in client_data_sizes]
 
@@ -485,6 +498,17 @@ def simulate_federated_training_vlg(args):
             # If cbl_finetune=True the backbone is trained on each client, so its updates must be aggregated.
             cbl_exclude_prefixes = ["backbone."] if not cbl_finetune else None
             lambda_ortho = getattr(args, "ortho_lambda", 0.0)
+            # --cbl_agg posaware: per-concept weights for the CBL output layer, from each
+            # client's positive DINO counts (one C-vector per client, summed by the server).
+            _posaware = getattr(args, "cbl_agg", "fedavg") == "posaware"
+            if _posaware:
+                _ann = base_cbl_dataset._annotation_cache
+                _pos = torch.stack([_ann[torch.as_tensor(client_indices[i], dtype=torch.long)].sum(dim=0).float()
+                                    for i in range(args.num_clients)])            # [M, C]
+                _row_w = (_pos / _pos.sum(dim=0, keepdim=True).clamp(min=1.0)).to(device)
+                _out = len(global_model.cbl.model) - 1                          # last Linear = concept rows
+                _row_keys = [f"cbl.model.{_out}.weight", f"cbl.model.{_out}.bias"]
+                print(f"[cbl_agg] posaware: per-concept weights on {_row_keys}")
             for round_num in range(args.num_rounds):
                 round_losses = []
                 round_concept_losses = []
@@ -509,6 +533,11 @@ def simulate_federated_training_vlg(args):
                     if lambda_ortho > 0.0:
                         print(f"  Round {round_num + 1} Client {i}: concept_loss={concept_loss:.4f} ortho_loss={ortho_loss:.4f} total_loss={total_loss:.4f}", flush=True)
                 global_state = federated_averaging(client_models, client_weights, exclude_prefixes=cbl_exclude_prefixes)
+                if _posaware:
+                    for _k in _row_keys:
+                        _s = [m.state_dict()[_k] for m in client_models]
+                        _w = _row_w if _s[0].dim() == 1 else _row_w.unsqueeze(-1)
+                        global_state[_k] = sum(_w[i] * _s[i] for i in range(args.num_clients))
                 global_model.load_state_dict(global_state)
                 avg_train_loss = sum(round_losses) / len(round_losses)
                 avg_concept_loss = sum(round_concept_losses) / len(round_concept_losses)

@@ -37,6 +37,8 @@ Usage:
     python naut/gen_seed_main.py > naut/generated_jobs/fedcbm-seed-main.yaml
 """
 
+import sys
+
 DATA = "/sc-rwx-vol/fedmedcbm/datasets"
 
 # Per-dataset: base seed already run, plus the two to add.
@@ -285,11 +287,14 @@ CLASSES = {"cifar10": 10, "cifar100": 100, "cub": 200, "places365": 365, "imagen
 
 
 def main():
+    # `gen_seed_main.py posaware`: the same jobs with --cbl_agg posaware, all three seeds,
+    # written to SEED_POSAWARE (fedcbm-seedposaware-<ds>). Default output is unchanged.
+    posaware = len(sys.argv) > 1 and sys.argv[1] == "posaware"
     out = [HEADER]
     for ds, cfg in CFG.items():
         calls, n = [], 0
         for part, ptag, flag in (("dirichlet", "dir", "--alpha 0.5"), ("iid", "iid", "--iid")):
-            for seed in SEEDS[ds]:
+            for seed in ([42, 31, 7] if posaware else SEEDS[ds]):
                 l50 = LAMS[ds][part][50]
                 l5 = LAMS[ds][part][5] or ""
                 calls.append(f'              run_pair "{flag}" {ptag} {seed} {l50} "{l5}"')
@@ -301,7 +306,12 @@ def main():
             cpu=cfg.get("cpu", "4"),
             calls="\n".join(calls), classes=CLASSES[ds], ncells=n,
         ))
-    print("".join(out), end="")
+    text = "".join(out)
+    if posaware:
+        assert text.count(COMMON) == 2 * len(CFG)
+        text = (text.replace(COMMON, COMMON + " --cbl_agg posaware")
+                    .replace("SEED_MAIN", "SEED_POSAWARE").replace("fedcbm-seedmain-", "fedcbm-seedposaware-"))
+    print(text, end="")
 
 
 if __name__ == "__main__":
