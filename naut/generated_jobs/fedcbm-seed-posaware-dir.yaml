@@ -1,0 +1,1029 @@
+# Posaware CBL aggregation, Dirichlet only, one Job per (dataset, seed).
+# Derived from fedcbm-seed-posaware.yaml (naut/gen_seed_main.py posaware) on 2026-10-15:
+#   - IID pairs dropped (posaware ~ FedAvg under IID: C10/C100/CUB differences 0.0-0.1)
+#   - each Dirichlet seed is its own Job so the three run in parallel
+#   - 2 CPU with OMP/MKL threads pinned (measured use ~1.0 core)
+#   - memory sized from measured use: Places365 Phase 1 12 GiB, Phase 3 35 GiB -> 48Gi;
+#     ImageNet Phase 1 11.5 GiB, Phase 3 est. ~47 GiB (same tensors as P365, scaled) -> 56Gi
+#   - GPU list: only types reachable through nvidia.com/gpu, >= 16 GB; broken node excluded
+# Outputs land in models/SEED_POSAWARE/<ds>/dir_s<seed>_nec{50,5}, same as the original job.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-seedposaware-imagenet-s42
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm
+    task: seed-main
+    dataset: imagenet
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          env:
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update -q && apt-get install -y -q git
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              DS=imagenet
+              OUT=/sc-rwx-vol/fedmedcbm/models/SEED_POSAWARE/$DS
+              mkdir -p $OUT
+
+              export IMAGENET_ROOT=/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC
+              CHK="/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC/val"
+              if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
+                echo "ERROR: raw images not reachable at $CHK"; exit 1
+              fi
+
+              # $1 partition-flag  $2 tag  $3 seed  $4 lam50  $5 lam5
+              run_pair () {
+                PART="$1"; PTAG="$2"; SEED="$3"; L50="$4"; L5="$5"
+
+                D50=$OUT/${PTAG}_s${SEED}_nec50
+                if find "$D50" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec50"
+                else
+                  echo ""
+                  echo "############ $DS | $PTAG | seed $SEED | NEC~50 (lam=$L50) | FULL ############"
+                  SAVE=$WORKSPACE/full_${PTAG}_${SEED}
+                  mkdir -p "$SAVE"
+                  set +e
+                  python main_fed.py --dataset $DS --concept_file concept_files/imagenet_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                    $PART --seed $SEED --save_dir "$SAVE" --dual_lam $L50 \
+                    --val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 --cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                  RC=$?; set -e
+                  if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec50 rc=$RC"; return 0; fi
+                  MD=$(find "$SAVE/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                  if [ -z "$MD" ]; then echo "[FAIL] $DS/$PTAG/s$SEED no model dir"; return 0; fi
+                  mkdir -p "$D50" && cp -r "$MD" "$D50/"
+                  echo "[ok] -> $D50"
+                fi
+
+                # NEC~5 reuses the CBL just trained: same seed, same partition,
+                # only the Phase-3 lambda differs, so Phase 1 need not repeat.
+                if [ -z "$L5" ]; then return 0; fi
+                D5=$OUT/${PTAG}_s${SEED}_nec5
+                if find "$D5" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec5"; return 0
+                fi
+                PIN=$(find "$D50" -name train_concept_features.pt 2>/dev/null | head -1)
+                if [ -z "$PIN" ]; then
+                  echo "[FAIL] $DS/$PTAG/s$SEED: no cached features to reuse for NEC~5"; return 0
+                fi
+                PIN=$(dirname "$PIN")
+                echo ""
+                echo "############ $DS | $PTAG | seed $SEED | NEC~5 (lam=$L5) | PHASE 3 ############"
+                SAVE5=$WORKSPACE/p3_${PTAG}_${SEED}
+                mkdir -p "$SAVE5"
+                set +e
+                python main_fed.py --dataset $DS --concept_file concept_files/imagenet_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                  $PART --seed $SEED --save_dir "$SAVE5" --dual_lam $L5 \
+                  --load_pretrained_vlg "$PIN" \
+                  --val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 --cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                RC=$?; set -e
+                if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 rc=$RC"; return 0; fi
+                MD5=$(find "$SAVE5/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                if [ -z "$MD5" ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 no model dir"; return 0; fi
+                mkdir -p "$D5" && cp -r "$MD5" "$D5/"
+                echo "[ok] -> $D5"
+                rm -rf "$SAVE5"
+              }
+
+              run_pair "--alpha 0.5" dir 42 0.000077 "0.0005"
+              echo ""
+              echo "=========== SUMMARY: $DS ==========="
+              NDONE=$(find $OUT -name metrics.txt 2>/dev/null | wc -l)
+              for D in $(ls -d $OUT/*/ 2>/dev/null | sort); do
+                M=$(find "$D" -name metrics.txt | head -1); [ -z "$M" ] && continue
+                A=$(grep -o '"test_accuracy": [0-9.]*' "$M" | head -1 | cut -d' ' -f2)
+                NZ=$(grep -o '"Non-zero weights": [0-9]*' "$M" | head -1 | cut -d' ' -f3)
+                awk -v n="$(basename $D)" -v a="$A" -v nz="$NZ" -v k=998 \
+                  'BEGIN{printf "  %-28s acc=%6.2f  NEC=%8.2f\n", n, a*100, nz/k}'
+              done
+              echo "$NDONE cells have results (all seeds)."
+              if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
+          resources:
+            requests:
+              cpu: "2"
+              memory: "56Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "56Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      # >= 16 GB; peak use ~2-5 GB with the feature cache (all 3 seeds cached)
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - Quadro-RTX-6000
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-RTX-A4000
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-seedposaware-imagenet-s31
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm
+    task: seed-main
+    dataset: imagenet
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          env:
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update -q && apt-get install -y -q git
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              DS=imagenet
+              OUT=/sc-rwx-vol/fedmedcbm/models/SEED_POSAWARE/$DS
+              mkdir -p $OUT
+
+              export IMAGENET_ROOT=/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC
+              CHK="/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC/val"
+              if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
+                echo "ERROR: raw images not reachable at $CHK"; exit 1
+              fi
+
+              # $1 partition-flag  $2 tag  $3 seed  $4 lam50  $5 lam5
+              run_pair () {
+                PART="$1"; PTAG="$2"; SEED="$3"; L50="$4"; L5="$5"
+
+                D50=$OUT/${PTAG}_s${SEED}_nec50
+                if find "$D50" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec50"
+                else
+                  echo ""
+                  echo "############ $DS | $PTAG | seed $SEED | NEC~50 (lam=$L50) | FULL ############"
+                  SAVE=$WORKSPACE/full_${PTAG}_${SEED}
+                  mkdir -p "$SAVE"
+                  set +e
+                  python main_fed.py --dataset $DS --concept_file concept_files/imagenet_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                    $PART --seed $SEED --save_dir "$SAVE" --dual_lam $L50 \
+                    --val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 --cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                  RC=$?; set -e
+                  if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec50 rc=$RC"; return 0; fi
+                  MD=$(find "$SAVE/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                  if [ -z "$MD" ]; then echo "[FAIL] $DS/$PTAG/s$SEED no model dir"; return 0; fi
+                  mkdir -p "$D50" && cp -r "$MD" "$D50/"
+                  echo "[ok] -> $D50"
+                fi
+
+                # NEC~5 reuses the CBL just trained: same seed, same partition,
+                # only the Phase-3 lambda differs, so Phase 1 need not repeat.
+                if [ -z "$L5" ]; then return 0; fi
+                D5=$OUT/${PTAG}_s${SEED}_nec5
+                if find "$D5" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec5"; return 0
+                fi
+                PIN=$(find "$D50" -name train_concept_features.pt 2>/dev/null | head -1)
+                if [ -z "$PIN" ]; then
+                  echo "[FAIL] $DS/$PTAG/s$SEED: no cached features to reuse for NEC~5"; return 0
+                fi
+                PIN=$(dirname "$PIN")
+                echo ""
+                echo "############ $DS | $PTAG | seed $SEED | NEC~5 (lam=$L5) | PHASE 3 ############"
+                SAVE5=$WORKSPACE/p3_${PTAG}_${SEED}
+                mkdir -p "$SAVE5"
+                set +e
+                python main_fed.py --dataset $DS --concept_file concept_files/imagenet_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                  $PART --seed $SEED --save_dir "$SAVE5" --dual_lam $L5 \
+                  --load_pretrained_vlg "$PIN" \
+                  --val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 --cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                RC=$?; set -e
+                if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 rc=$RC"; return 0; fi
+                MD5=$(find "$SAVE5/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                if [ -z "$MD5" ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 no model dir"; return 0; fi
+                mkdir -p "$D5" && cp -r "$MD5" "$D5/"
+                echo "[ok] -> $D5"
+                rm -rf "$SAVE5"
+              }
+
+              run_pair "--alpha 0.5" dir 31 0.000077 "0.0005"
+              echo ""
+              echo "=========== SUMMARY: $DS ==========="
+              NDONE=$(find $OUT -name metrics.txt 2>/dev/null | wc -l)
+              for D in $(ls -d $OUT/*/ 2>/dev/null | sort); do
+                M=$(find "$D" -name metrics.txt | head -1); [ -z "$M" ] && continue
+                A=$(grep -o '"test_accuracy": [0-9.]*' "$M" | head -1 | cut -d' ' -f2)
+                NZ=$(grep -o '"Non-zero weights": [0-9]*' "$M" | head -1 | cut -d' ' -f3)
+                awk -v n="$(basename $D)" -v a="$A" -v nz="$NZ" -v k=998 \
+                  'BEGIN{printf "  %-28s acc=%6.2f  NEC=%8.2f\n", n, a*100, nz/k}'
+              done
+              echo "$NDONE cells have results (all seeds)."
+              if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
+          resources:
+            requests:
+              cpu: "2"
+              memory: "56Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "56Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      # >= 16 GB; peak use ~2-5 GB with the feature cache (all 3 seeds cached)
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - Quadro-RTX-6000
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-RTX-A4000
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-seedposaware-imagenet-s7
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm
+    task: seed-main
+    dataset: imagenet
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          env:
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update -q && apt-get install -y -q git
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              DS=imagenet
+              OUT=/sc-rwx-vol/fedmedcbm/models/SEED_POSAWARE/$DS
+              mkdir -p $OUT
+
+              export IMAGENET_ROOT=/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC
+              CHK="/sc-rwx-vol/fedmedcbm/datasets/imagenet_kaggle_download/ILSVRC/Data/CLS-LOC/val"
+              if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
+                echo "ERROR: raw images not reachable at $CHK"; exit 1
+              fi
+
+              # $1 partition-flag  $2 tag  $3 seed  $4 lam50  $5 lam5
+              run_pair () {
+                PART="$1"; PTAG="$2"; SEED="$3"; L50="$4"; L5="$5"
+
+                D50=$OUT/${PTAG}_s${SEED}_nec50
+                if find "$D50" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec50"
+                else
+                  echo ""
+                  echo "############ $DS | $PTAG | seed $SEED | NEC~50 (lam=$L50) | FULL ############"
+                  SAVE=$WORKSPACE/full_${PTAG}_${SEED}
+                  mkdir -p "$SAVE"
+                  set +e
+                  python main_fed.py --dataset $DS --concept_file concept_files/imagenet_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                    $PART --seed $SEED --save_dir "$SAVE" --dual_lam $L50 \
+                    --val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 --cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                  RC=$?; set -e
+                  if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec50 rc=$RC"; return 0; fi
+                  MD=$(find "$SAVE/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                  if [ -z "$MD" ]; then echo "[FAIL] $DS/$PTAG/s$SEED no model dir"; return 0; fi
+                  mkdir -p "$D50" && cp -r "$MD" "$D50/"
+                  echo "[ok] -> $D50"
+                fi
+
+                # NEC~5 reuses the CBL just trained: same seed, same partition,
+                # only the Phase-3 lambda differs, so Phase 1 need not repeat.
+                if [ -z "$L5" ]; then return 0; fi
+                D5=$OUT/${PTAG}_s${SEED}_nec5
+                if find "$D5" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec5"; return 0
+                fi
+                PIN=$(find "$D50" -name train_concept_features.pt 2>/dev/null | head -1)
+                if [ -z "$PIN" ]; then
+                  echo "[FAIL] $DS/$PTAG/s$SEED: no cached features to reuse for NEC~5"; return 0
+                fi
+                PIN=$(dirname "$PIN")
+                echo ""
+                echo "############ $DS | $PTAG | seed $SEED | NEC~5 (lam=$L5) | PHASE 3 ############"
+                SAVE5=$WORKSPACE/p3_${PTAG}_${SEED}
+                mkdir -p "$SAVE5"
+                set +e
+                python main_fed.py --dataset $DS --concept_file concept_files/imagenet_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                  $PART --seed $SEED --save_dir "$SAVE5" --dual_lam $L5 \
+                  --load_pretrained_vlg "$PIN" \
+                  --val_split 0.05 --batch_size 64 --cbl_lr 0.01 --cbl_epochs 7 --cbl_batch_size 64 --cbl_pos_weight 8000.0 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                RC=$?; set -e
+                if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 rc=$RC"; return 0; fi
+                MD5=$(find "$SAVE5/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                if [ -z "$MD5" ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 no model dir"; return 0; fi
+                mkdir -p "$D5" && cp -r "$MD5" "$D5/"
+                echo "[ok] -> $D5"
+                rm -rf "$SAVE5"
+              }
+
+              run_pair "--alpha 0.5" dir 7 0.000077 "0.0005"
+              echo ""
+              echo "=========== SUMMARY: $DS ==========="
+              NDONE=$(find $OUT -name metrics.txt 2>/dev/null | wc -l)
+              for D in $(ls -d $OUT/*/ 2>/dev/null | sort); do
+                M=$(find "$D" -name metrics.txt | head -1); [ -z "$M" ] && continue
+                A=$(grep -o '"test_accuracy": [0-9.]*' "$M" | head -1 | cut -d' ' -f2)
+                NZ=$(grep -o '"Non-zero weights": [0-9]*' "$M" | head -1 | cut -d' ' -f3)
+                awk -v n="$(basename $D)" -v a="$A" -v nz="$NZ" -v k=998 \
+                  'BEGIN{printf "  %-28s acc=%6.2f  NEC=%8.2f\n", n, a*100, nz/k}'
+              done
+              echo "$NDONE cells have results (all seeds)."
+              if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
+          resources:
+            requests:
+              cpu: "2"
+              memory: "56Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "56Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      # >= 16 GB; peak use ~2-5 GB with the feature cache (all 3 seeds cached)
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - Quadro-RTX-6000
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-RTX-A4000
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-seedposaware-places365-s42
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm
+    task: seed-main
+    dataset: places365
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          env:
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update -q && apt-get install -y -q git
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              DS=places365
+              OUT=/sc-rwx-vol/fedmedcbm/models/SEED_POSAWARE/$DS
+              mkdir -p $OUT
+
+              export PLACES365_ROOT=/sc-rwx-vol/fedmedcbm/datasets/places365
+              CHK="/sc-rwx-vol/fedmedcbm/datasets/places365/data_256_standard"
+              if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
+                echo "ERROR: raw images not reachable at $CHK"; exit 1
+              fi
+
+              # $1 partition-flag  $2 tag  $3 seed  $4 lam50  $5 lam5
+              run_pair () {
+                PART="$1"; PTAG="$2"; SEED="$3"; L50="$4"; L5="$5"
+
+                D50=$OUT/${PTAG}_s${SEED}_nec50
+                if find "$D50" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec50"
+                else
+                  echo ""
+                  echo "############ $DS | $PTAG | seed $SEED | NEC~50 (lam=$L50) | FULL ############"
+                  SAVE=$WORKSPACE/full_${PTAG}_${SEED}
+                  mkdir -p "$SAVE"
+                  set +e
+                  python main_fed.py --dataset $DS --concept_file concept_files/places365_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                    $PART --seed $SEED --save_dir "$SAVE" --dual_lam $L50 \
+                    --val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 --cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                  RC=$?; set -e
+                  if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec50 rc=$RC"; return 0; fi
+                  MD=$(find "$SAVE/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                  if [ -z "$MD" ]; then echo "[FAIL] $DS/$PTAG/s$SEED no model dir"; return 0; fi
+                  mkdir -p "$D50" && cp -r "$MD" "$D50/"
+                  echo "[ok] -> $D50"
+                fi
+
+                # NEC~5 reuses the CBL just trained: same seed, same partition,
+                # only the Phase-3 lambda differs, so Phase 1 need not repeat.
+                if [ -z "$L5" ]; then return 0; fi
+                D5=$OUT/${PTAG}_s${SEED}_nec5
+                if find "$D5" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec5"; return 0
+                fi
+                PIN=$(find "$D50" -name train_concept_features.pt 2>/dev/null | head -1)
+                if [ -z "$PIN" ]; then
+                  echo "[FAIL] $DS/$PTAG/s$SEED: no cached features to reuse for NEC~5"; return 0
+                fi
+                PIN=$(dirname "$PIN")
+                echo ""
+                echo "############ $DS | $PTAG | seed $SEED | NEC~5 (lam=$L5) | PHASE 3 ############"
+                SAVE5=$WORKSPACE/p3_${PTAG}_${SEED}
+                mkdir -p "$SAVE5"
+                set +e
+                python main_fed.py --dataset $DS --concept_file concept_files/places365_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                  $PART --seed $SEED --save_dir "$SAVE5" --dual_lam $L5 \
+                  --load_pretrained_vlg "$PIN" \
+                  --val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 --cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                RC=$?; set -e
+                if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 rc=$RC"; return 0; fi
+                MD5=$(find "$SAVE5/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                if [ -z "$MD5" ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 no model dir"; return 0; fi
+                mkdir -p "$D5" && cp -r "$MD5" "$D5/"
+                echo "[ok] -> $D5"
+                rm -rf "$SAVE5"
+              }
+
+              run_pair "--alpha 0.5" dir 42 0.0001 "0.001"
+              echo ""
+              echo "=========== SUMMARY: $DS ==========="
+              NDONE=$(find $OUT -name metrics.txt 2>/dev/null | wc -l)
+              for D in $(ls -d $OUT/*/ 2>/dev/null | sort); do
+                M=$(find "$D" -name metrics.txt | head -1); [ -z "$M" ] && continue
+                A=$(grep -o '"test_accuracy": [0-9.]*' "$M" | head -1 | cut -d' ' -f2)
+                NZ=$(grep -o '"Non-zero weights": [0-9]*' "$M" | head -1 | cut -d' ' -f3)
+                awk -v n="$(basename $D)" -v a="$A" -v nz="$NZ" -v k=365 \
+                  'BEGIN{printf "  %-28s acc=%6.2f  NEC=%8.2f\n", n, a*100, nz/k}'
+              done
+              echo "$NDONE cells have results (all seeds)."
+              if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
+          resources:
+            requests:
+              cpu: "2"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      # >= 16 GB; peak use ~2-5 GB with the feature cache (all 3 seeds cached)
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - Quadro-RTX-6000
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-RTX-A4000
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-seedposaware-places365-s31
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm
+    task: seed-main
+    dataset: places365
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          env:
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update -q && apt-get install -y -q git
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              DS=places365
+              OUT=/sc-rwx-vol/fedmedcbm/models/SEED_POSAWARE/$DS
+              mkdir -p $OUT
+
+              export PLACES365_ROOT=/sc-rwx-vol/fedmedcbm/datasets/places365
+              CHK="/sc-rwx-vol/fedmedcbm/datasets/places365/data_256_standard"
+              if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
+                echo "ERROR: raw images not reachable at $CHK"; exit 1
+              fi
+
+              # $1 partition-flag  $2 tag  $3 seed  $4 lam50  $5 lam5
+              run_pair () {
+                PART="$1"; PTAG="$2"; SEED="$3"; L50="$4"; L5="$5"
+
+                D50=$OUT/${PTAG}_s${SEED}_nec50
+                if find "$D50" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec50"
+                else
+                  echo ""
+                  echo "############ $DS | $PTAG | seed $SEED | NEC~50 (lam=$L50) | FULL ############"
+                  SAVE=$WORKSPACE/full_${PTAG}_${SEED}
+                  mkdir -p "$SAVE"
+                  set +e
+                  python main_fed.py --dataset $DS --concept_file concept_files/places365_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                    $PART --seed $SEED --save_dir "$SAVE" --dual_lam $L50 \
+                    --val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 --cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                  RC=$?; set -e
+                  if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec50 rc=$RC"; return 0; fi
+                  MD=$(find "$SAVE/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                  if [ -z "$MD" ]; then echo "[FAIL] $DS/$PTAG/s$SEED no model dir"; return 0; fi
+                  mkdir -p "$D50" && cp -r "$MD" "$D50/"
+                  echo "[ok] -> $D50"
+                fi
+
+                # NEC~5 reuses the CBL just trained: same seed, same partition,
+                # only the Phase-3 lambda differs, so Phase 1 need not repeat.
+                if [ -z "$L5" ]; then return 0; fi
+                D5=$OUT/${PTAG}_s${SEED}_nec5
+                if find "$D5" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec5"; return 0
+                fi
+                PIN=$(find "$D50" -name train_concept_features.pt 2>/dev/null | head -1)
+                if [ -z "$PIN" ]; then
+                  echo "[FAIL] $DS/$PTAG/s$SEED: no cached features to reuse for NEC~5"; return 0
+                fi
+                PIN=$(dirname "$PIN")
+                echo ""
+                echo "############ $DS | $PTAG | seed $SEED | NEC~5 (lam=$L5) | PHASE 3 ############"
+                SAVE5=$WORKSPACE/p3_${PTAG}_${SEED}
+                mkdir -p "$SAVE5"
+                set +e
+                python main_fed.py --dataset $DS --concept_file concept_files/places365_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                  $PART --seed $SEED --save_dir "$SAVE5" --dual_lam $L5 \
+                  --load_pretrained_vlg "$PIN" \
+                  --val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 --cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                RC=$?; set -e
+                if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 rc=$RC"; return 0; fi
+                MD5=$(find "$SAVE5/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                if [ -z "$MD5" ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 no model dir"; return 0; fi
+                mkdir -p "$D5" && cp -r "$MD5" "$D5/"
+                echo "[ok] -> $D5"
+                rm -rf "$SAVE5"
+              }
+
+              run_pair "--alpha 0.5" dir 31 0.0001 "0.001"
+              echo ""
+              echo "=========== SUMMARY: $DS ==========="
+              NDONE=$(find $OUT -name metrics.txt 2>/dev/null | wc -l)
+              for D in $(ls -d $OUT/*/ 2>/dev/null | sort); do
+                M=$(find "$D" -name metrics.txt | head -1); [ -z "$M" ] && continue
+                A=$(grep -o '"test_accuracy": [0-9.]*' "$M" | head -1 | cut -d' ' -f2)
+                NZ=$(grep -o '"Non-zero weights": [0-9]*' "$M" | head -1 | cut -d' ' -f3)
+                awk -v n="$(basename $D)" -v a="$A" -v nz="$NZ" -v k=365 \
+                  'BEGIN{printf "  %-28s acc=%6.2f  NEC=%8.2f\n", n, a*100, nz/k}'
+              done
+              echo "$NDONE cells have results (all seeds)."
+              if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
+          resources:
+            requests:
+              cpu: "2"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      # >= 16 GB; peak use ~2-5 GB with the feature cache (all 3 seeds cached)
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - Quadro-RTX-6000
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-RTX-A4000
+      restartPolicy: Never
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fedcbm-seedposaware-places365-s7
+  namespace: wenglab-interpretable-ai
+  labels:
+    experiment: fed-lfc-cbm
+    task: seed-main
+    dataset: places365
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+        - name: gpu-container
+          env:
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+          image: pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              apt-get update -q && apt-get install -y -q git
+
+              WORKSPACE=/tmp/workspace
+              mkdir -p $WORKSPACE && cd $WORKSPACE
+              git clone https://github.com/Samintha-C/fedmedcbm.git $WORKSPACE/fedmedcbm
+              git clone https://github.com/Trustworthy-ML-Lab/Label-free-CBM.git $WORKSPACE/Label-free-CBM
+
+              export PIP_CACHE_DIR=/tmp/pip-cache
+              mkdir -p $PIP_CACHE_DIR
+              pip install --cache-dir $PIP_CACHE_DIR -q ftfy regex tqdm numpy pandas
+              pip install --cache-dir $PIP_CACHE_DIR -q git+https://github.com/openai/CLIP.git
+              pip install --cache-dir $PIP_CACHE_DIR -q pytorchcv || true
+              pip install --cache-dir $PIP_CACHE_DIR -q psutil || true
+
+              cd $WORKSPACE/fedmedcbm
+              DS=places365
+              OUT=/sc-rwx-vol/fedmedcbm/models/SEED_POSAWARE/$DS
+              mkdir -p $OUT
+
+              export PLACES365_ROOT=/sc-rwx-vol/fedmedcbm/datasets/places365
+              CHK="/sc-rwx-vol/fedmedcbm/datasets/places365/data_256_standard"
+              if [ -n "$CHK" ] && [ ! -e "$CHK" ]; then
+                echo "ERROR: raw images not reachable at $CHK"; exit 1
+              fi
+
+              # $1 partition-flag  $2 tag  $3 seed  $4 lam50  $5 lam5
+              run_pair () {
+                PART="$1"; PTAG="$2"; SEED="$3"; L50="$4"; L5="$5"
+
+                D50=$OUT/${PTAG}_s${SEED}_nec50
+                if find "$D50" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec50"
+                else
+                  echo ""
+                  echo "############ $DS | $PTAG | seed $SEED | NEC~50 (lam=$L50) | FULL ############"
+                  SAVE=$WORKSPACE/full_${PTAG}_${SEED}
+                  mkdir -p "$SAVE"
+                  set +e
+                  python main_fed.py --dataset $DS --concept_file concept_files/places365_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                    $PART --seed $SEED --save_dir "$SAVE" --dual_lam $L50 \
+                    --val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 --cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                  RC=$?; set -e
+                  if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec50 rc=$RC"; return 0; fi
+                  MD=$(find "$SAVE/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                  if [ -z "$MD" ]; then echo "[FAIL] $DS/$PTAG/s$SEED no model dir"; return 0; fi
+                  mkdir -p "$D50" && cp -r "$MD" "$D50/"
+                  echo "[ok] -> $D50"
+                fi
+
+                # NEC~5 reuses the CBL just trained: same seed, same partition,
+                # only the Phase-3 lambda differs, so Phase 1 need not repeat.
+                if [ -z "$L5" ]; then return 0; fi
+                D5=$OUT/${PTAG}_s${SEED}_nec5
+                if find "$D5" -name metrics.txt 2>/dev/null | grep -q .; then
+                  echo "[skip] $DS/${PTAG}_s${SEED}_nec5"; return 0
+                fi
+                PIN=$(find "$D50" -name train_concept_features.pt 2>/dev/null | head -1)
+                if [ -z "$PIN" ]; then
+                  echo "[FAIL] $DS/$PTAG/s$SEED: no cached features to reuse for NEC~5"; return 0
+                fi
+                PIN=$(dirname "$PIN")
+                echo ""
+                echo "############ $DS | $PTAG | seed $SEED | NEC~5 (lam=$L5) | PHASE 3 ############"
+                SAVE5=$WORKSPACE/p3_${PTAG}_${SEED}
+                mkdir -p "$SAVE5"
+                set +e
+                python main_fed.py --dataset $DS --concept_file concept_files/places365_filtered.txt --backbone resnet50 --clip_name ViT-B/16 --feature_layer layer4 \
+                  $PART --seed $SEED --save_dir "$SAVE5" --dual_lam $L5 \
+                  --load_pretrained_vlg "$PIN" \
+                  --val_split 0.05 --batch_size 128 --cbl_lr 5e-4 --cbl_epochs 4 --cbl_batch_size 128 --cbl_pos_weight 50 --num_workers 8 --num_clients 5 --num_rounds 5 --local_epochs 5 --lr 1e-3 --weight_decay 1e-5 --device cuda --use_vlg --annotation_dir /sc-rwx-vol/fedmedcbm/annotations --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache --log_dir /sc-rwx-vol/fedmedcbm/job_logs --cbl_loss_type bce --cbl_optimizer adam --cbl_hidden_layers 0 --cbl_twoway_tp 4.0 --cbl_bb_lr_rate 1.0 --ortho_lambda 100 --final_layer_method feddualavg --final_rounds 200 --final_epochs 3 --final_lr 1e-3 --no_nec_eval --cbl_agg posaware
+                RC=$?; set -e
+                if [ $RC -ne 0 ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 rc=$RC"; return 0; fi
+                MD5=$(find "$SAVE5/fully_trained" -maxdepth 1 -mindepth 1 -type d | head -1)
+                if [ -z "$MD5" ]; then echo "[FAIL] $DS/$PTAG/s$SEED/nec5 no model dir"; return 0; fi
+                mkdir -p "$D5" && cp -r "$MD5" "$D5/"
+                echo "[ok] -> $D5"
+                rm -rf "$SAVE5"
+              }
+
+              run_pair "--alpha 0.5" dir 7 0.0001 "0.001"
+              echo ""
+              echo "=========== SUMMARY: $DS ==========="
+              NDONE=$(find $OUT -name metrics.txt 2>/dev/null | wc -l)
+              for D in $(ls -d $OUT/*/ 2>/dev/null | sort); do
+                M=$(find "$D" -name metrics.txt | head -1); [ -z "$M" ] && continue
+                A=$(grep -o '"test_accuracy": [0-9.]*' "$M" | head -1 | cut -d' ' -f2)
+                NZ=$(grep -o '"Non-zero weights": [0-9]*' "$M" | head -1 | cut -d' ' -f3)
+                awk -v n="$(basename $D)" -v a="$A" -v nz="$NZ" -v k=365 \
+                  'BEGIN{printf "  %-28s acc=%6.2f  NEC=%8.2f\n", n, a*100, nz/k}'
+              done
+              echo "$NDONE cells have results (all seeds)."
+              if [ "$NDONE" -eq 0 ]; then echo "ERROR: no cell produced results"; exit 1; fi
+          resources:
+            requests:
+              cpu: "2"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: sc-rwx-vol
+              mountPath: /sc-rwx-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: sc-rwx-vol
+          persistentVolumeClaim:
+            claimName: sc-rwx-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      # >= 16 GB; peak use ~2-5 GB with the feature cache (all 3 seeds cached)
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - Quadro-RTX-6000
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-RTX-A4000
+      restartPolicy: Never
