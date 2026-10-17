@@ -66,6 +66,8 @@ def build_parser():
     ap.add_argument("--save_dir", required=True)
     ap.add_argument("--partitions", nargs="+", default=["iid", "dirichlet"],
                     choices=["iid", "dirichlet"])
+    ap.add_argument("--alphas", type=float, nargs="+", default=None,
+                    help="heads scripts: replace the dirichlet partition by one per alpha, named a<alpha>")
     # FedCBM: defaults are the F-CM reference config (conf/learning/FedCBM.yaml,
     # trainer.max_epochs 200)
     ap.add_argument("--svm_rounds", type=int, default=200)
@@ -187,6 +189,18 @@ def reference_check(args, d, rows, stage_a, lr, out):
         res[d["concepts"][j]] = float(np.abs(w - w_ref).max() / max(np.abs(w_ref).max(), 1e-12))
         print(f"[reference check] {d['concepts'][j]!r}: max rel |w - w_ref| = {res[d['concepts'][j]]:.2e}")
     out["reference_check_stage_a"] = res
+
+
+def arms(args):
+    """(name, iid, alpha) per partition the heads scripts evaluate. With --alphas,
+    "dirichlet" becomes one partition per alpha, named a<alpha> (a0.05, a1, ...)."""
+    out = []
+    for p in args.partitions:
+        if p == "dirichlet" and args.alphas:
+            out += [(f"a{a:g}", False, a) for a in args.alphas]
+        else:
+            out.append((p, p == "iid", args.alpha))
+    return out
 
 
 def proj(feats, stage_a, args, rows=None):

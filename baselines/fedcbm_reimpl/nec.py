@@ -36,16 +36,18 @@ import run  # noqa: E402
 def score(heads, z_val, y_val, z_test, y_test, split):
     g_val = [core.accuracy(h, z_val, y_val) for h in heads]
     g_test = [core.accuracy(h, z_test, y_test) for h in heads]
-    correct, total = 0.0, 0
+    correct, total, each = 0.0, 0, []
     for h, ix in zip(heads, split):
+        each.append(None)
         if ix.numel():
             ix = ix.to(z_test.device)
-            correct += core.accuracy(h, z_test[ix], y_test[ix]) * ix.numel()
+            each[-1] = core.accuracy(h, z_test[ix], y_test[ix])
+            correct += each[-1] * ix.numel()
             total += ix.numel()
     return {"global_val_mean_client_acc": sum(g_val) / len(g_val),
             "global_test_mean_client_acc": sum(g_test) / len(g_test),
             "personalized_test_acc_weighted": correct / max(total, 1),
-            "client_global_test_acc": g_test}
+            "client_global_test_acc": g_test, "personalized_test_acc_each": each}
 
 
 def main():
@@ -82,9 +84,9 @@ def main():
            "num_concepts": nc, "num_classes": nk, "nec_targets": args.nec_targets,
            "head_C_grid": args.head_C_grid, "dense": {}, "sparse": {}}
 
-    for p in args.partitions:
-        ci = run.split_dataset_for_federated(d["train_ds"], args.num_clients, iid=(p == "iid"),
-                                             alpha=args.alpha, seed=args.seed)
+    for p, iid, alpha in run.arms(args):
+        ci = run.split_dataset_for_federated(d["train_ds"], args.num_clients, iid=iid,
+                                             alpha=alpha, seed=args.seed)
         dense = {C: [] for C in args.head_C_grid}
         sparse = {t: [] for t in args.nec_targets}
         refit = {t: [] for t in args.nec_targets}
@@ -113,6 +115,7 @@ def main():
             del z
             torch.cuda.empty_cache()
         split = core.personalized_test_split(te._target_cache, labels, nk, seed=args.seed)
+        out.setdefault("client_stats", {})[p] = core.client_stats(labels, split, nk)
         for C in args.head_C_grid:
             out["dense"].setdefault(str(C), {})[p] = score(dense[C], z_val, y_val, z_test, y_test, split)
         for key, heads in (("sparse", sparse), ("sparse_refit", refit)):
@@ -134,7 +137,8 @@ def main():
             print(f"[{p}] dense C={C:g}: global {r['global_test_mean_client_acc']:.4f} "
                   f"per-client {r['personalized_test_acc_weighted']:.4f} (val {r['global_val_mean_client_acc']:.4f})")
 
-    sel = "iid" if "iid" in args.partitions else args.partitions[0]
+    names = [a[0] for a in run.arms(args)]
+    sel = "iid" if "iid" in names else names[0]
     out["dense_selected_C"] = max(args.head_C_grid, key=lambda C: out["dense"][str(C)][sel]["global_val_mean_client_acc"])
     print(f"[dense] selected C={out['dense_selected_C']:g} (on {sel} val)")
     out["total_seconds"] = round(time.time() - t0, 1)

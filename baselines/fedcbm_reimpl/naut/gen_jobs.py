@@ -23,6 +23,7 @@ Variants:
   personal  ours with private per-client heads (ours_personal.py).
   head-own  ours, the head rule: FedDualAvg -> refit on its own support (ours_head.py).
   nec-refit nec, plus each sparse head refit on its support without the penalty.
+  head-alpha / nec-alpha  head-own / nec-refit per client across Dirichlet alpha (alpha-sweep runs).
 The earlier "strong" variant (balanced + bias + standardization, lr chosen on
 val; FEDCBM_STRONG) is retired; its flags are in each run's args.json.
 
@@ -33,6 +34,8 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py personal > baselines/fedcbm_reimpl/naut/ours-personal.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py head-own > baselines/fedcbm_reimpl/naut/ours-head-own.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-refit > baselines/fedcbm_reimpl/naut/fedcbm-nec-refit.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py head-alpha > baselines/fedcbm_reimpl/naut/ours-head-alpha.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-alpha > baselines/fedcbm_reimpl/naut/fedcbm-nec-alpha.yaml
 """
 
 import os
@@ -91,6 +94,19 @@ VARIANTS = {
 VARIANTS["nec-refit"] = dict(VARIANTS["nec"], job="fedcbm-nec-refit", out="FEDCBM_BALANCED_NEC_REFIT", sized=True,
                              flags=VARIANTS["nec"]["flags"] + " --path_refit_iters 1000",
                              note="# FedCBM-NEC + support refit (core.fit_sparse_path refit_iters), reported next to the path heads.\n")
+# Per-client results across Dirichlet alpha: the heads above on the Fig-4 alpha-sweep runs
+# (models/<ds>/alphasweep/{a0.05,a0.1,a0.5,a1.0,iid}, seed 42 only). FedCBM's bank does not
+# depend on the partition, so its seed-42 bank is reused. Ours keeps the lam bracket so each
+# alpha lands near NEC 5 / 50. Both save per-client accuracy and data conditions.
+ALPHAS = [0.05, 0.1, 0.5, 1.0]
+_ALPHA_FLAGS = " --alphas " + " ".join(f"{a:g}" for a in ALPHAS)
+VARIANTS["head-alpha"] = dict(job="ours-head-alpha", out="OURS_HEAD_ALPHA", refcheck=False, script="ours_head.py",
+                              cpu_small=True, sized=True, seeds=[42], datasets=("cifar10", "cifar100", "cub"), alpha_runs=True,
+                              flags="--runs $RUNS --supports own --refit_rounds 100" + _ALPHA_FLAGS,
+                              note="# Ours (head rule) per client across Dirichlet alpha, on the alpha-sweep runs.\n")
+VARIANTS["nec-alpha"] = dict(VARIANTS["nec-refit"], job="fedcbm-nec-alpha", out="FEDCBM_BALANCED_NEC_ALPHA",
+                             seeds=[42], datasets=("cifar10", "cifar100", "cub"), flags=VARIANTS["nec-refit"]["flags"] + _ALPHA_FLAGS,
+                             note="# FedCBM-NEC (+ refit) per client across Dirichlet alpha (seed-42 bank).\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -166,6 +182,12 @@ def run_dirs(ds, posaware=False):
         lines.append(f'  {seed}) RUNS="iid={iid} dirichlet={dr}" ;;')
     lines.append("esac")
     return "\n                ".join(lines)
+
+
+def alpha_run_dirs(ds):
+    """$RUNS for the alpha-sweep runs (seed 42): iid=... a0.05=... (keys as run.arms names them)."""
+    runs = [f"iid={MODELS}/{ds}/alphasweep/iid"] + [f"a{a:g}={MODELS}/{ds}/alphasweep/a{a}" for a in ALPHAS]
+    return f'\n                RUNS="{" ".join(runs)}"'
 
 
 HEADER = """# FedCBM (Yang & Long 2023) on our data and protocol: the F-CM authors'
@@ -329,6 +351,8 @@ def main():
     out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n{note}# One Job per dataset;")
            .replace("FEDCBM_REIMPL", v["out"])]
     for ds, cfg in CFG.items():
+        if ds not in v.get("datasets", CFG):
+            continue
         cpu_only = bool(v.get("cpu_small")) and ds in CPU_DATASETS
         k = REF_CHECK[ds] if v["refcheck"] else 0
         cifar = ds.startswith("cifar")
@@ -346,7 +370,8 @@ def main():
             job = JOB.format(
                 ds=ds, job=v["job"], out=v["out"],
                 flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
-                runs=(run_dirs(ds, posaware=variant == "head-posaware")
+                runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
+                      run_dirs(ds, posaware=variant == "head-posaware")
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],

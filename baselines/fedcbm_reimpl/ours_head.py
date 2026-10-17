@@ -15,7 +15,10 @@ Scored on the global test set and on per-client test splits (core.personalized_t
 same seed, as ours_personal.py / nec.py).
 
 Usage: run.py's data flags, plus --runs iid=<dir> dirichlet=<dir> and
-       --lam_targets 5:<lam> 50:<lam> (the tab:main lambdas for that partition)
+       --lam_targets 5:<lam> 50:<lam> (the tab:main lambdas for that partition).
+       With --alphas 0.05 0.1 ...: --runs iid=<dir> a0.05=<dir> a0.1=<dir> ..., the
+       Dirichlet lambdas apply to every alpha (pair with the default lam bracket).
+Per-client accuracies and data conditions (core.client_stats) are saved for each partition.
 """
 import datetime
 import json
@@ -137,19 +140,19 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     t0 = time.time()
     loaded = {}
-    for p in args.partitions:
+    for p, _, alpha in run.arms(args):
         r = op.load_run(op.resolve_run(runs[p]), device)
-        op.check_args(r, args, p)
+        op.check_args(r, args, p, alpha)
         loaded[p] = r
     d = run.load_data(args, device)
     tr, va, te = d["tr"], d["va"], d["te"]
     nk = len(d["classes"])
     out = {"dataset": args.dataset, "seed": args.seed, "method": "ours head: fda / per-class+refit / logit-adj",
            "lam_targets": lam_t, "partitions": {}}
-    for p in args.partitions:
+    for p, iid, alpha in run.arms(args):
         r = loaded[p]
-        ci = run.split_dataset_for_federated(d["train_ds"], args.num_clients, iid=(p == "iid"),
-                                             alpha=args.alpha, seed=args.seed)
+        ci = run.split_dataset_for_federated(d["train_ds"], args.num_clients, iid=iid,
+                                             alpha=alpha, seed=args.seed)
         rec = {"run": r["path"], "checks": op.check_rows(r, d, ci, args), "targets": {}}
         held = torch.cat([torch.as_tensor(c, dtype=torch.long) for c in ci])
         # rows in client-block order, fp16 (Places365 / ImageNet would need ~17 / 22 GB in fp32)
@@ -165,21 +168,25 @@ def main():
         zt, yt = op.concept_scores(te._feature_cache, r), te._target_cache.to(device)
         labels = [tr._target_cache[torch.as_tensor(c, dtype=torch.long)] for c in ci]
         split = core.personalized_test_split(te._target_cache, labels, nk, seed=args.seed)
+        rec["client_stats"] = core.client_stats(labels, split, nk)
         prior = (torch.bincount(y, minlength=nk).float() + 1) / (len(y) + nk)
 
         def gacc(W, b):
             return 100 * core.accuracy(core.Head(W, b, torch.arange(nk)), zt, yt)
 
-        def pacc(heads):
-            corr = tot = 0
-            for (W, b), ix in zip(heads, split):
+        def pacc(heads, each=False):
+            """Accuracy on the per-client test splits, pooled; each=True: one value per client."""
+            corr, tot = [0] * len(split), [0] * len(split)
+            for m, ((W, b), ix) in enumerate(zip(heads, split)):
                 if ix.numel():
                     ix = ix.to(device)
-                    corr += int(((zt[ix] @ W.T + b).argmax(1) == yt[ix]).sum())
-                    tot += ix.numel()
-            return 100 * corr / max(tot, 1)
+                    corr[m] = int(((zt[ix] @ W.T + b).argmax(1) == yt[ix]).sum())
+                    tot[m] = ix.numel()
+            if each:
+                return [100 * c / t if t else None for c, t in zip(corr, tot)]
+            return 100 * sum(corr) / max(sum(tot), 1)
 
-        for target, base in sorted(lam_t[p].items()):
+        for target, base in sorted(lam_t.get(p, lam_t.get("dirichlet", {})).items()):
             cands = []
             for m in args.lam_mults:
                 W, b, zw = feddualavg(z, y, zv, yv, nk, base * m, clients)
@@ -205,7 +212,9 @@ def main():
                     Wv, bv = (Wr, br) if (sup == "perclass" and R == 20) else refit(W, b, Ms, z, y, nk, clients, rounds=R)
                     variants[f"{sup}_{R}"] = {"nec": float((Wv * Ms != 0).sum()) / nk, "global_test": gacc(Wv, bv),
                                               "per_client": pacc([(Wv, bv)] * len(ci)),
-                                              "logit_adj_per_client": pacc([(Wv, bv + sh) for sh in shifts])}
+                                              "logit_adj_per_client": pacc([(Wv, bv + sh) for sh in shifts]),
+                                              "per_client_each": pacc([(Wv, bv)] * len(ci), each=True),
+                                              "logit_adj_each": pacc([(Wv, bv + sh) for sh in shifts], each=True)}
             res["refit_variants"] = variants
             print(f"[{p}] NEC~{target} refit variants: " + " | ".join(
                 f"{k} {v['global_test']:.2f}@{v['nec']:.1f} (logit-adj per-client {v['logit_adj_per_client']:.2f})" for k, v in variants.items()), flush=True)

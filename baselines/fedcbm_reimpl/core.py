@@ -304,6 +304,23 @@ def personalized_test_split(test_labels: torch.Tensor, client_train_labels: Sequ
     return [torch.cat(p) if p else torch.zeros(0, dtype=torch.long) for p in parts]
 
 
+def client_stats(client_train_labels: Sequence[torch.Tensor], split: Sequence[torch.Tensor],
+                 num_classes: int) -> List[Dict[str, float]]:
+    """Each client's data conditions: training size, classes held, effective number
+    of classes exp(H(p_m)), total-variation distance of its label mix from the
+    federation's, the largest class's share, and its per-client test split size."""
+    counts = torch.stack([torch.bincount(l.cpu(), minlength=num_classes).double() for l in client_train_labels])
+    glob = counts.sum(dim=0) / counts.sum()
+    out = []
+    for c, ix in zip(counts, split):
+        p = c / c.sum().clamp(min=1)
+        nz = p[p > 0]
+        out.append({"n_train": int(c.sum()), "n_test": int(ix.numel()), "classes_held": int((c > 0).sum()),
+                    "eff_classes": float(torch.exp(-(nz * nz.log()).sum())),
+                    "tv_from_global": float(0.5 * (p - glob).abs().sum()), "top_class_share": float(p.max())})
+    return out
+
+
 @torch.no_grad()
 def concept_accuracy(z: torch.Tensor, concepts: torch.Tensor, trainable: torch.Tensor,
                      chunk: int = 32768) -> Dict[str, float]:

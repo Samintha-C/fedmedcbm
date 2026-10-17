@@ -87,13 +87,13 @@ def concept_scores(feats, r, rows=None, chunk=32768):
     return out
 
 
-def check_args(r, args, p):
-    ra = r["args"]
+def check_args(r, args, p, alpha=None):
+    ra = dict({"label_flip_client": -1}, **r["args"])  # runs from before --label_flip_client had no flip
     want = {"dataset": args.dataset, "seed": args.seed, "val_split": args.val_split,
             "num_clients": args.num_clients, "backbone": args.backbone, "iid": p == "iid",
             "cbl_hidden_layers": 0, "cbl_finetune": False, "label_flip_client": -1}
     if p != "iid":
-        want["alpha"] = args.alpha
+        want["alpha"] = args.alpha if alpha is None else alpha
     if args.backbone.startswith("clip_"):
         want["use_clip_penultimate"] = args.use_clip_penultimate
     else:
