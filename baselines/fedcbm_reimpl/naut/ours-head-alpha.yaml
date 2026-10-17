@@ -180,7 +180,7 @@ spec:
                 echo "ERROR: raw images not reachable at $CHK"; exit 1
               fi
 
-              for SEED in 42; do
+              for SEED in 31; do
                 D=$OUT/s$SEED
                 if find "$D" -name metrics.json 2>/dev/null | grep -q .; then
                   echo "[skip] $DS seed $SEED"; continue
@@ -207,7 +207,7 @@ spec:
               echo ""
               echo "=========== SUMMARY: $DS ==========="
               python baselines/fedcbm_reimpl/summarize.py $OUT
-              N=$(for S in 42; do find $OUT/s$S -name metrics.json 2>/dev/null; done | wc -l)
+              N=$(for S in 31; do find $OUT/s$S -name metrics.json 2>/dev/null; done | wc -l)
               echo "$N/1 seeds have results."
               if [ "$N" -eq 0 ]; then echo "ERROR: no results"; exit 1; fi
           resources:

@@ -95,18 +95,23 @@ VARIANTS["nec-refit"] = dict(VARIANTS["nec"], job="fedcbm-nec-refit", out="FEDCB
                              flags=VARIANTS["nec"]["flags"] + " --path_refit_iters 1000",
                              note="# FedCBM-NEC + support refit (core.fit_sparse_path refit_iters), reported next to the path heads.\n")
 # Per-client results across Dirichlet alpha: the heads above on the Fig-4 alpha-sweep runs
-# (models/<ds>/alphasweep/{a0.05,a0.1,a0.5,a1.0,iid}, seed 42 only). FedCBM's bank does not
-# depend on the partition, so its seed-42 bank is reused. Ours keeps the lam bracket so each
+# (models/<ds>/alphasweep/{a0.05,a0.1,a0.5,a1.0,iid}, one seed each). FedCBM's bank does not
+# depend on the partition, so that seed's bank is reused. Ours keeps the lam bracket so each
 # alpha lands near NEC 5 / 50. Both save per-client accuracy and data conditions.
 ALPHAS = [0.05, 0.1, 0.5, 1.0]
+# The alpha sweep's seed per dataset (args.txt of every alphasweep run): CIFAR-100 ran 31, the
+# rest 42. Both variants must use it, so FedCBM's clients are ours.
+ALPHA_SWEEP_SEED = {"cifar10": 42, "cifar100": 31, "cub": 42, "places365": 42, "imagenet": 42}
 _ALPHA_FLAGS = " --alphas " + " ".join(f"{a:g}" for a in ALPHAS)
 VARIANTS["head-alpha"] = dict(job="ours-head-alpha", out="OURS_HEAD_ALPHA", refcheck=False, script="ours_head.py",
-                              cpu_small=True, sized=True, seeds=[42], datasets=("cifar10", "cifar100", "cub"), alpha_runs=True,
+                              cpu_small=True, sized=True, seed_of=ALPHA_SWEEP_SEED, alpha_runs=True,
+                              datasets=("cifar10", "cifar100", "cub"),
                               flags="--runs $RUNS --supports own --refit_rounds 100" + _ALPHA_FLAGS,
                               note="# Ours (head rule) per client across Dirichlet alpha, on the alpha-sweep runs.\n")
 VARIANTS["nec-alpha"] = dict(VARIANTS["nec-refit"], job="fedcbm-nec-alpha", out="FEDCBM_BALANCED_NEC_ALPHA",
-                             seeds=[42], datasets=("cifar10", "cifar100", "cub"), flags=VARIANTS["nec-refit"]["flags"] + _ALPHA_FLAGS,
-                             note="# FedCBM-NEC (+ refit) per client across Dirichlet alpha (seed-42 bank).\n")
+                             seed_of=ALPHA_SWEEP_SEED, datasets=("cifar10", "cifar100", "cub"),
+                             flags=VARIANTS["nec-refit"]["flags"] + _ALPHA_FLAGS,
+                             note="# FedCBM-NEC (+ refit) per client across Dirichlet alpha (the alpha sweep's seed).\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -185,7 +190,7 @@ def run_dirs(ds, posaware=False):
 
 
 def alpha_run_dirs(ds):
-    """$RUNS for the alpha-sweep runs (seed 42): iid=... a0.05=... (keys as run.arms names them)."""
+    """$RUNS for the alpha-sweep runs (ALPHA_SWEEP_SEED): iid=... a0.05=... (keys as run.arms names them)."""
     runs = [f"iid={MODELS}/{ds}/alphasweep/iid"] + [f"a{a:g}={MODELS}/{ds}/alphasweep/a{a}" for a in ALPHAS]
     return f'\n                RUNS="{" ".join(runs)}"'
 
@@ -362,7 +367,7 @@ def main():
                      if cifar else ": # not CIFAR")
         refcheck = (f"\\\n                  --fcm_repo $WORKSPACE/F-CMs --reference_check_concepts {k}"
                     if k else "")
-        seeds = v.get("seeds", SEEDS)
+        seeds = [v["seed_of"][ds]] if "seed_of" in v else v.get("seeds", SEEDS)
         cpu, mem, dshm = SIZED[ds] if v.get("sized") else (
             str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), cfg["mem"], cfg["dshm"])
         groups = [[s] for s in seeds] if v.get("sized") and not cpu_only else [seeds]
