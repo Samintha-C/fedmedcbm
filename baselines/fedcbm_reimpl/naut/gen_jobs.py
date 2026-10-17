@@ -21,6 +21,8 @@ Variants:
   nec       nec.py on the balanced bank: the paper's C-tuned dense heads
             ({0.01, 0.1, 1.0}) plus NEC-matched sparse heads.
   personal  ours with private per-client heads (ours_personal.py).
+  head-own  ours, the head rule: FedDualAvg -> refit on its own support (ours_head.py).
+  nec-refit nec, plus each sparse head refit on its support without the penalty.
 The earlier "strong" variant (balanced + bias + standardization, lr chosen on
 val; FEDCBM_STRONG) is retired; its flags are in each run's args.json.
 
@@ -29,6 +31,8 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py balanced > baselines/fedcbm_reimpl/naut/fedcbm-balanced.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec      > baselines/fedcbm_reimpl/naut/fedcbm-nec.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py personal > baselines/fedcbm_reimpl/naut/ours-personal.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py head-own > baselines/fedcbm_reimpl/naut/ours-head-own.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-refit > baselines/fedcbm_reimpl/naut/fedcbm-nec-refit.yaml
 """
 
 import os
@@ -75,7 +79,24 @@ VARIANTS = {
                       cpu_small=True, seeds=[42],
                       flags="--runs $RUNS --lam_mults 1.0 --refit_rounds 20 100 --supports perclass own",
                       note="# Diagnosis: own vs per-class support, refit 20 vs 100 rounds (seed 42).\n"),
+    # The head rule picked from head-diag (2026-10-15): FedDualAvg at the tab:main lambda, then
+    # refit on its own support for 100 rounds. Three seeds; seed 42 should reproduce head-diag's own_100.
+    "head-own": dict(job="ours-head-own", out="OURS_HEAD_OWN", refcheck=False, script="ours_head.py",
+                     cpu_small=True, sized=True,
+                     flags="--runs $RUNS --lam_mults 1.0 --refit_rounds 100 --supports own",
+                     note="# Ours, the head rule: FedDualAvg -> refit on its own support, 100 rounds, + logit adjustment.\n"),
 }
+# nec, with each sparse head also refit on its own support without the penalty: the L1 path
+# alone collapses at low NEC (ImageNet NEC5 13%). 1000 steps = our refit's 100 rounds x 10 local.
+VARIANTS["nec-refit"] = dict(VARIANTS["nec"], job="fedcbm-nec-refit", out="FEDCBM_BALANCED_NEC_REFIT", sized=True,
+                             flags=VARIANTS["nec"]["flags"] + " --path_refit_iters 1000",
+                             note="# FedCBM-NEC + support refit (core.fit_sparse_path refit_iters), reported next to the path heads.\n")
+# Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
+# 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
+# peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
+# (cpu, memory, /dev/shm); Places365 and ImageNet get one Job per seed.
+SIZED = {"cifar10": ("8", "4Gi", "1Gi"), "cifar100": ("8", "4Gi", "1Gi"), "cub": ("8", "3Gi", "1Gi"),
+         "places365": ("2", "48Gi", "4Gi"), "imagenet": ("2", "20Gi", "4Gi")}
 # CUB has no NEC~5 lambda in gen_seed_main.LAMS; these are the CUB_NEC5 bracket's.
 CUB_NEC5_LAMS = {"iid": "0.020", "dirichlet": "0.019"}
 
@@ -97,19 +118,24 @@ CPU_DATASETS = ("cifar10", "cifar100", "cub")
 CPU_CORES = 8
 
 
-def to_cpu(job):
+def pin_threads(job, cores):
+    """torch's thread count pinned to the CPU limit (in a container it
+    otherwise sees every host core and oversubscribes)."""
+    old = "              export PIP_CACHE_DIR=/tmp/pip-cache\n"
+    assert job.count(old) == 1, f"pin_threads: expected 1x {old!r}"
+    return job.replace(old, f"              export OMP_NUM_THREADS={cores} MKL_NUM_THREADS={cores}\n" + old)
+
+
+def to_cpu(job, cores=CPU_CORES):
     """The same Job without a GPU: no GPU request, no GPU-type affinity,
-    --device cpu, and torch's thread count pinned to the CPU limit (in a
-    container it otherwise sees every host core and oversubscribes)."""
+    --device cpu, and threads pinned to the CPU limit."""
     def sub(old, new, count):
         nonlocal job
         assert job.count(old) == count, f"to_cpu: expected {count}x {old!r}"
         job = job.replace(old, new)
     sub('              nvidia.com/gpu: "1"\n', "", 2)
     sub("--device cuda", "--device cpu", 1)
-    sub("              export PIP_CACHE_DIR=/tmp/pip-cache\n",
-        f"              export OMP_NUM_THREADS={CPU_CORES} MKL_NUM_THREADS={CPU_CORES}\n"
-        "              export PIP_CACHE_DIR=/tmp/pip-cache\n", 1)
+    job = pin_threads(job, cores)
     head, tail = job.split("      affinity:\n", 1)
     job = head + "      restartPolicy: Never" + tail.split("      restartPolicy: Never", 1)[1]
     assert "nvidia" not in job, "to_cpu: GPU reference left"
@@ -238,7 +264,7 @@ spec:
               echo ""
               echo "=========== SUMMARY: $DS ==========="
               python baselines/fedcbm_reimpl/summarize.py $OUT
-              N=$(find $OUT -name metrics.json | wc -l)
+              N=$(for S in {seeds}; do find $OUT/s$S -name metrics.json 2>/dev/null; done | wc -l)
               echo "$N/{nseeds} seeds have results."
               if [ "$N" -eq 0 ]; then echo "ERROR: no results"; exit 1; fi
           resources:
@@ -271,7 +297,8 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
-                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads)
+                      # all >= 24 GB; 11-16 GB cards left out (ImageNet's per-client heads).
+                      # A40 / A100 need their own resource names on NRP, so they are not listed.
                       - NVIDIA-GeForce-RTX-3090
                       - NVIDIA-A10
                       - NVIDIA-L40
@@ -283,9 +310,10 @@ spec:
                       - Quadro-RTX-6000
                       - NVIDIA-RTX-A5000
                       - NVIDIA-TITAN-RTX
-                      - NVIDIA-A40
-                      - NVIDIA-A100-SXM4-80GB
-                      - NVIDIA-A100-PCIE-40GB
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu  # "GPU is lost" admission errors, 2026-10-15
       restartPolicy: Never
 """
 
@@ -296,6 +324,8 @@ def main():
     note = v.get("note", "")
     if v.get("cpu_small"):
         note += f"# {', '.join(CPU_DATASETS)}: CPU only ({CPU_CORES} cores), see CPU_DATASETS in gen_jobs.py.\n"
+    if v.get("sized"):
+        note += "# Requests sized from measured use (SIZED in gen_jobs.py); Places365 / ImageNet: one Job per seed.\n"
     out = [HEADER.replace("# One Job per dataset;", f"# Variant: {variant}.\n{note}# One Job per dataset;")
            .replace("FEDCBM_REIMPL", v["out"])]
     for ds, cfg in CFG.items():
@@ -308,18 +338,31 @@ def main():
                      if cifar else ": # not CIFAR")
         refcheck = (f"\\\n                  --fcm_repo $WORKSPACE/F-CMs --reference_check_concepts {k}"
                     if k else "")
-        job = JOB.format(
-            ds=ds, job=v["job"], out=v["out"],
-            flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
-            runs=(run_dirs(ds, posaware=variant == "head-posaware")
-                  if variant in ("personal", "head", "head-posaware", "head-diag") else ""),
-            cifar_in=cifar_in, cifar_out=cifar_out,
-            lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
-            val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
-            data=cfg["data"] or ": # no dataset setup needed", check=cfg["check"],
-            seeds=" ".join(map(str, v.get("seeds", SEEDS))), nseeds=len(v.get("seeds", SEEDS)), refcheck=refcheck,
-            cpu=str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), mem=cfg["mem"], dshm=cfg["dshm"])
-        out.append(to_cpu(job) if cpu_only else job)
+        seeds = v.get("seeds", SEEDS)
+        cpu, mem, dshm = SIZED[ds] if v.get("sized") else (
+            str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), cfg["mem"], cfg["dshm"])
+        groups = [[s] for s in seeds] if v.get("sized") and not cpu_only else [seeds]
+        for grp in groups:
+            job = JOB.format(
+                ds=ds, job=v["job"], out=v["out"],
+                flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
+                runs=(run_dirs(ds, posaware=variant == "head-posaware")
+                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own") else ""),
+                cifar_in=cifar_in, cifar_out=cifar_out,
+                lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
+                val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
+                data=cfg["data"] or ": # no dataset setup needed", check=cfg["check"],
+                seeds=" ".join(map(str, grp)), nseeds=len(grp), refcheck=refcheck,
+                cpu=cpu, mem=mem, dshm=dshm)
+            if len(groups) > 1:  # one Job per seed
+                old = f"  name: {v['job']}-{ds}\n"
+                assert job.count(old) == 1
+                job = job.replace(old, f"  name: {v['job']}-{ds}-s{grp[0]}\n")
+            if cpu_only:
+                job = to_cpu(job, int(cpu))
+            elif v.get("sized"):
+                job = pin_threads(job, int(cpu))
+            out.append(job)
     print("".join(out), end="")
 
 

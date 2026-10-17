@@ -24,7 +24,6 @@ import sys
 import time
 
 import torch
-import torch.nn.functional as F
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -82,22 +81,30 @@ def lipschitz(z, rows=65536):
     return 0.5 * float((zz @ v).norm() ** 2) / zz.shape[0]
 
 
-def refit(W, b, M, z, y, nk, clients, rounds=20, local=10):
+def refit(W, b, M, z, y, nk, clients, rounds=20, local=10, chunk=32768):
     lr = 1.0 / lipschitz(z)
     n = float(sum(len(c) for c in clients))
     W = W * M
     for _ in range(rounds):
         Wn, bn = torch.zeros_like(W), torch.zeros_like(b)
         for ix in clients:
-            zc, Y = z[ix].float(), F.one_hot(y[ix], nk).float()
             Wm, bm = W.clone(), b.clone()
             for _ in range(local):
-                P = torch.softmax(zc @ Wm.T + bm, 1) - Y
-                Wm = Wm - lr * (P.T @ zc / len(ix)) * M
-                bm = bm - lr * P.mean(0)
+                # full-batch gradient summed over row chunks: a whole ImageNet client in fp32
+                # does not fit next to z on a 24 GB card
+                gW, gb = torch.zeros_like(Wm), torch.zeros_like(bm)
+                for s in range(0, len(ix), chunk):
+                    rows = ix[s:s + chunk]
+                    zc = z[rows].float()
+                    P = torch.softmax(zc @ Wm.T + bm, 1)
+                    P[torch.arange(len(rows), device=P.device), y[rows]] -= 1.0
+                    gW += P.T @ zc
+                    gb += P.sum(0)
+                    del zc, P
+                Wm = Wm - lr * (gW / len(ix)) * M
+                bm = bm - lr * gb / len(ix)
             Wn += Wm * len(ix) / n
             bn += bm * len(ix) / n
-            del zc, Y
         W, b = Wn, bn
     return W, b
 

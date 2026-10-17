@@ -218,7 +218,7 @@ def nec_check(seed: int = 0) -> bool:
     zt, yt = sample(1500)
     z, y, zt, yt = map(torch.from_numpy, (z, y, zt, yt))
     targets = [2, 4, 10]
-    res = core.fit_sparse_path(z, y, targets, iters=200)
+    res = core.fit_sparse_path(z, y, targets, iters=200, refit_iters=200)
     dense = core.fit_head(z.double(), y, C=1.0, max_iter=200, dtype=torch.float64)
     acc_d = core.accuracy(dense, zt.double(), yt)
     accs = {t: core.accuracy(res[t]["head"], zt, yt) for t in targets}
@@ -229,7 +229,13 @@ def nec_check(seed: int = 0) -> bool:
     good = hit and mono and close
     print(f"nec check (synthetic): NEC achieved {necs}, acc { {t: round(a, 3) for t, a in accs.items()} } "
           f"vs dense {acc_d:.3f} -> {'PASS' if good else 'FAIL'}")
-    return good
+    # the support refit keeps each head's zero pattern and must not lose accuracy
+    acc_r = {t: core.accuracy(res[t]["head_refit"], zt, yt) for t in targets}
+    kept = all(torch.equal(res[t]["head_refit"].weight != 0, res[t]["head"].weight != 0) for t in targets)
+    gain = all(acc_r[t] >= accs[t] - 0.01 for t in targets)
+    print(f"refit check (synthetic): support kept {kept}, acc { {t: round(a, 3) for t, a in acc_r.items()} } "
+          f"-> {'PASS' if kept and gain else 'FAIL'}")
+    return good and kept and gain
 
 
 if __name__ == "__main__":

@@ -335,7 +335,7 @@ def concept_accuracy(z: torch.Tensor, concepts: torch.Tensor, trainable: torch.T
 @torch.no_grad()
 def fit_sparse_path(z: torch.Tensor, y: torch.Tensor, targets: Sequence[float], alpha: float = 0.99,
                     n_lambda: int = 40, min_ratio: float = 1e-3, iters: int = 100,
-                    tol: float = 1e-6) -> Dict[float, Dict[str, object]]:
+                    tol: float = 1e-6, refit_iters: int = 0) -> Dict[float, Dict[str, object]]:
     """One client's sparse head at each NEC target, from an elastic-net path.
 
     Objective (glm_saga's, as in VLG-CBM's sparse layer):
@@ -346,13 +346,20 @@ def fit_sparse_path(z: torch.Tensor, y: torch.Tensor, targets: Sequence[float], 
     geometric lam path from lam_max (all-zero W). NEC = nonzeros / classes held.
     For each target, the path point whose NEC is nearest is returned, mapped
     back to raw projected scores (the zero pattern is unchanged).
+
+    refit_iters > 0 also returns "head_refit": the same support refit without
+    the penalty (FISTA on mean CE, zero pattern fixed, from the path point),
+    as our head is refit on FedDualAvg's support. At low NEC the L1 shrinkage,
+    not the support, is what costs accuracy (C100 NEC5 val 0.43-0.48 -> 0.61-0.64).
+    "empty_classes" counts held classes whose support is empty.
     """
     classes = torch.unique(y.cpu())
     dev = z.device
     k = classes.numel()
     if k < 2:
-        return {t: {"head": Head(torch.zeros(0), torch.zeros(0), classes, constant=int(classes[0])),
-                    "nec": 0.0, "lam": float("nan")} for t in targets}
+        const = Head(torch.zeros(0), torch.zeros(0), classes, constant=int(classes[0]))
+        return {t: {"head": const, "head_refit": const, "nec": 0.0, "lam": float("nan"), "empty_classes": 0}
+                for t in targets}
     tgt = torch.searchsorted(classes.to(dev), y.to(dev))
     n, f = z.shape
     mu, sd = z.mean(dim=0), z.std(dim=0).clamp(min=1e-6)
@@ -395,9 +402,35 @@ def fit_sparse_path(z: torch.Tensor, y: torch.Tensor, targets: Sequence[float], 
     out = {}
     for t in targets:
         lam, nec, Wt, bt = min(path, key=lambda p: abs(p[1] - t))
-        Wr = Wt / sd
-        out[t] = {"head": Head(weight=Wr, bias=bt - Wr @ mu, classes=classes), "nec": nec, "lam": lam}
+        fits = {"head": (Wt, bt)}
+        if refit_iters:
+            fits["head_refit"] = _refit_support(zs, Y, Wt, bt, 0.5 * s2, refit_iters, tol)
+        out[t] = {"nec": nec, "lam": lam, "empty_classes": int(((Wt != 0).sum(dim=1) == 0).sum())}
+        for key, (Wk, bk) in fits.items():
+            Wr = Wk / sd
+            out[t][key] = Head(weight=Wr, bias=bk - Wr @ mu, classes=classes)
     return out
+
+
+@torch.no_grad()
+def _refit_support(zs: torch.Tensor, Y: torch.Tensor, W: torch.Tensor, b: torch.Tensor,
+                   L: float, iters: int, tol: float):
+    """Mean CE over W's zero pattern, no penalty: FISTA from (W, b), step 1/L."""
+    M = (W != 0).float()
+    n = zs.shape[0]
+    Wy, by, t_m = W.clone(), b.clone(), 1.0
+    for _ in range(iters):
+        P = torch.softmax(zs @ Wy.T + by, dim=1) - Y
+        W_new = Wy - (P.T @ zs / n) * M / L
+        b_new = by - P.mean(dim=0) / L
+        t_n = (1 + (1 + 4 * t_m * t_m) ** 0.5) / 2
+        Wy = W_new + ((t_m - 1) / t_n) * (W_new - W)
+        by = b_new + ((t_m - 1) / t_n) * (b_new - b)
+        delta = float((W_new - W).abs().max())
+        W, b, t_m = W_new, b_new, t_n
+        if delta < tol:
+            break
+    return W, b
 
 
 def support_stats(heads: Sequence[Head], num_classes: int, num_concepts: int) -> Dict[str, float]:

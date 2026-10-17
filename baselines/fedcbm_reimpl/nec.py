@@ -7,7 +7,8 @@ per partition and per client:
                 C over {0.01, 0.1, 1.0}); C chosen by mean client accuracy on the
                 full val set, IID partition, as in run.py;
   sparse heads  one elastic-net path per client (core.fit_sparse_path), keeping
-                the point nearest each NEC target.
+                the point nearest each NEC target; with --path_refit_iters > 0, also
+                that support refit without the penalty ("sparse_refit").
 Every head set is scored on the global test set (mean over clients) and on the
 per-client test splits; sparse sets also report the union NEC across clients
 and the support overlap (core.support_stats).
@@ -54,6 +55,8 @@ def main():
     ap.add_argument("--head_C_grid", type=float, nargs="+", default=[0.01, 0.1, 1.0])
     ap.add_argument("--path_lambdas", type=int, default=40)
     ap.add_argument("--path_iters", type=int, default=100)
+    ap.add_argument("--path_refit_iters", type=int, default=0,
+                    help="> 0: also refit each sparse head's support without the penalty")
     args = ap.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -84,7 +87,9 @@ def main():
                                              alpha=args.alpha, seed=args.seed)
         dense = {C: [] for C in args.head_C_grid}
         sparse = {t: [] for t in args.nec_targets}
+        refit = {t: [] for t in args.nec_targets}
         nec_ach = {t: [] for t in args.nec_targets}
+        empty = {t: [] for t in args.nec_targets}
         labels = []
         for m in range(args.num_clients):
             idx = torch.as_tensor(ci[m], dtype=torch.long)
@@ -95,10 +100,14 @@ def main():
             for C in args.head_C_grid:
                 dense[C].append(core.fit_head(z, y, C=C, max_iter=max(50, args.head_max_iter), tol=args.head_tol))
             td = time.time() - th
-            res = core.fit_sparse_path(z, y, args.nec_targets, n_lambda=args.path_lambdas, iters=args.path_iters)
+            res = core.fit_sparse_path(z, y, args.nec_targets, n_lambda=args.path_lambdas, iters=args.path_iters,
+                                       refit_iters=args.path_refit_iters)
             for t in args.nec_targets:
                 sparse[t].append(res[t]["head"])
                 nec_ach[t].append(res[t]["nec"])
+                empty[t].append(res[t]["empty_classes"])
+                if args.path_refit_iters:
+                    refit[t].append(res[t]["head_refit"])
             print(f"[{p}] client {m}: dense x{len(args.head_C_grid)} {td:.0f}s, path {time.time() - th - td:.0f}s, "
                   f"NEC achieved { {t: round(res[t]['nec'], 2) for t in args.nec_targets} }", flush=True)
             del z
@@ -106,15 +115,20 @@ def main():
         split = core.personalized_test_split(te._target_cache, labels, nk, seed=args.seed)
         for C in args.head_C_grid:
             out["dense"].setdefault(str(C), {})[p] = score(dense[C], z_val, y_val, z_test, y_test, split)
-        for t in args.nec_targets:
-            r = score(sparse[t], z_val, y_val, z_test, y_test, split)
-            r["nec_mean_over_clients"] = sum(nec_ach[t]) / len(nec_ach[t])
-            r["nec_per_client"] = nec_ach[t]
-            r.update(core.support_stats(sparse[t], nk, nc))
-            out["sparse"].setdefault(str(t), {})[p] = r
-            print(f"[{p}] NEC {t:g}: achieved {r['nec_mean_over_clients']:.2f}, union {r['union_nec']:.1f}, "
-                  f"jaccard {r['support_jaccard']:.3f} | global {r['global_test_mean_client_acc']:.4f} "
-                  f"per-client {r['personalized_test_acc_weighted']:.4f}", flush=True)
+        for key, heads in (("sparse", sparse), ("sparse_refit", refit)):
+            if key == "sparse_refit" and not args.path_refit_iters:
+                continue
+            for t in args.nec_targets:
+                r = score(heads[t], z_val, y_val, z_test, y_test, split)
+                r["nec_mean_over_clients"] = sum(nec_ach[t]) / len(nec_ach[t])
+                r["nec_per_client"] = nec_ach[t]
+                r["empty_classes_per_client"] = empty[t]
+                r.update(core.support_stats(heads[t], nk, nc))
+                out.setdefault(key, {}).setdefault(str(t), {})[p] = r
+                print(f"[{p}] {key} NEC {t:g}: achieved {r['nec_mean_over_clients']:.2f}, union {r['union_nec']:.1f}, "
+                      f"jaccard {r['support_jaccard']:.3f}, empty classes {empty[t]} | global "
+                      f"{r['global_test_mean_client_acc']:.4f} per-client {r['personalized_test_acc_weighted']:.4f}",
+                      flush=True)
         for C in args.head_C_grid:
             r = out["dense"][str(C)][p]
             print(f"[{p}] dense C={C:g}: global {r['global_test_mean_client_acc']:.4f} "
