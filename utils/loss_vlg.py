@@ -59,6 +59,29 @@ class TwoWayLoss(nn.Module):
             torch.nn.functional.softplus(nlogit_sample + plogit_sample).mean()
 
 
+class BalancedHingeLoss(nn.Module):
+    """Per-concept hinge loss on the CBL logits, labels mapped to {-1, +1}, as FedCBM's
+    concept SVMs use. Each concept's positives and negatives get equal total weight,
+    n / (2 n_pos) and n / (2 n_neg) (sklearn's class_weight="balanced", the FedCBM
+    baseline's balanced variant in baselines/fedcbm_reimpl/core.py): unweighted hinge on
+    ~1-6% positives scores every image absent. cbl_pos_weight is not used.
+    squared=True gives the squared hinge, which is smooth."""
+
+    def __init__(self, concept_counts, num_samples, squared=False):
+        super().__init__()
+        pos = torch.as_tensor(concept_counts, dtype=torch.float32)
+        n = float(num_samples)
+        self.register_buffer("w_pos", torch.where(pos > 0, n / (2.0 * pos.clamp(min=1)), torch.zeros_like(pos)))
+        self.register_buffer("w_neg", torch.where(pos < n, n / (2.0 * (n - pos).clamp(min=1)), torch.zeros_like(pos)))
+        self.squared = squared
+
+    def forward(self, x, y):
+        h = torch.clamp(1.0 - (y * 2.0 - 1.0) * x, min=0.0)
+        if self.squared:
+            h = h * h
+        return (h * torch.where(y > 0, self.w_pos, self.w_neg)).mean()
+
+
 def get_loss(loss_type: str, num_concepts: int, num_samples: int, concept_counts: List[float],
              cbl_pos_weight: float, cbl_auto_weight: bool = False, tp: float = 4.0, device="cuda"):
     if loss_type == "bce":
@@ -73,6 +96,8 @@ def get_loss(loss_type: str, num_concepts: int, num_samples: int, concept_counts
         loss_fn = TwoWayLoss(Tp=tp)
     elif loss_type == "cos_cubed":
         loss_fn = CosCubedLoss()
+    elif loss_type in ("hinge", "sqhinge"):
+        loss_fn = BalancedHingeLoss(concept_counts, num_samples, squared=loss_type == "sqhinge").to(device)
     else:
         raise NotImplementedError(f"Loss {loss_type} is not implemented")
     return loss_fn
