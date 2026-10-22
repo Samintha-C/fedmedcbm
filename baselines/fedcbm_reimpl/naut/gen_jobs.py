@@ -24,6 +24,8 @@ Variants:
   head-own  ours, the head rule: FedDualAvg -> refit on its own support (ours_head.py).
   nec-refit nec, plus each sparse head refit on its support without the penalty.
   head-alpha / nec-alpha  head-own / nec-refit per client across Dirichlet alpha (alpha-sweep runs).
+  local / local-alpha  fully local CBMs vs our federated CBL under the same private heads
+            (local_cbm.py), on the tab:main runs / the alpha-sweep runs.
 The earlier "strong" variant (balanced + bias + standardization, lr chosen on
 val; FEDCBM_STRONG) is retired; its flags are in each run's args.json.
 
@@ -36,6 +38,8 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-refit > baselines/fedcbm_reimpl/naut/fedcbm-nec-refit.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py head-alpha > baselines/fedcbm_reimpl/naut/ours-head-alpha.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-alpha > baselines/fedcbm_reimpl/naut/fedcbm-nec-alpha.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py local > baselines/fedcbm_reimpl/naut/local-cbm.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py local-alpha > baselines/fedcbm_reimpl/naut/local-cbm-alpha.yaml
 """
 
 import os
@@ -112,6 +116,19 @@ VARIANTS["nec-alpha"] = dict(VARIANTS["nec-refit"], job="fedcbm-nec-alpha", out=
                              seed_of=ALPHA_SWEEP_SEED, datasets=("cifar10", "cifar100", "cub"),
                              flags=VARIANTS["nec-refit"]["flags"] + _ALPHA_FLAGS,
                              note="# FedCBM-NEC (+ refit) per client across Dirichlet alpha (the alpha sweep's seed).\n")
+# Fully local CBMs (local_cbm.py): each client trains its own CBL with the tab:main run's Phase-1
+# settings, then fed_cbl (our CBL) and local get the same private heads with the support refit.
+# One Job per seed: a local CBL per client costs about one Phase 1, so a seed is a few hours.
+VARIANTS["local"] = dict(job="local-cbm", out="LOCAL_CBM", refcheck=False, script="local_cbm.py",
+                         cpu_small=True, sized=True, per_seed=True, datasets=("cifar10", "cifar100", "cub"),
+                         flags="--runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 "
+                               "--path_refit_iters 1000",
+                         note="# Fully local CBMs vs our federated CBL, same private heads (+ refit), "
+                              "union NEC, concept AUC and agreement.\n")
+VARIANTS["local-alpha"] = dict(VARIANTS["local"], job="local-cbm-alpha", out="LOCAL_CBM_ALPHA",
+                               seed_of=ALPHA_SWEEP_SEED, alpha_runs=True,
+                               flags=VARIANTS["local"]["flags"] + _ALPHA_FLAGS,
+                               note="# Fully local CBMs vs our federated CBL across Dirichlet alpha (alpha-sweep runs).\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -370,14 +387,14 @@ def main():
         seeds = [v["seed_of"][ds]] if "seed_of" in v else v.get("seeds", SEEDS)
         cpu, mem, dshm = SIZED[ds] if v.get("sized") else (
             str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), cfg["mem"], cfg["dshm"])
-        groups = [[s] for s in seeds] if v.get("sized") and not cpu_only else [seeds]
+        groups = [[s] for s in seeds] if (v.get("sized") and not cpu_only) or v.get("per_seed") else [seeds]
         for grp in groups:
             job = JOB.format(
                 ds=ds, job=v["job"], out=v["out"],
                 flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
                 runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
-                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own") else ""),
+                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "local") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
