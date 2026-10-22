@@ -166,6 +166,11 @@ def main():
     ap.add_argument("--path_iters", type=int, default=100)
     ap.add_argument("--path_refit_iters", type=int, default=1000,
                     help="support refit without the penalty, as nec.py; 1000 = our refit's 100 rounds x 10")
+    ap.add_argument("--local_init", choices=["independent", "shared"], default="independent",
+                    help="independent: each client draws its own initialization, as clients that never "
+                         "coordinate would; shared: one initialization for all (the first LOCAL_CBM runs). "
+                         "On small clients (CUB) a shared init keeps local CBLs correlated through it, so "
+                         "agreement and support overlap read high")
     ap.add_argument("--check_rows", type=int, default=4096)
     ap.add_argument("--check_tol", type=float, default=1e-2)
     ap.add_argument("--acc_tol", type=float, default=0.005)
@@ -194,6 +199,7 @@ def main():
     out = {"dataset": args.dataset, "seed": args.seed, "num_clients": args.num_clients,
            "method": "fed_cbl: federated CBL + private heads; local: own CBL + own private head",
            "num_classes": nk, "nec_targets": args.nec_targets, "head_C_grid": args.head_C_grid,
+           "local_init": args.local_init,
            "runs": {}, "concepts": {}, "client_stats": {}, "fed_cbl": {}, "local": {}}
 
     for p, iid, alpha in run.arms(args):
@@ -213,8 +219,13 @@ def main():
 
         loss_fn = get_loss("bce", nc, 0, [0] * nc, hp["cbl_pos_weight"], False, device=str(device))
         val_loader = DataLoader(va, batch_size=hp["cbl_batch_size"], shuffle=False, num_workers=0)
-        torch.manual_seed(args.seed)
-        init = ConceptLayer(r["W"].shape[1], nc, num_hidden=0, bias=True, device=str(device))
+        # Independent seeds also avoid seed alone, which is the federated Dirichlet run's own
+        # init (train_vlg seeds, and its Dirichlet split draws from numpy, not torch).
+        inits = []
+        for s in ([args.seed * 1000 + m for m in range(args.num_clients)]
+                  if args.local_init == "independent" else [args.seed]):
+            torch.manual_seed(s)
+            inits.append(ConceptLayer(r["W"].shape[1], nc, num_hidden=0, bias=True, device=str(device)))
 
         heads = {v: {"dense": [], "sparse": {t: [] for t in args.nec_targets},
                      "refit": {t: [] for t in args.nec_targets}, "nec": {t: [] for t in args.nec_targets},
@@ -225,7 +236,7 @@ def main():
             y = tr._target_cache[idx]
             labels.append(y)
             th = time.time()
-            cbl, vl = train_local_cbl(tr, ci[m], val_loader, init, hp, loss_fn, device)
+            cbl, vl = train_local_cbl(tr, ci[m], val_loader, inits[m % len(inits)], hp, loss_fn, device)
             val_loss.append(vl)
             loc = local_run(cbl, tr._feature_cache, idx, device)
             tl = time.time() - th

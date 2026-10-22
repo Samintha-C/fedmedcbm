@@ -90,7 +90,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -203,7 +203,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -316,7 +316,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -429,7 +429,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -542,7 +542,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -655,7 +655,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -768,7 +768,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -881,7 +881,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
@@ -994,7 +994,7 @@ spec:
                   --partitions iid dirichlet \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000
+                  --save_dir "$SAVE" --device cpu --runs $RUNS --nec_targets 5 10 20 50 --head_C_grid 0.01 0.1 1.0 --path_refit_iters 1000 --local_init shared
                 RC=$?; set -e
                 if [ $RC -ne 0 ]; then echo "[FAIL] $DS seed $SEED rc=$RC"; continue; fi
                 MD=$(find "$SAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
