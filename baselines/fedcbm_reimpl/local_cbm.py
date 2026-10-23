@@ -132,15 +132,18 @@ def agreement(za, zb):
 
 
 def score(heads, zv, yv, zt, yt, split):
-    """nec.score with one feature set per client (local CBLs) or the same one for all."""
-    g_val = [core.accuracy(h, zv[m], yv) for m, h in enumerate(heads)]
-    g_test = [core.accuracy(h, zt[m], yt) for m, h in enumerate(heads)]
+    """nec.score with one feature set per client (local CBLs, held on the CPU and moved to
+    the labels' device one client at a time: five ImageNet sets do not fit a 24 GB GPU) or
+    the same one for all."""
+    dev = yt.device
+    g_val = [core.accuracy(h, zv[m].to(dev), yv) for m, h in enumerate(heads)]
+    g_test = [core.accuracy(h, zt[m].to(dev), yt) for m, h in enumerate(heads)]
     correct, total, each = 0.0, 0, []
     for m, (h, ix) in enumerate(zip(heads, split)):
         each.append(None)
         if ix.numel():
-            ix = ix.to(zt[m].device)
-            each[-1] = core.accuracy(h, zt[m][ix], yt[ix])
+            ix = ix.to(dev)
+            each[-1] = core.accuracy(h, zt[m].to(dev)[ix], yt[ix])
             correct += each[-1] * ix.numel()
             total += ix.numel()
     return {"global_val_mean_client_acc": sum(g_val) / len(g_val),
@@ -240,8 +243,8 @@ def main():
             val_loss.append(vl)
             loc = local_run(cbl, tr._feature_cache, idx, device)
             tl = time.time() - th
-            zl_val.append(op.concept_scores(va._feature_cache, loc))
-            zl_test.append(op.concept_scores(te._feature_cache, loc))
+            zl_val.append(op.concept_scores(va._feature_cache, loc).cpu())
+            zl_test.append(op.concept_scores(te._feature_cache, loc).cpu())
             for v, z in (("fed_cbl", op.concept_scores(tr._feature_cache, r, rows=idx)),
                          ("local", op.concept_scores(tr._feature_cache, loc, rows=idx))):
                 dense, path = fit_heads(z, y, args)
@@ -277,20 +280,20 @@ def main():
                           f"{s['union_nec']:.1f}, jaccard {s['support_jaccard']:.3f} | global "
                           f"{s['global_test_mean_client_acc']:.4f} per-client {s['personalized_test_acc_weighted']:.4f}",
                           flush=True)
-        lab = te._annotation_cache
+        lab, zt_cpu = te._annotation_cache, z_test.cpu()
         pairs = [(i, j) for i in range(args.num_clients) for j in range(i + 1, args.num_clients)]
         out["concepts"][p] = {
-            "fed_auc": concept_auc(z_test, lab),
+            "fed_auc": concept_auc(zt_cpu, lab),
             "local_auc_per_client": [concept_auc(z, lab) for z in zl_test],
             "local_pairwise_agreement": sum(agreement(zl_test[i], zl_test[j]) for i, j in pairs) / len(pairs),
-            "local_vs_fed_agreement": [agreement(z, z_test) for z in zl_test],
+            "local_vs_fed_agreement": [agreement(z, zt_cpu) for z in zl_test],
             "local_cbl_val_loss": val_loss}
         c = out["concepts"][p]
         print(f"[{p}] concepts: fed AUC {c['fed_auc']:.3f}, local AUC {[round(a, 3) for a in c['local_auc_per_client']]}, "
               f"local pairwise agreement {c['local_pairwise_agreement']:.3f}, local vs fed "
               f"{[round(a, 3) for a in c['local_vs_fed_agreement']]}", flush=True)
         out["runs"][p] = rec
-        del z_val, z_test, zl_val, zl_test, feats
+        del z_val, z_test, zt_cpu, zl_val, zl_test, feats
         torch.cuda.empty_cache()
 
     out["total_seconds"] = round(time.time() - t0, 1)

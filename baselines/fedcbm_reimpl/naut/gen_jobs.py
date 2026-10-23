@@ -40,6 +40,7 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-alpha > baselines/fedcbm_reimpl/naut/fedcbm-nec-alpha.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local > baselines/fedcbm_reimpl/naut/local-cbm.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-indep > baselines/fedcbm_reimpl/naut/local-cbm-indep.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py local-indep-large > baselines/fedcbm_reimpl/naut/local-cbm-indep-large.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-alpha > baselines/fedcbm_reimpl/naut/local-cbm-alpha.yaml
 """
 
@@ -139,6 +140,13 @@ VARIANTS["local-alpha"] = dict(VARIANTS["local"], job="local-cbm-alpha", out="LO
                                flags=_LOCAL_INDEP + _ALPHA_FLAGS,
                                note="# Fully local CBMs (independent init) vs our federated CBL across "
                                     "Dirichlet alpha (alpha-sweep runs).\n")
+# local-indep on the two large datasets: GPU, one Job per seed, same LOCAL_CBM_INDEP root and job
+# names. ImageNet needs ~30 GiB of host memory for five local CBLs' val/test features (held on the
+# CPU so they do not fill a 24 GB card), so 48Gi as Places365; GPU use follows Phase 1 (44% / 89%
+# on the posaware runs) and the per-client paths (94-99% on fedcbm-nec).
+VARIANTS["local-indep-large"] = dict(VARIANTS["local-indep"], datasets=("places365", "imagenet"),
+                                     mem_of={"imagenet": "48Gi"},
+                                     note="# Fully local CBMs, independent init, Places365 / ImageNet (GPU).\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -406,7 +414,7 @@ def main():
                 runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "local",
-                                     "local-indep") else ""),
+                                     "local-indep", "local-indep-large") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
