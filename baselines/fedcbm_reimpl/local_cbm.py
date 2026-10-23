@@ -219,6 +219,9 @@ def main():
         print(f"[check] {p}: {rec['checks']} | global head {acc:.4f} vs {ref:.4f} in metrics.txt", flush=True)
         if abs(acc - ref) > args.acc_tol:
             sys.exit(f"ERROR: {r['path']}: global head does not reproduce its test accuracy: {rec['global_head']}")
+        # Held on the CPU like the local sets and moved per client by score(): on ImageNet the
+        # pair is 2 GB of GPU memory the head fits need.
+        z_val, z_test = z_val.cpu(), z_test.cpu()
 
         loss_fn = get_loss("bce", nc, 0, [0] * nc, hp["cbl_pos_weight"], False, device=str(device))
         val_loader = DataLoader(va, batch_size=hp["cbl_batch_size"], shuffle=False, num_workers=0)
@@ -245,8 +248,12 @@ def main():
             tl = time.time() - th
             zl_val.append(op.concept_scores(va._feature_cache, loc).cpu())
             zl_test.append(op.concept_scores(te._feature_cache, loc).cpu())
-            for v, z in (("fed_cbl", op.concept_scores(tr._feature_cache, r, rows=idx)),
-                         ("local", op.concept_scores(tr._feature_cache, loc, rows=idx))):
+            del cbl
+            torch.cuda.empty_cache()
+            # One CBL's training features on the GPU at a time (ImageNet: 4.2 GB each; holding
+            # both ran a 22 GB card out of memory in fit_sparse_path, 2026-10-23).
+            for v, rv in (("fed_cbl", r), ("local", loc)):
+                z = op.concept_scores(tr._feature_cache, rv, rows=idx)
                 dense, path = fit_heads(z, y, args)
                 heads[v]["dense"].append(dense)
                 for t in args.nec_targets:
@@ -254,7 +261,8 @@ def main():
                     heads[v]["refit"][t].append(path[t]["head_refit"])
                     heads[v]["nec"][t].append(path[t]["nec"])
                     heads[v]["empty"][t].append(path[t]["empty_classes"])
-                del z
+                del z, path
+                torch.cuda.empty_cache()
             print(f"[{p}] client {m}: {len(ci[m])} rows, local CBL {tl:.0f}s (val loss {vl:.4f}), heads "
                   f"{time.time() - th - tl:.0f}s, NEC achieved fed { {t: round(heads['fed_cbl']['nec'][t][-1], 1) for t in args.nec_targets} } "
                   f"local { {t: round(heads['local']['nec'][t][-1], 1) for t in args.nec_targets} }", flush=True)
