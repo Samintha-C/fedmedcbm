@@ -26,6 +26,8 @@ Variants:
   head-alpha / nec-alpha  head-own / nec-refit per client across Dirichlet alpha (alpha-sweep runs).
   local / local-indep / local-alpha  fully local CBMs vs our federated CBL, same private heads
             (local_cbm.py), on the tab:main runs / the alpha-sweep runs.
+  fedmid    FedMiD vs FedDualAvg over a lambda grid on the head (fedmid.py), each dataset's
+            base tab:main run (the seed whose run is in dlamsweep).
 The earlier "strong" variant (balanced + bias + standardization, lr chosen on
 val; FEDCBM_STRONG) is retired; its flags are in each run's args.json.
 
@@ -42,6 +44,7 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-indep > baselines/fedcbm_reimpl/naut/local-cbm-indep.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-indep-large > baselines/fedcbm_reimpl/naut/local-cbm-indep-large.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-alpha > baselines/fedcbm_reimpl/naut/local-cbm-alpha.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py fedmid > baselines/fedcbm_reimpl/naut/fedmid.yaml
 """
 
 import os
@@ -147,6 +150,16 @@ VARIANTS["local-alpha"] = dict(VARIANTS["local"], job="local-cbm-alpha", out="LO
 VARIANTS["local-indep-large"] = dict(VARIANTS["local-indep"], datasets=("places365", "imagenet"),
                                      mem_of={"imagenet": "48Gi"},
                                      note="# Fully local CBMs, independent init, Places365 / ImageNet (GPU).\n")
+# FedMiD vs FedDualAvg (fedmid.py) on each dataset's base tab:main run, the one in dlamsweep[_iid]
+# (C10 s42 and C100 s31 match the local test of 2026-10-24). One FedDualAvg run took ~25 min on
+# Places365 and ~1 h on ImageNet in head-own, so those two run the Dirichlet arm only, FedDualAvg at
+# the two tab:main lambdas (Table 6 holds its other operating points) and FedMiD at five lambdas.
+BASE_SEED = {ds: (set(SEEDS) - set(SEED_MAIN_SEEDS[ds])).pop() for ds in CFG}
+_FEDMID_LARGE = " --partitions dirichlet --grid_points 2 --beyond 3 9 27 --fda_points ends"
+VARIANTS["fedmid"] = dict(job="fedmid", out="FEDMID", refcheck=False, script="fedmid.py",
+                          cpu_small=True, sized=True, seed_of=BASE_SEED, flags="--runs $RUNS", mem_of={"cub": "2Gi"},
+                          flags_of={"places365": _FEDMID_LARGE, "imagenet": _FEDMID_LARGE},
+                          note="# FedMiD (local prox-SGD + primal averaging) vs FedDualAvg on the head, lambda grid.\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -410,11 +423,12 @@ def main():
         for grp in groups:
             job = JOB.format(
                 ds=ds, job=v["job"], out=v["out"],
-                flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") else ""), script=v.get("script", "run.py"),
+                flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") or variant == "fedmid" else "")
+                + v.get("flags_of", {}).get(ds, ""), script=v.get("script", "run.py"),
                 runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "local",
-                                     "local-indep", "local-indep-large") else ""),
+                                     "local-indep", "local-indep-large", "fedmid") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
