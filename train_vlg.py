@@ -96,6 +96,7 @@ def simulate_federated_training_vlg(args):
     _log_path = init_log(getattr(args, "log_dir", None), _run_name, _is_phase1)
     print(f"RUN_NAME={_run_name}")
     print(f"SAVE_DIR={save_dir}")
+    joint_head = None  # --joint_cbm: Phase 1's dense head, scored on the test set at the end
 
     concepts = data_utils.get_concepts(args.concept_file, getattr(args, "filter_set", None))
     # When resuming from a Phase-1 checkpoint, the saved concepts.txt is authoritative:
@@ -483,6 +484,15 @@ def simulate_federated_training_vlg(args):
             )
             _t = _step("loss function init", _t)
 
+            # --joint_cbm: a dense head on the raw concept logits, trained with the CBL. It sits in
+            # global_model.final_layer so federated_averaging averages it with the CBL; it is taken
+            # out again after Phase 1, so Phases 2-3 never see it.
+            _joint = getattr(args, "joint_cbm", False)
+            _joint_gamma = getattr(args, "joint_gamma", 0.5)
+            if _joint:
+                global_model.final_layer = FinalLayer(num_concepts, num_classes, device=str(device))
+                print(f"[joint_cbm] loss = {_joint_gamma} * concept + {1.0 - _joint_gamma:g} * class CE")
+
             client_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
             for m in client_models:
                 m.to(device)
@@ -526,6 +536,8 @@ def simulate_federated_training_vlg(args):
                         backbone_lr=getattr(args, "cbl_bb_lr_rate", 1.0) * getattr(args, "cbl_lr", args.lr),
                         val_loader=val_cbl_loader,
                         lambda_ortho=lambda_ortho,
+                        joint_head=client_models[i].final_layer if _joint else None,
+                        joint_gamma=_joint_gamma,
                     )
                     round_losses.append(total_loss)
                     round_concept_losses.append(concept_loss)
@@ -543,7 +555,13 @@ def simulate_federated_training_vlg(args):
                 avg_concept_loss = sum(round_concept_losses) / len(round_concept_losses)
                 avg_ortho_loss = sum(round_ortho_losses) / len(round_ortho_losses)
                 # Server-side validation on aggregated model
-                server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
+                server_val_loss = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device),
+                                               joint_head=global_model.final_layer if _joint else None,
+                                               joint_gamma=_joint_gamma)
+                if _joint:
+                    _vc = validate_cbl(global_model.backbone, global_model.cbl, val_cbl_loader, loss_fn, str(device))
+                    _vy = (server_val_loss - _joint_gamma * _vc) / (1.0 - _joint_gamma) if _joint_gamma < 1.0 else float("nan")
+                    print(f"  [joint_cbm] round {round_num + 1} server val: concept loss {_vc:.4f}, class CE {_vy:.4f}")
                 projection_metrics["rounds"].append(round_num + 1)
                 projection_metrics["client_losses"].append(round_losses)
                 projection_metrics["avg_client_loss"].append(avg_train_loss)
@@ -564,6 +582,10 @@ def simulate_federated_training_vlg(args):
             if best_cbl_state is not None:
                 global_model.load_state_dict(best_cbl_state)
                 print(f"Restored best CBL checkpoint (val loss {best_val_loss:.4f})")
+            if _joint:
+                joint_head = global_model.final_layer
+                global_model.final_layer = None
+                torch.save(joint_head.state_dict(), os.path.join(save_dir, "joint_head.pt"))
 
             # --phase1_only: save CBL and exit so Phase 2+3 can run in a separate job
             if getattr(args, "phase1_only", False):
@@ -1539,6 +1561,10 @@ def simulate_federated_training_vlg(args):
     log_mem("before test evaluation (backbone back on GPU)")
     test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, global_model.normalization, global_model.final_layer, str(device))
     print(f"Test accuracy: {test_acc:.4f}")
+    if joint_head is not None:
+        # the joint head reads raw concept logits, so no normalization
+        joint_test_acc = test_model(test_loader, global_model.backbone, global_model.cbl, nn.Identity(), joint_head, str(device))
+        print(f"Joint head (dense, Phase 1) test accuracy: {joint_test_acc:.4f}")
 
     # Save model immediately after final layer training completes
     print(f"\nSaving model to {save_dir}...")
@@ -1566,6 +1592,9 @@ def simulate_federated_training_vlg(args):
         "metrics": {"test_accuracy": float(test_acc)},
         "sparsity": sparsity_vlg,
     }
+    if joint_head is not None:
+        metrics_txt_data["joint_cbm"] = {"joint_gamma": args.joint_gamma,
+                                         "joint_head_test_accuracy": float(joint_test_acc)}
     if vlg_final_method == "hybrid_saga":
         metrics_txt_data["saga_lam"] = getattr(args, "saga_lam", 0.0007)
         metrics_txt_data["saga_n_iters"] = getattr(args, "saga_n_iters", 2000)

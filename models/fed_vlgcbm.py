@@ -129,17 +129,22 @@ class FedVLGCBM(nn.Module):
         return c
 
 
-def validate_cbl(backbone, cbl, val_loader, loss_fn, device="cuda"):
+def validate_cbl(backbone, cbl, val_loader, loss_fn, device="cuda", joint_head=None, joint_gamma=1.0):
     val_loss = 0.0
     with torch.no_grad():
-        for features, concept_one_hot, _ in val_loader:
+        for features, concept_one_hot, targets in val_loader:
             features = features.to(device)
             concept_one_hot = concept_one_hot.to(device)
             # features.dim() == 4: raw image batch → run backbone.
             # Otherwise: pre-extracted embeddings [B, D] from feature cache.
             embeddings = backbone(features) if features.dim() == 4 else features
             concept_logits = cbl(embeddings)
-            val_loss += loss_fn(concept_logits, concept_one_hot).item()
+            loss = loss_fn(concept_logits, concept_one_hot)
+            # --joint_cbm: score the joint objective, so the best epoch is not picked on concepts alone
+            if joint_head is not None:
+                y_loss = F.cross_entropy(joint_head(concept_logits), targets.to(device))
+                loss = joint_gamma * loss + (1.0 - joint_gamma) * y_loss
+            val_loss += loss.item()
     return val_loss / len(val_loader)
 
 
@@ -171,25 +176,30 @@ def _ortho_loss(W: torch.Tensor) -> torch.Tensor:
 
 def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_decay=1e-5,
               device="cuda", finetune=False, optimizer_name="sgd", backbone_lr=1e-3,
-              val_loader=None, lambda_ortho=0.0):
+              val_loader=None, lambda_ortho=0.0, joint_head=None, joint_gamma=1.0):
+    # joint_head (--joint_cbm): a linear head on the raw concept logits, trained with the CBL on
+    # joint_gamma * concept loss + (1 - joint_gamma) * class CE. None = the usual concept-only CBL.
     if optimizer_name == "sgd":
         opt = torch.optim.SGD(cbl.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9)
     else:
         opt = torch.optim.Adam(cbl.parameters(), lr=lr, weight_decay=weight_decay)
     if finetune:
         opt.add_param_group({"params": backbone.parameters(), "lr": backbone_lr})
+    if joint_head is not None:
+        opt.add_param_group({"params": joint_head.parameters()})
 
     use_ortho = lambda_ortho > 0.0
 
     best_val_loss = float("inf")
     best_cbl_state = None
     best_backbone_state = None
+    best_head_state = None
 
     for epoch in range(epochs):
         train_loss = 0.0
         concept_loss_sum = 0.0
         ortho_loss_sum = 0.0
-        for features, concept_one_hot, _ in train_loader:
+        for features, concept_one_hot, targets in train_loader:
             features = features.to(device)
             concept_one_hot = concept_one_hot.to(device)
             # 4D (raw image batch) → run backbone. 2D → cached embeddings,
@@ -211,13 +221,17 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
                     "Ensure num_concepts = len(concepts) when building the CBL and the same concept list is used for the dataset."
                 )
             c_loss = loss_fn(concept_logits, concept_one_hot)
+            task_loss = c_loss
+            if joint_head is not None:
+                y_loss = F.cross_entropy(joint_head(concept_logits), targets.to(device))
+                task_loss = joint_gamma * c_loss + (1.0 - joint_gamma) * y_loss
             if use_ortho:
                 W = _get_cbl_output_weight(cbl)
                 o_loss = _ortho_loss(W)
-                loss = c_loss + lambda_ortho * o_loss
+                loss = task_loss + lambda_ortho * o_loss
                 ortho_loss_sum += o_loss.item()
             else:
-                loss = c_loss
+                loss = task_loss
             concept_loss_sum += c_loss.item()
             opt.zero_grad()
             loss.backward()
@@ -228,17 +242,22 @@ def train_cbl(backbone, cbl, train_loader, epochs, loss_fn, lr=1e-3, weight_deca
         train_loss /= n_batches
 
         if val_loader is not None:
-            val_loss = validate_cbl(backbone, cbl, val_loader, loss_fn, device)
+            val_loss = validate_cbl(backbone, cbl, val_loader, loss_fn, device,
+                                    joint_head=joint_head, joint_gamma=joint_gamma)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_cbl_state = {k: v.clone() for k, v in cbl.state_dict().items()}
                 best_backbone_state = {k: v.clone() for k, v in backbone.state_dict().items()}
+                if joint_head is not None:
+                    best_head_state = {k: v.clone() for k, v in joint_head.state_dict().items()}
 
     # Restore best-epoch weights (matches VLG-CBM train_cbl behaviour)
     if val_loader is not None and best_cbl_state is not None:
         cbl.load_state_dict(best_cbl_state)
         if best_backbone_state is not None:
             backbone.load_state_dict(best_backbone_state)
+        if best_head_state is not None:
+            joint_head.load_state_dict(best_head_state)
 
     # Return breakdown so the caller can log component losses
     if use_ortho:
