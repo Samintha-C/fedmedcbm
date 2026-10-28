@@ -22,6 +22,7 @@ Variants:
             ({0.01, 0.1, 1.0}) plus NEC-matched sparse heads.
   personal  ours with private per-client heads (ours_personal.py).
   head-own  ours, the head rule: FedDualAvg -> refit on its own support (ours_head.py).
+  head-nec1020  head-own at NEC~10 and ~20 (lambdas interpolated between tab:main's NEC~5 / ~50).
   nec-refit nec, plus each sparse head refit on its support without the penalty.
   head-alpha / nec-alpha  head-own / nec-refit per client across Dirichlet alpha (alpha-sweep runs).
   local / local-indep / local-alpha  fully local CBMs vs our federated CBL, same private heads
@@ -37,6 +38,7 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec      > baselines/fedcbm_reimpl/naut/fedcbm-nec.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py personal > baselines/fedcbm_reimpl/naut/ours-personal.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py head-own > baselines/fedcbm_reimpl/naut/ours-head-own.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py head-nec1020 > baselines/fedcbm_reimpl/naut/ours-head-nec1020.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-refit > baselines/fedcbm_reimpl/naut/fedcbm-nec-refit.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py head-alpha > baselines/fedcbm_reimpl/naut/ours-head-alpha.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-alpha > baselines/fedcbm_reimpl/naut/fedcbm-nec-alpha.yaml
@@ -47,6 +49,7 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py fedmid > baselines/fedcbm_reimpl/naut/fedmid.yaml
 """
 
+import math
 import os
 import re
 import sys
@@ -160,6 +163,17 @@ VARIANTS["fedmid"] = dict(job="fedmid", out="FEDMID", refcheck=False, script="fe
                           cpu_small=True, sized=True, seed_of=BASE_SEED, flags="--runs $RUNS", mem_of={"cub": "2Gi"},
                           flags_of={"places365": _FEDMID_LARGE, "imagenet": _FEDMID_LARGE},
                           note="# FedMiD (local prox-SGD + primal averaging) vs FedDualAvg on the head, lambda grid.\n")
+# The head rule at NEC~10 and ~20 on the tab:main runs (D4: the cost-of-interpretability claim at
+# NEC 5 / 10 / 20; X7: Table 3 at matched NEC). Same runs and rule as head-own, lambdas from
+# lam_targets_mid with the default 0.6 / 1 / 1.6 bracket; per-class+refit gives NEC exactly 10 and 20.
+# One Job per seed. Places365 and ImageNet run the Dirichlet arm only (a FedDualAvg run is ~25 min
+# / ~1 h there, and this takes 6 per seed).
+_DIR_ONLY = " --partitions dirichlet"
+VARIANTS["head-nec1020"] = dict(VARIANTS["head-own"], job="ours-head-nec1020", out="OURS_HEAD_NEC1020",
+                                per_seed=True, mem_of={"cub": "2Gi"},
+                                flags="--runs $RUNS --refit_rounds 100 --supports own",
+                                flags_of={"places365": _DIR_ONLY, "imagenet": _DIR_ONLY},
+                                note="# Ours, the head rule (own-support refit, 100 rounds) at NEC~10 and ~20.\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -176,6 +190,19 @@ def lam_targets(ds):
         for nec in (5, 50):
             lam = LAMS[ds][part][nec] or (CUB_NEC5_LAMS[part] if ds == "cub" and nec == 5 else None)
             out.append(f"{part}.{nec}:{lam}")
+    return " --lam_targets " + " ".join(out)
+
+
+def lam_targets_mid(ds, necs=(10, 20)):
+    """Lambdas for NEC between the tab:main targets: log-linear in log NEC between the NEC~5 and
+    NEC~50 lambdas (FedDualAvg's NEC falls roughly as a power of lambda); the bracket absorbs the rest."""
+    out = []
+    for part in ("iid", "dirichlet"):
+        l5 = float(LAMS[ds][part][5] or CUB_NEC5_LAMS[part])
+        l50 = float(LAMS[ds][part][50])
+        for nec in necs:
+            t = math.log(nec / 5) / math.log(10)
+            out.append(f"{part}.{nec}:{l5 ** (1 - t) * l50 ** t:.3g}")
     return " --lam_targets " + " ".join(out)
 # torchvision downloads CIFAR from Toronto at ~80 KB/s (35 min each). Keep one
 # copy on the PVC and seed the pod's cache from it; the first job populates it.
@@ -423,12 +450,13 @@ def main():
         for grp in groups:
             job = JOB.format(
                 ds=ds, job=v["job"], out=v["out"],
-                flags=v["flags"] + (lam_targets(ds) if variant.startswith("head") or variant == "fedmid" else "")
+                flags=v["flags"] + (lam_targets_mid(ds) if variant == "head-nec1020" else
+                                    lam_targets(ds) if variant.startswith("head") or variant == "fedmid" else "")
                 + v.get("flags_of", {}).get(ds, ""), script=v.get("script", "run.py"),
                 runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
-                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "local",
-                                     "local-indep", "local-indep-large", "fedmid") else ""),
+                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-nec1020",
+                                     "local", "local-indep", "local-indep-large", "fedmid") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
