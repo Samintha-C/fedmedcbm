@@ -21,10 +21,14 @@ Compare with OURS_HEAD_OWN/cifar100 (IID, ResNet-50) and VLG-CBM's CIFAR-100 row
 Caution: an earlier federated CIFAR-100 run on CLIP-RN50 (hidden layers 0, before the head
 rule) gave 59 against 65.7 on ResNet-50.
 
-Sizing as gen_joint_pilot.py (8 CPU / 6Gi): its CLIP-RN50 CIFAR-10 pods used 59-99% CPU and
-30-65% RAM. ours_head.py extracts the CIFAR-100 CLIP test features (not cached before), at
+Sizing: 8 CPU as gen_joint_pilot.py (its CLIP-RN50 CIFAR-10 pods used 59-99% CPU and 1.8-3.9 GB
+RAM). ours_head.py extracts the CIFAR-100 CLIP test features (not cached before), at
 --extract_batch_size 64: the default 256 with 2 workers x prefetch 4 needs ~1.2 GB of /dev/shm
-and died with a bus error on 1Gi (2026-10-28, seed 42 head-rule step).
+and died with a bus error on 1Gi (2026-10-28, seed 42 head-rule step). main_fed.py has no such
+flag: its extraction runs at cbl_batch_size x 8 = 256 with max(num_workers, 4) = 4 workers x
+prefetch 4, so 16 batches of 154 MB = 2.4 GB in /dev/shm. Seed 42's train features were cached
+by an older run, so this first bit at seed 31 (bus error, 2026-10-28). Hence 3Gi dshm, and 8Gi
+RAM because the memory-backed shm counts against the pod's limit (RSS ~3 GB + 2.4 GB at peak).
 
 Usage:
     python naut/gen_c100_clip.py > naut/generated_jobs/c100-clip.yaml
@@ -44,7 +48,7 @@ SEEDS = [42, 31, 7]
 BB = CFG["cifar10"]["bb"]  # --backbone clip_RN50 --use_clip_penultimate --clip_name RN50
 LAM_MULTS = "0.3 0.55 1.0 1.8 3.3"
 COMMON_CPU = COMMON.replace("--device cuda", "--device cpu")
-CPU, MEM, DSHM = "8", "6Gi", "1Gi"
+CPU, MEM, DSHM = "8", "8Gi", "3Gi"
 
 JOB = """---
 apiVersion: batch/v1

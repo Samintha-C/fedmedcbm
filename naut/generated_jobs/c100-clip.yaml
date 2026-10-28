@@ -93,10 +93,10 @@ spec:
           resources:
             requests:
               cpu: "8"
-              memory: "6Gi"
+              memory: "8Gi"
             limits:
               cpu: "8"
-              memory: "6Gi"
+              memory: "8Gi"
           volumeMounts:
             - name: sc-rwx-vol
               mountPath: /sc-rwx-vol
@@ -109,5 +109,5 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 1Gi
+            sizeLimit: 3Gi
       restartPolicy: Never

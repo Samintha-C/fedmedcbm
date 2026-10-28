@@ -76,7 +76,9 @@ BASE_SEED = {ds: ({42, 31, 7} - set(SEEDS[ds])).pop() for ds in DATASETS}
 MODELS = "/sc-rwx-vol/fedmedcbm/models"
 # (cpu, memory, /dev/shm); measured use in the docstring.
 SIZE = {"cifar10": ("4", "6Gi", "1Gi"), "cifar100": ("4", "6Gi", "1Gi"), "cub": ("4", "4Gi", "1Gi"),
-        "places365": ("2", "48Gi", "4Gi"), "imagenet": ("2", "48Gi", "4Gi")}
+        "places365": ("2", "48Gi", "4Gi"), "imagenet": ("2", "56Gi", "4Gi")}
+# 2026-10-22, the GPU run: Places365 peaked 38.5 GiB (GPU 49-57%), ImageNet 45.7 GiB of 48 (GPU 83%),
+# too close to the limit, hence 56Gi (Phase-1 mean 13 GiB stays above the 20% floor).
 SKIP = {ds: (ORTHO, "ran 2026-10-21, results in cvpr2027/RESULTS_STATUS.md")
         for ds in ("cifar10", "cifar100", "cub")}
 SKIP.update({ds: (["100"], "tab:main config, already on the PVC (dlamsweep run + OURS_HEAD_OWN s42)")

@@ -3057,11 +3057,11 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: sc-rwx-vol
@@ -3215,11 +3215,11 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: sc-rwx-vol
@@ -3374,11 +3374,11 @@ spec:
 #           resources:
 #             requests:
 #               cpu: "2"
-#               memory: "48Gi"
+#               memory: "56Gi"
 #               nvidia.com/gpu: "1"
 #             limits:
 #               cpu: "2"
-#               memory: "48Gi"
+#               memory: "56Gi"
 #               nvidia.com/gpu: "1"
 #           volumeMounts:
 #             - name: sc-rwx-vol
@@ -3532,11 +3532,11 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: sc-rwx-vol
@@ -3690,11 +3690,11 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "2"
-              memory: "48Gi"
+              memory: "56Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: sc-rwx-vol
