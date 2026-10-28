@@ -12,6 +12,7 @@ BACKBONE_ENCODING_DIMENSION = {
     "clip_RN50": 1024,
     "clip_RN50_penultimate": 2048,
     "resnet50": 2048,
+    "resnet18_cxr": 512,
 }
 
 lf_cbm_path = os.path.join(os.path.dirname(__file__), '../../Label-free-CBM')
@@ -67,9 +68,19 @@ def get_data(dataset_name, preprocess=None, root=None):
         except RuntimeError:
             return datasets.Places365(root=places_root, split=split, small=True,
                                       download=False, transform=preprocess)
+    # CheXpert (X28): F-CM's split, prepared by case_studies/chexpert/prepare.py; "val" is the test set.
+    if dataset_name in ("chexpert_train", "chexpert_val"):
+        from data.chexpert import CheXpert
+        return CheXpert(dataset_name.split("_")[1], transform=preprocess, root=root)
     return lf_cbm_data_utils.get_data(dataset_name, preprocess)
 
 def get_target_model(target_name, device):
+    # F-CM's CheXpert encoder: ImageNet ResNet-18 (V1) on its own preprocessing (data/chexpert.py).
+    if target_name == "resnet18_cxr":
+        from data.chexpert import CXR_PREPROCESS
+        target_model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).to(device)
+        target_model.eval()
+        return target_model, CXR_PREPROCESS
     return lf_cbm_data_utils.get_target_model(target_name, device)
 
 def get_classes(dataset_name):

@@ -201,6 +201,9 @@ def save_metrics_txt(save_dir, metrics_data):
 def get_preprocess(backbone_name):
     if backbone_name.startswith("clip_"):
         return get_clip_preprocess()
+    elif backbone_name == "resnet18_cxr":
+        from data.chexpert import CXR_PREPROCESS
+        return CXR_PREPROCESS
     else:
         return get_resnet_preprocess()
 
