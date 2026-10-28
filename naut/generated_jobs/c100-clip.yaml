@@ -82,7 +82,7 @@ spec:
                   --partitions iid \
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \
-                  --save_dir "$HSAVE" --device cpu --runs iid=$D \
+                  --save_dir "$HSAVE" --device cpu --runs iid=$D --extract_batch_size 64 \
                   --lam_mults 0.3 0.55 1.0 1.8 3.3 --refit_rounds 100 --supports own \
                   --lam_targets iid.5:0.0088 iid.50:0.00069
                 MH=$(find "$HSAVE" -maxdepth 1 -mindepth 1 -type d | head -1)

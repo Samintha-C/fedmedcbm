@@ -22,7 +22,9 @@ Caution: an earlier federated CIFAR-100 run on CLIP-RN50 (hidden layers 0, befor
 rule) gave 59 against 65.7 on ResNet-50.
 
 Sizing as gen_joint_pilot.py (8 CPU / 6Gi): its CLIP-RN50 CIFAR-10 pods used 59-99% CPU and
-30-65% RAM.
+30-65% RAM. ours_head.py extracts the CIFAR-100 CLIP test features (not cached before), at
+--extract_batch_size 64: the default 256 with 2 workers x prefetch 4 needs ~1.2 GB of /dev/shm
+and died with a bus error on 1Gi (2026-10-28, seed 42 head-rule step).
 
 Usage:
     python naut/gen_c100_clip.py > naut/generated_jobs/c100-clip.yaml
@@ -121,7 +123,7 @@ spec:
                   --partitions iid \\
                   --annotation_dir /sc-rwx-vol/fedmedcbm/annotations \\
                   --annotation_cache_dir /sc-rwx-vol/fedmedcbm/annotation_cache \\
-                  --save_dir "$HSAVE" --device cpu --runs iid=$D \\
+                  --save_dir "$HSAVE" --device cpu --runs iid=$D --extract_batch_size 64 \\
                   --lam_mults {lam_mults} --refit_rounds 100 --supports own \\
                   --lam_targets iid.5:{lam5} iid.50:{lam50}
                 MH=$(find "$HSAVE" -maxdepth 1 -mindepth 1 -type d | head -1)
