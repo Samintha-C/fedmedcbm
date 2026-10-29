@@ -10,6 +10,7 @@ FedMask steps removed). Backbone is frozen throughout, matching the CBM runs.
 """
 
 import datetime
+import hashlib
 import os
 
 import torch
@@ -17,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from data.data_utils import (
-    get_data, get_classes, split_dataset_for_federated, print_client_distribution,
+    get_data, get_classes, get_dataset_targets, split_dataset_for_federated, print_client_distribution,
 )
 from models.fed_vlgcbm import Backbone, BackboneCLIP, NormalizationLayer
 from training_utils import get_preprocess, save_args, save_metrics_txt, save_training_metrics
@@ -58,6 +59,34 @@ def _extract_features(backbone, dataset, device, batch_size, num_workers):
         feats.append(emb)
         labels.append(y)
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
+
+
+def _load_cached_features(args, split_suffix, dataset):
+    """(feats fp16, labels) from the main pipeline's backbone-feature cache, or None.
+
+    Same file name as DinoConceptDataset._feature_cache_path, keyed by the md5 of the rows'
+    indices into the full dataset. train_vlg.py draws the same random_split (seed, val_split)
+    and uses the same backbone and preprocessing, so a hit holds the features this file would
+    extract. Used only if the labels match row for row; otherwise the caller extracts.
+    """
+    cache_dir = getattr(args, "feature_cache_dir", None)
+    if not cache_dir:
+        return None
+    indices = list(dataset.indices) if hasattr(dataset, "indices") else list(range(len(dataset)))
+    idx_hash = hashlib.md5(torch.tensor(indices, dtype=torch.long).numpy().tobytes()).hexdigest()[:12]
+    safe_name = args.backbone.replace("/", "_").replace(":", "_")
+    path = os.path.join(cache_dir, f"{args.dataset}_{split_suffix}_{safe_name}_feat_s{idx_hash}.pt")
+    if not os.path.exists(path):
+        print(f"[dense] no feature cache at {path}; extracting")
+        return None
+    blob = torch.load(path, map_location="cpu", weights_only=True)
+    feats, targets = blob["features"], blob["targets"].long()
+    labels = torch.as_tensor(get_dataset_targets(dataset)).long()
+    if feats.shape[0] != len(indices) or not torch.equal(targets, labels):
+        print(f"[dense] feature cache {path} does not match this split; extracting")
+        return None
+    print(f"[dense] loaded {path} ({tuple(feats.shape)}, {feats.dtype})")
+    return feats.half(), targets
 
 
 def train_fed_dense(args):
@@ -101,8 +130,10 @@ def train_fed_dense(args):
     # parent RSS, COW-duplicating already-extracted features → OOM on imagenet/places.)
     bs = getattr(args, "extract_batch_size", 256)
     nw = getattr(args, "num_workers", 2)
-    all_feats, all_labels = _extract_features(backbone, train_dataset, device, bs, nw)
-    print(f"[dense] extracted {all_feats.shape[0]} train features "
+    cached = _load_cached_features(args, "train", train_dataset)
+    all_feats, all_labels = cached if cached is not None else \
+        _extract_features(backbone, train_dataset, device, bs, nw)
+    print(f"[dense] {all_feats.shape[0]} train features "
           f"({all_feats.element_size() * all_feats.nelement() / 1024**3:.2f}GB fp16)")
 
     client_feats, client_labels, client_data_sizes = [], [], []
@@ -115,7 +146,10 @@ def train_fed_dense(args):
     total_samples = sum(client_data_sizes)
     client_weights = [n / total_samples for n in client_data_sizes]
 
-    val_feats, val_labels = _extract_features(backbone, val_dataset, device, bs, nw)
+    # train_vlg.py caches its val split under split_suffix "train" as well.
+    cached = _load_cached_features(args, "train", val_dataset)
+    val_feats, val_labels = cached if cached is not None else \
+        _extract_features(backbone, val_dataset, device, bs, nw)
 
     # ── Phase 2b: federated normalization (parallel statistics) ──────────────
     # Stats accumulated in fp32 from the fp16 blocks (one client cast at a time).
@@ -224,13 +258,20 @@ def train_fed_dense(args):
     model = DenseClassifier(backbone, normalization=norm_layer, head=head).to(device)
     model.eval()
     test_data = get_data(f"{args.dataset}_val", preprocess=preprocess)
+    # Cached test features skip the backbone pass (DenseClassifier takes features as well as
+    # images); in-memory tensors need no loader workers.
+    test_nw = nw
+    cached = _load_cached_features(args, "val", test_data)
+    if cached is not None:
+        test_data = TensorDataset(cached[0].float(), cached[1])
+        test_nw = 0
     print("\n=== Test evaluation ===")
     accuracy = get_accuracy_cbm(model, test_data, device,
                                 batch_size=getattr(args, "batch_size", 250),
-                                num_workers=nw)
+                                num_workers=test_nw)
     per_class = get_per_class_accuracy_vlg(model, test_data, device, classes,
                                            batch_size=getattr(args, "batch_size", 250),
-                                           num_workers=nw)
+                                           num_workers=test_nw)
     print(f"Test accuracy: {float(accuracy):.4f}  (overall {per_class['Overall accuracy']}%)")
 
     # ── Save (metrics.txt schema matches CBM runs; no sparsity block) ────────

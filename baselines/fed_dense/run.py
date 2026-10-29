@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--save_dir", default="saved_models")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--feature_cache_dir", default=None,
+                        help="main pipeline's --annotation_cache_dir; reuse its cached backbone features")
     cli = parser.parse_args()
 
     config_path = cli.config if os.path.isabs(cli.config) else os.path.join(_FED_ROOT, cli.config)
@@ -63,6 +65,8 @@ def main():
         merged["device"] = cli.device
     if cli.seed is not None:
         merged["seed"] = cli.seed
+    if cli.feature_cache_dir is not None:
+        merged["feature_cache_dir"] = cli.feature_cache_dir
 
     args = types.SimpleNamespace(**merged)
     print(f"[run] fed_dense config: {config_path}")
