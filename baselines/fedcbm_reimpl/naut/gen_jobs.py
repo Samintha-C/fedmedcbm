@@ -27,6 +27,8 @@ Variants:
   head-alpha / nec-alpha  head-own / nec-refit per client across Dirichlet alpha (alpha-sweep runs).
   local / local-indep / local-alpha  fully local CBMs vs our federated CBL, same private heads
             (local_cbm.py), on the tab:main runs / the alpha-sweep runs.
+  t3-dense / t3-oracle  Table 3 (dense_prune.py): dense FedAvg / FedProx and FedAvg cut to NEC k +
+            masked fine-tune; the centrally solved sparse layer (oracle).
   fedmid    FedMiD vs FedDualAvg over a lambda grid on the head (fedmid.py), each dataset's
             base tab:main run (the seed whose run is in dlamsweep).
 The earlier "strong" variant (balanced + bias + standardization, lr chosen on
@@ -47,6 +49,8 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-indep-large > baselines/fedcbm_reimpl/naut/local-cbm-indep-large.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-alpha > baselines/fedcbm_reimpl/naut/local-cbm-alpha.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py fedmid > baselines/fedcbm_reimpl/naut/fedmid.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-dense > baselines/fedcbm_reimpl/naut/t3-dense.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-oracle > baselines/fedcbm_reimpl/naut/t3-oracle.yaml
 """
 
 import math
@@ -174,6 +178,25 @@ VARIANTS["head-nec1020"] = dict(VARIANTS["head-own"], job="ours-head-nec1020", o
                                 flags="--runs $RUNS --refit_rounds 100 --supports own",
                                 flags_of={"places365": _DIR_ONLY, "imagenet": _DIR_ONLY},
                                 note="# Ours, the head rule (own-support refit, 100 rounds) at NEC~10 and ~20.\n")
+# Table 3 subset (X7, 2026-10-29), dense_prune.py on the same tab:main runs and seeds as head-own /
+# head-nec1020, Dirichlet only. t3-dense: dense FedAvg and FedProx heads, and the FedAvg head cut to
+# NEC 5 / 10 / 20 + masked fine-tune. t3-oracle: the sparse layer solved centrally on the pooled
+# rows (the oracle). Separate Jobs and output roots, so the large datasets run both at once and
+# neither Job's skip check sees the other's metrics.json.
+_T3 = "--runs $RUNS --partitions dirichlet --necs 5 10 20"
+# Large datasets: per-class cut only, fine-tune lr from {3e-2, 1e-1} (the two the local check picked),
+# so a seed is 2 dense heads + 6 fine-tunes (~40-60 min each on ImageNet by the head-rule runs).
+_T3_LARGE = " --prune_modes perclass --prune_lrs 0.03 0.1"
+# CUB gets 4 cores: ours-head-nec1020 CUB pods used 1.4-2.6 of 8 (s31 17%, under the 20% floor).
+VARIANTS["t3-dense"] = dict(VARIANTS["head-own"], job="t3-dense", out="T3_DENSE_PRUNE", mem_of={"cub": "2Gi"},
+                            cpu_of={"cub": "4"},
+                            flags=_T3 + " --parts dense prune",
+                            flags_of={"places365": _T3_LARGE, "imagenet": _T3_LARGE},
+                            script="dense_prune.py",
+                            note="# Table 3: dense FedAvg / FedProx heads, and FedAvg cut to NEC k + masked fine-tune.\n")
+VARIANTS["t3-oracle"] = dict(VARIANTS["t3-dense"], job="t3-oracle", out="T3_ORACLE", flags=_T3 + " --parts oracle",
+                             flags_of={},
+                             note="# Table 3: the sparse layer solved centrally on the pooled rows (oracle) + support refit.\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -446,6 +469,7 @@ def main():
         cpu, mem, dshm = SIZED[ds] if v.get("sized") else (
             str(CPU_CORES) if cpu_only else cfg.get("cpu", "4"), cfg["mem"], cfg["dshm"])
         mem = v.get("mem_of", {}).get(ds, mem)
+        cpu = v.get("cpu_of", {}).get(ds, cpu)
         groups =[[s] for s in seeds] if (v.get("sized") and not cpu_only) or v.get("per_seed") else [seeds]
         for grp in groups:
             job = JOB.format(
@@ -456,7 +480,8 @@ def main():
                 runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-nec1020",
-                                     "local", "local-indep", "local-indep-large", "fedmid") else ""),
+                                     "local", "local-indep", "local-indep-large", "fedmid", "t3-dense",
+                                     "t3-oracle") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),

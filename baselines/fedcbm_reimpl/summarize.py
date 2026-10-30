@@ -19,6 +19,17 @@ def main(root):
     if not runs:
         print(f"no metrics.json under {root}")
         return
+    t3_runs = [m for m in runs if m.get("method", "").startswith("dense FedAvg")]
+    for m in t3_runs:  # dense_prune.py output (Table 3): one line per seed and part
+        for p, rec in m["partitions"].items():
+            cells = [f"{k} {rec[k]['global_test']:.2f}" for k in ("fedavg", "fedprox") if k in rec]
+            cells += [f"{mode} {k}: {r['global_test']:.2f}" for mode, by in rec.get("prune", {}).items()
+                      for k, r in by.items()]
+            cells += [f"oracle {k}: {r['global_test']:.2f}@{r['nec']:.1f}" for k, r in rec.get("oracle", {}).items()]
+            print(f"s{m['seed']} {p}: " + " | ".join(cells))
+    runs = [m for m in runs if m not in t3_runs]
+    if not runs:
+        return
     nec_runs = [m for m in runs if "sparse" in m]
     head_runs = [m for m in runs if any("targets" in v for v in m.get("partitions", {}).values())]
     runs = [m for m in runs if "partitions" in m and not any("targets" in v for v in m["partitions"].values())]
