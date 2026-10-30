@@ -122,6 +122,9 @@ def main():
                     help="extra refit lengths to report (20 = the method)")
     ap.add_argument("--supports", nargs="+", choices=["perclass", "own"], default=["perclass"],
                     help="perclass = top-k by |dual| (the method); own = FedDualAvg's own support")
+    ap.add_argument("--save_heads", action="store_true",
+                    help="also save the FedDualAvg head and each refit variant to heads.pt (test-time steering "
+                         "and intervention need the weights, and metrics.json has only their accuracy)")
     ap.add_argument("--check_rows", type=int, default=4096)
     ap.add_argument("--check_tol", type=float, default=1e-2)
     ap.add_argument("--acc_tol", type=float, default=0.005)
@@ -149,6 +152,7 @@ def main():
     nk = len(d["classes"])
     out = {"dataset": args.dataset, "seed": args.seed, "method": "ours head: fda / per-class+refit / logit-adj",
            "lam_targets": lam_t, "partitions": {}}
+    saved = {}  # {partition: {nec target: {"fda" or "<support>_<rounds>": (W, b)}}}
     for p, iid, alpha in run.arms(args):
         r = loaded[p]
         ci = run.split_dataset_for_federated(d["train_ds"], args.num_clients, iid=iid,
@@ -206,10 +210,12 @@ def main():
                                     "global_test_mean": sum(gacc(*h) for h in la) / len(la)},
                    "union_nec": float((Wr * M != 0).sum()) / nk}
             variants = {}
+            held_heads = saved.setdefault(p, {}).setdefault(target, {"fda": (W.cpu(), b.cpu())})
             for sup in args.supports:
                 Ms = M if sup == "perclass" else (W.abs() > 1e-5).float()
                 for R in args.refit_rounds:
                     Wv, bv = (Wr, br) if (sup == "perclass" and R == 20) else refit(W, b, Ms, z, y, nk, clients, rounds=R)
+                    held_heads[f"{sup}_{R}"] = (Wv.cpu(), bv.cpu())
                     variants[f"{sup}_{R}"] = {"nec": float((Wv * Ms != 0).sum()) / nk, "global_test": gacc(Wv, bv),
                                               "per_client": pacc([(Wv, bv)] * len(ci)),
                                               "logit_adj_per_client": pacc([(Wv, bv + sh) for sh in shifts]),
@@ -226,6 +232,8 @@ def main():
         out["partitions"][p] = rec
         del z
         torch.cuda.empty_cache()
+    if args.save_heads:
+        torch.save(saved, os.path.join(save_dir, "heads.pt"))
     out["total_seconds"] = round(time.time() - t0, 1)
     with open(os.path.join(save_dir, "metrics.json"), "w") as f:
         json.dump(out, f, indent=2)
