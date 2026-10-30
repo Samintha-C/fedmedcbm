@@ -23,11 +23,20 @@ Then, on those features:
              (VLG-CBM's objective, core.fit_sparse_path's solver), then refit on its support. What a
              sparse head on this concept layer reaches when the data can be pooled. Checked against
              core.fit_sparse_path on C10 / C100 (same NEC, lambda and accuracy at every target).
+  thresh     FedAvg as fedavg above, with train_vlg.py's fedavg_l1 server step: the averaged head is
+             soft-thresholded every round, at the level that leaves k*K nonzeros (NEC exactly k).
+  fedmid     fedmid.fedmid (local prox-SGD, primal averaging) over a lambda bracket (--fedmid_lams x
+             --mults), the run with the NEC nearest each target kept.
+  elastic    FedDualAvg with train_vlg.py's elastic-net prox (l2 = --elastic_l2_ratio x l1), bracketed
+             around the head rule's lambda, nearest NEC kept.
+  thresh, fedmid and elastic are each refit on their own support as the head rule is (ours_head.refit,
+  --refit_rounds 100); the head before the refit is recorded too.
 Scored on the global test set. The head rule at the same NEC is OURS_HEAD_OWN / OURS_HEAD_NEC1020
 on the same runs.
 
 Usage: run.py's data flags, plus --runs dirichlet=<dir> [iid=<dir>], --necs 5 10 20 and
-       --parts dense prune oracle (prune needs dense).
+       --parts dense prune oracle thresh fedmid elastic (prune needs dense; fedmid / elastic need
+       --fedmid_lams / --elastic_lams NEC:LAM ...).
 """
 import datetime
 import json
@@ -41,15 +50,19 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import core  # noqa: E402
+import fedmid as fm  # noqa: E402
 import ours_head  # noqa: E402
 import ours_personal as op  # noqa: E402
 import run  # noqa: E402
 
 
-def fedavg_dense(z, y, zv, yv, nk, clients, mu=0.0, rounds=200, epochs=3, bs=512, lr=1e-3, mask=None, init=None):
+def fedavg_dense(z, y, zv, yv, nk, clients, mu=0.0, rounds=200, epochs=3, bs=512, lr=1e-3, mask=None, init=None,
+                 budget=None):
     """train_vlg.py's fedavg_l1 (lambda 0) or fedprox (mu > 0) Phase 3 on rows in client-block order.
     With mask (and init, the head it was cut from), the same loop trains only the masked weights:
-    zero-gradient coordinates get zero Adam steps, so the support never changes."""
+    zero-gradient coordinates get zero Adam steps, so the support never changes. With budget=k,
+    train_vlg.py's fedavg_l1 server step: after averaging, soft-threshold the head every round, at
+    the level that leaves k*K nonzeros (so NEC is exactly k without searching a fixed threshold)."""
     dev = z.device
     g = torch.Generator(device="cpu").manual_seed(0)
     torch.manual_seed(0)
@@ -79,6 +92,9 @@ def fedavg_dense(z, y, zv, yv, nk, clients, mu=0.0, rounds=200, epochs=3, bs=512
             nW += wts[ci] * lw.detach()
             nb += wts[ci] * lb.detach()
         W, b = nW, nb
+        if budget is not None:
+            theta = W.abs().flatten().topk(min(budget * nk + 1, W.numel())).values[-1]
+            W = ours_head.soft(W, theta)
         acc = core.accuracy(core.Head(W, b, torch.arange(nk)), zv, yv)
         hist.append(acc)
         if acc > best_acc:
@@ -95,6 +111,49 @@ def cut(W, k, mode):
         flat = M.view(-1)
         flat[W.abs().view(-1).topk(min(k * W.shape[0], W.numel())).indices] = 1.0
     return M
+
+
+def feddualavg_en(z, y, zv, yv, nk, lam, l2_ratio, clients, rounds=200, epochs=3, bs=512, eta_c=0.01, eta_s=1.0):
+    """ours_head.feddualavg with train_vlg.py's elastic-net prox (--dual_l2_lam): the l1 soft
+    threshold at t*lam, divided by 1 + t*lam*l2_ratio, at every step and at the server."""
+    dev = z.device
+    g = torch.Generator(device="cpu").manual_seed(0)
+    n = float(sum(len(c) for c in clients))
+    wts = [len(c) / n for c in clients]
+    zw, zb = torch.zeros(nk, z.shape[1], device=dev), torch.zeros(nk, device=dev)
+    K = epochs * -(-len(clients[0]) // bs)
+    prox = lambda v, t: ours_head.soft(v, t * lam) / (1.0 + t * lam * l2_ratio)  # noqa: E731
+    best, best_acc, best_nnz = None, -1.0, None
+    for r in range(rounds):
+        dw, db = torch.zeros_like(zw), torch.zeros_like(zb)
+        for ci, ix in enumerate(clients):
+            lw, lb, step = zw.clone(), zb.clone(), 0
+            for _ in range(epochs):
+                perm = ix[torch.randperm(len(ix), generator=g).to(dev)]
+                for s in range(0, len(perm), bs):
+                    b_ix = perm[s:s + bs]
+                    w = prox(lw, eta_s * eta_c * (r * K + step + 1))
+                    zb_ = z[b_ix].float()
+                    P = torch.softmax(zb_ @ w.T + lb, 1)
+                    P[torch.arange(len(b_ix), device=dev), y[b_ix]] -= 1.0
+                    lw -= eta_c * (P.T @ zb_ / len(b_ix))
+                    lb -= eta_c * P.mean(0)
+                    step += 1
+            dw += wts[ci] * (lw - zw)
+            db += wts[ci] * (lb - zb)
+        zw += eta_s * dw
+        zb += eta_s * db
+        w_s = prox(zw, eta_s * eta_c * (r + 1) * K)
+        acc = core.accuracy(core.Head(w_s, zb, torch.arange(nk)), zv, yv)
+        nnz = int((w_s.abs() > 1e-5).sum())
+        if acc > best_acc or (acc == best_acc and best_nnz is not None and nnz < best_nnz):
+            best, best_acc, best_nnz = (w_s.clone(), zb.clone(), r + 1), acc, nnz
+    return best
+
+
+def parse_lams(items):
+    """['5:0.02', '20:0.005'] -> {5: 0.02, 20: 0.005}"""
+    return {int(k): float(v) for k, v in (i.split(":") for i in items)}
 
 
 @torch.no_grad()
@@ -186,7 +245,15 @@ def central_path(z, y, nk, targets, alpha=0.99, n_lambda=60, min_ratio=1e-3, ite
 def main():
     ap = run.build_parser()
     ap.add_argument("--runs", nargs="+", required=True, metavar="PARTITION=DIR")
-    ap.add_argument("--parts", nargs="+", choices=["dense", "prune", "oracle"], default=["dense", "prune", "oracle"])
+    ap.add_argument("--parts", nargs="+", choices=["dense", "prune", "oracle", "thresh", "fedmid", "elastic"],
+                    default=["dense", "prune", "oracle"])
+    ap.add_argument("--fedmid_lams", nargs="+", default=[], metavar="NEC:LAM",
+                    help="FedMiD lambda per NEC target (interpolated from the FEDMID runs), bracketed by --mults")
+    ap.add_argument("--elastic_lams", nargs="+", default=[], metavar="NEC:LAM",
+                    help="elastic-net FedDualAvg l1 lambda per NEC target (the head rule's), bracketed by --mults")
+    ap.add_argument("--mults", type=float, nargs="+", default=[0.6, 1.0, 1.6])
+    ap.add_argument("--elastic_l2_ratio", type=float, default=1.0, help="lambda_2 / lambda_1 (train_vlg --dual_l2_lam)")
+    ap.add_argument("--refit_rounds", type=int, default=100, help="own-support refit for every sparse row (head rule: 100)")
     ap.add_argument("--necs", type=int, nargs="+", default=[5, 10, 20])
     ap.add_argument("--prune_modes", nargs="+", choices=["perclass", "global"], default=["perclass", "global"])
     ap.add_argument("--prune_lrs", type=float, nargs="+", default=[1e-2, 3e-2, 1e-1],
@@ -214,8 +281,9 @@ def main():
     d = run.load_data(args, device)
     tr, va, te = d["tr"], d["va"], d["te"]
     nk = len(d["classes"])
-    out = {"dataset": args.dataset, "seed": args.seed, "method": "dense FedAvg / FedProx; FedAvg cut to NEC + masked fine-tune; centralized sparse oracle",
+    out = {"dataset": args.dataset, "seed": args.seed, "method": "dense FedAvg / FedProx; FedAvg cut to NEC + masked fine-tune; centralized sparse oracle; FedAvg + l1 threshold, FedMiD, elastic-net FedDualAvg (each + own-support refit)",
            "parts": args.parts, "necs": args.necs, "prune_lrs": args.prune_lrs, "fedprox_mu": args.fedprox_mu,
+           "mults": args.mults, "elastic_l2_ratio": args.elastic_l2_ratio, "refit_rounds": args.refit_rounds,
            "partitions": {}}
     for p, iid, alpha in run.arms(args):
         r = loaded[p]
@@ -277,6 +345,49 @@ def main():
                     print(f"[{p}] prune {mode} NEC {k}: fine-tuned {res['global_test']:.2f} @ {res['nec']:.2f} "
                           f"(lr {lr:g}, round {res['best_round']}; cut only {res['no_refit_global_test']:.2f}, "
                           f"empty classes {res['empty_classes']}, {res['seconds']:.0f}s)", flush=True)
+        def refit_own(W, b):
+            """The head rule's last step: refit on this head's own support (ours_head.refit, own_100)."""
+            return ours_head.refit(W, b, (W.abs() > 1e-5).float(), z, y, nk, clients, rounds=args.refit_rounds)
+
+        def nearest(cands, k):
+            """cands: [(lam, W, b, best_round)]; the run whose NEC is nearest k, then its refit."""
+            pts = [{"lam": lam, "nec": nec(W), "global_test": gacc(W, b), "best_round": br} for lam, W, b, br in cands]
+            i = min(range(len(pts)), key=lambda j: abs(pts[j]["nec"] - k))
+            Wr, br_ = refit_own(cands[i][1], cands[i][2])
+            return {"nec": pts[i]["nec"], "lam": pts[i]["lam"], "no_refit_global_test": pts[i]["global_test"],
+                    "global_test": gacc(Wr, br_), "bracket": pts}
+
+        if "thresh" in args.parts:
+            rec["thresh"] = {}
+            for k in args.necs:
+                th = time.time()
+                W, b, info = fedavg_dense(z, y, zv, yv, nk, clients, budget=k)
+                Wr, br = refit_own(W, b)
+                rec["thresh"][str(k)] = res = {"nec": nec(W), "no_refit_global_test": gacc(W, b), "global_test": gacc(Wr, br),
+                                               "best_round": info["best_round"], "val": info["val"],
+                                               "seconds": round(time.time() - th, 1)}
+                print(f"[{p}] FedAvg + l1 threshold NEC {k}: refit {res['global_test']:.2f} @ {res['nec']:.2f} (before "
+                      f"refit {res['no_refit_global_test']:.2f}, round {res['best_round']}, {res['seconds']:.0f}s)", flush=True)
+        for part, lams in (("fedmid", parse_lams(args.fedmid_lams)), ("elastic", parse_lams(args.elastic_lams))):
+            if part not in args.parts:
+                continue
+            rec[part] = {}
+            for k in args.necs:
+                th = time.time()
+                cands = []
+                for m in args.mults:
+                    lam = lams[k] * m
+                    if part == "fedmid":
+                        (W, b, br), _ = fm.fedmid(z, y, zv, yv, nk, lam, clients)
+                    else:
+                        W, b, br = feddualavg_en(z, y, zv, yv, nk, lam, args.elastic_l2_ratio, clients)
+                    cands.append((lam, W, b, br))
+                res = nearest(cands, k)
+                res["seconds"] = round(time.time() - th, 1)
+                rec[part][str(k)] = res
+                print(f"[{p}] {part} NEC~{k}: refit {res['global_test']:.2f} @ {res['nec']:.2f} (before refit "
+                      f"{res['no_refit_global_test']:.2f}, lam {res['lam']:.3g}; bracket NEC "
+                      f"{[round(q['nec'], 1) for q in res['bracket']]}, {res['seconds']:.0f}s)", flush=True)
         if "oracle" in args.parts:
             th = time.time()
             paths = central_path(z, y, nk, args.necs, n_lambda=args.oracle_lambdas)

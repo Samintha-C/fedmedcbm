@@ -51,6 +51,8 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py fedmid > baselines/fedcbm_reimpl/naut/fedmid.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-dense > baselines/fedcbm_reimpl/naut/t3-dense.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-oracle > baselines/fedcbm_reimpl/naut/t3-oracle.yaml
+    (gen_jobs.py t3-thresh; gen_jobs.py t3-fedmid; gen_jobs.py t3-elastic) > baselines/fedcbm_reimpl/naut/t3-aggregators.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-dense-only  (filtered to the Jobs that had not run)
 """
 
 import math
@@ -197,14 +199,70 @@ VARIANTS["t3-dense"] = dict(VARIANTS["head-own"], job="t3-dense", out="T3_DENSE_
 VARIANTS["t3-oracle"] = dict(VARIANTS["t3-dense"], job="t3-oracle", out="T3_ORACLE", flags=_T3 + " --parts oracle",
                              flags_of={},
                              note="# Table 3: the sparse layer solved centrally on the pooled rows (oracle) + support refit.\n")
+# CUB has no NEC~5 lambda in gen_seed_main.LAMS; these are the CUB_NEC5 bracket's.
+CUB_NEC5_LAMS = {"iid": "0.020", "dirichlet": "0.019"}
+# Table 3 rows the user picked (2026-10-30): FedAvg + l1 threshold, FedMiD and elastic-net FedDualAvg,
+# each at NEC 5 / 10 / 20 (Places365 / ImageNet 5 and 20) and each refit on its own support for 100
+# rounds as the head rule is. Same runs, seeds and Dirichlet split as t3-dense; own output roots.
+#   thresh   FedAvg (Adam, as train_vlg fedavg_l1) with the server soft-threshold set every round to
+#            leave k*K nonzeros, so NEC is exactly k with one run per target.
+#   fedmid   lambda per target interpolated log-log from each dataset's FEDMID curve (models/FEDMID,
+#            base seed, Dirichlet; ImageNet / Places365 NEC 5 and 20 and C10 NEC 5 extrapolate past
+#            the sparsest run), bracketed by --mults, nearest NEC kept.
+#   elastic  FedDualAvg with train_vlg's elastic-net prox at l2 = l1 (--elastic_l2_ratio 1), lambda
+#            per target the head rule's (LAMS / lam_targets_mid), bracketed, nearest NEC kept. The l2 term
+#            keeps NEC above target at the head rule's lambda (local check, C10 NEC 5: 6.7 at x1, 6.2
+#            at x1.6), so its bracket reaches x2.5.
+FEDMID_LAMS = {"cifar10": {5: 0.449, 10: 0.249, 20: 0.138}, "cifar100": {5: 0.0841, 10: 0.0667, 20: 0.0529},
+               "cub": {5: 0.0948, 10: 0.0717, 20: 0.0514}, "places365": {5: 0.0566, 10: 0.0384, 20: 0.0261},
+               "imagenet": {5: 0.0628, 10: 0.0383, 20: 0.0233}}
+T3_LARGE = ("places365", "imagenet")
+
+
+def dir_lams(ds):
+    """The head rule's Dirichlet lambda per NEC target: tab:main's NEC~5 lambda and lam_targets_mid's
+    interpolation for 10 and 20."""
+    l5 = float(LAMS[ds]["dirichlet"][5] or CUB_NEC5_LAMS["dirichlet"])
+    l50 = float(LAMS[ds]["dirichlet"][50])
+    out = {5: l5}
+    for nec in (10, 20):
+        t = math.log(nec / 5) / math.log(10)
+        out[nec] = float(f"{l5 ** (1 - t) * l50 ** t:.3g}")
+    return out
+
+
+def _lam_flag(flag, table, ds):
+    necs = (5, 20) if ds in T3_LARGE else (5, 10, 20)
+    return f" --{flag} " + " ".join(f"{k}:{table[k]:g}" for k in necs)
+
+
+_T3_NECS_LARGE = " --necs 5 20"
+_T3_BASE = dict(VARIANTS["head-own"], mem_of={"cub": "2Gi"}, cpu_of={"cub": "4"}, script="dense_prune.py")
+VARIANTS["t3-thresh"] = dict(_T3_BASE, job="t3-thresh", out="T3_THRESH",
+                             flags="--runs $RUNS --partitions dirichlet --necs 5 10 20 --parts thresh",
+                             flags_of={ds: _T3_NECS_LARGE for ds in T3_LARGE},
+                             note="# Table 3: FedAvg + l1 threshold at the budget (exact NEC) + own-support refit.\n")
+VARIANTS["t3-fedmid"] = dict(_T3_BASE, job="t3-fedmid", out="T3_FEDMID",
+                             flags="--runs $RUNS --partitions dirichlet --necs 5 10 20 --parts fedmid",
+                             flags_of={ds: _lam_flag("fedmid_lams", FEDMID_LAMS[ds], ds)
+                                       + (_T3_NECS_LARGE if ds in T3_LARGE else "") for ds in FEDMID_LAMS},
+                             note="# Table 3: FedMiD at matched NEC (lambda bracket) + own-support refit.\n")
+VARIANTS["t3-elastic"] = dict(_T3_BASE, job="t3-elastic", out="T3_ELASTIC",
+                              flags="--runs $RUNS --partitions dirichlet --necs 5 10 20 --parts elastic --mults 0.6 1 1.6 2.5",
+                              flags_of={ds: _lam_flag("elastic_lams", dir_lams(ds), ds)
+                                        + (_T3_NECS_LARGE if ds in T3_LARGE else "") for ds in FEDMID_LAMS},
+                              note="# Table 3: elastic-net FedDualAvg (l2 = l1) at matched NEC + own-support refit.\n")
+# Dense rows only, for the large-dataset t3-dense Jobs that had not run (same names and output root):
+# cut + fine-tune left Table 3 (user, 2026-10-30).
+VARIANTS["t3-dense-only"] = dict(VARIANTS["t3-dense"], flags="--runs $RUNS --partitions dirichlet --parts dense",
+                                 flags_of={}, datasets=T3_LARGE,
+                                 note="# Table 3: dense FedAvg / FedProx heads only.\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
 # (cpu, memory, /dev/shm); Places365 and ImageNet get one Job per seed.
 SIZED = {"cifar10": ("8", "4Gi", "1Gi"), "cifar100": ("8", "4Gi", "1Gi"), "cub": ("8", "3Gi", "1Gi"),
          "places365": ("2", "48Gi", "4Gi"), "imagenet": ("2", "20Gi", "4Gi")}
-# CUB has no NEC~5 lambda in gen_seed_main.LAMS; these are the CUB_NEC5 bracket's.
-CUB_NEC5_LAMS = {"iid": "0.020", "dirichlet": "0.019"}
 
 
 def lam_targets(ds):
@@ -481,7 +539,7 @@ def main():
                       run_dirs(ds, posaware=variant == "head-posaware")
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-nec1020",
                                      "local", "local-indep", "local-indep-large", "fedmid", "t3-dense",
-                                     "t3-oracle") else ""),
+                                     "t3-oracle", "t3-thresh", "t3-fedmid", "t3-elastic", "t3-dense-only") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
