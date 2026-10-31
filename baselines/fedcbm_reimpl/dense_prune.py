@@ -29,6 +29,12 @@ Then, on those features:
              --mults), the run with the NEC nearest each target kept.
   elastic    FedDualAvg with train_vlg.py's elastic-net prox (l2 = --elastic_l2_ratio x l1), bracketed
              around the head rule's lambda, nearest NEC kept.
+  central    the head rule itself (ours_head.feddualavg, then ours_head.refit 100 rounds on its own
+             support) with every training row held by one client: our optimizer without federation,
+             the centralized reference for Table 3 (central_path's FISTA does not converge on Places365 /
+             ImageNet). With one client FedDualAvg's threshold no longer scales by client 0's step count
+             over the federation's size-weighted mean (n_0 / (sum n_m^2 / N), from the run's split), so
+             the head rule's lambda is multiplied by that ratio and bracketed by --central_mults.
   thresh, fedmid and elastic are each refit on their own support as the head rule is (ours_head.refit,
   --refit_rounds 100); the head before the refit is recorded too.
 Scored on the global test set. The head rule at the same NEC is OURS_HEAD_OWN / OURS_HEAD_NEC1020
@@ -245,13 +251,18 @@ def central_path(z, y, nk, targets, alpha=0.99, n_lambda=60, min_ratio=1e-3, ite
 def main():
     ap = run.build_parser()
     ap.add_argument("--runs", nargs="+", required=True, metavar="PARTITION=DIR")
-    ap.add_argument("--parts", nargs="+", choices=["dense", "prune", "oracle", "thresh", "fedmid", "elastic"],
+    ap.add_argument("--parts", nargs="+", choices=["dense", "prune", "oracle", "thresh", "fedmid", "elastic", "central"],
                     default=["dense", "prune", "oracle"])
     ap.add_argument("--fedmid_lams", nargs="+", default=[], metavar="NEC:LAM",
                     help="FedMiD lambda per NEC target (interpolated from the FEDMID runs), bracketed by --mults")
     ap.add_argument("--elastic_lams", nargs="+", default=[], metavar="NEC:LAM",
                     help="elastic-net FedDualAvg l1 lambda per NEC target (the head rule's), bracketed by --mults")
+    ap.add_argument("--central_lams", nargs="+", default=[], metavar="NEC:LAM",
+                    help="the head rule's lambda per NEC target; scaled to one client, bracketed by --mults")
     ap.add_argument("--mults", type=float, nargs="+", default=[0.6, 1.0, 1.6])
+    ap.add_argument("--central_mults", type=float, nargs="+", default=[0.3, 0.45, 0.65, 1.0],
+                    help="bracket for central; one client lands at a lower NEC than the step ratio predicts "
+                         "(local check, C100 s31: x0.6 already gives NEC 6.6 for target 10)")
     ap.add_argument("--elastic_l2_ratio", type=float, default=1.0, help="lambda_2 / lambda_1 (train_vlg --dual_l2_lam)")
     ap.add_argument("--refit_rounds", type=int, default=100, help="own-support refit for every sparse row (head rule: 100)")
     ap.add_argument("--necs", type=int, nargs="+", default=[5, 10, 20])
@@ -388,6 +399,28 @@ def main():
                 print(f"[{p}] {part} NEC~{k}: refit {res['global_test']:.2f} @ {res['nec']:.2f} (before refit "
                       f"{res['no_refit_global_test']:.2f}, lam {res['lam']:.3g}; bracket NEC "
                       f"{[round(q['nec'], 1) for q in res['bracket']]}, {res['seconds']:.0f}s)", flush=True)
+        if "central" in args.parts:
+            sizes = torch.tensor([float(len(c)) for c in clients])
+            ratio = float(sizes[0] / ((sizes ** 2).sum() / sizes.sum()))
+            pooled = [torch.arange(held.numel(), device=device)]
+            rec["central"] = {"lam_ratio": ratio}
+            for k, lam0 in parse_lams(args.central_lams).items():
+                th = time.time()
+                cands = []
+                for m in args.central_mults:
+                    lam = lam0 * ratio * m
+                    W, b, _ = ours_head.feddualavg(z, y, zv, yv, nk, lam, pooled)
+                    cands.append((lam, W, b, None))
+                pts = [{"lam": lam, "nec": nec(W), "global_test": gacc(W, b)} for lam, W, b, _ in cands]
+                i = min(range(len(pts)), key=lambda j: abs(pts[j]["nec"] - k))
+                W, b = cands[i][1], cands[i][2]
+                Wr, br = ours_head.refit(W, b, (W.abs() > 1e-5).float(), z, y, nk, pooled, rounds=args.refit_rounds)
+                res = {"nec": pts[i]["nec"], "lam": pts[i]["lam"], "no_refit_global_test": pts[i]["global_test"],
+                       "global_test": gacc(Wr, br), "bracket": pts, "seconds": round(time.time() - th, 1)}
+                rec["central"][str(k)] = res
+                print(f"[{p}] central head rule NEC~{k}: refit {res['global_test']:.2f} @ {res['nec']:.2f} (before "
+                      f"refit {res['no_refit_global_test']:.2f}, lam {res['lam']:.3g} = x{ratio:.2f} x bracket; bracket "
+                      f"NEC {[round(q['nec'], 1) for q in pts]}, {res['seconds']:.0f}s)", flush=True)
         if "oracle" in args.parts:
             th = time.time()
             paths = central_path(z, y, nk, args.necs, n_lambda=args.oracle_lambdas)

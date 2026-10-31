@@ -53,6 +53,7 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-oracle > baselines/fedcbm_reimpl/naut/t3-oracle.yaml
     (gen_jobs.py t3-thresh; gen_jobs.py t3-fedmid; gen_jobs.py t3-elastic) > baselines/fedcbm_reimpl/naut/t3-aggregators.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-dense-only  (filtered to the Jobs that had not run)
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-central > baselines/fedcbm_reimpl/naut/t3-central.yaml
 """
 
 import math
@@ -107,6 +108,13 @@ VARIANTS = {
                      flags="--runs $RUNS --lam_mults 1.0 --refit_rounds 100 --supports own",
                      note="# Ours, the head rule: FedDualAvg -> refit on its own support, 100 rounds, + logit adjustment.\n"),
 }
+# head-own again with the weights saved (Fig. 3 steering / intervention; OURS_HEAD_OWN has metrics only).
+# Dirichlet only, no CUB (dropped from the interpretability evaluations). Each metrics.json should
+# reproduce OURS_HEAD_OWN's: FedDualAvg seeds its own generator per call, so skipping IID leaves it alone.
+VARIANTS["head-saved"] = dict(VARIANTS["head-own"], job="ours-head-saved", out="OURS_HEAD_SAVED",
+                              datasets=("cifar10", "cifar100", "places365", "imagenet"),
+                              flags=VARIANTS["head-own"]["flags"] + " --partitions dirichlet --save_heads",
+                              note="# Ours, the head rule, weights saved to heads.pt (Dirichlet, NEC~5 and ~50).\n")
 # nec, with each sparse head also refit on its own support without the penalty: the L1 path
 # alone collapses at low NEC (ImageNet NEC5 13%). 1000 steps = our refit's 100 rounds x 10 local.
 VARIANTS["nec-refit"] = dict(VARIANTS["nec"], job="fedcbm-nec-refit", out="FEDCBM_BALANCED_NEC_REFIT", sized=True,
@@ -252,6 +260,14 @@ VARIANTS["t3-elastic"] = dict(_T3_BASE, job="t3-elastic", out="T3_ELASTIC",
                               flags_of={ds: _lam_flag("elastic_lams", dir_lams(ds), ds)
                                         + (_T3_NECS_LARGE if ds in T3_LARGE else "") for ds in FEDMID_LAMS},
                               note="# Table 3: elastic-net FedDualAvg (l2 = l1) at matched NEC + own-support refit.\n")
+# Table 3's centralized reference (user, 2026-10-30): the head rule with every training row on one
+# client (dense_prune.py --parts central), replacing T3_ORACLE, whose FISTA path does not converge on
+# Places365 / ImageNet. Lambda = the head rule's, scaled to one client inside the script, bracketed.
+VARIANTS["t3-central"] = dict(_T3_BASE, job="t3-central", out="T3_CENTRAL",
+                              flags="--runs $RUNS --partitions dirichlet --necs 5 10 20 --parts central",
+                              flags_of={ds: _lam_flag("central_lams", dir_lams(ds), ds)
+                                        + (_T3_NECS_LARGE if ds in T3_LARGE else "") for ds in FEDMID_LAMS},
+                              note="# Table 3: the head rule on one client holding every row (centralized reference).\n")
 # Dense rows only, for the large-dataset t3-dense Jobs that had not run (same names and output root):
 # cut + fine-tune left Table 3 (user, 2026-10-30).
 VARIANTS["t3-dense-only"] = dict(VARIANTS["t3-dense"], flags="--runs $RUNS --partitions dirichlet --parts dense",
@@ -497,6 +513,9 @@ spec:
                     operator: NotIn
                     values:
                       - nautilus-ext-gpu01.fullerton.edu  # "GPU is lost" admission errors, 2026-10-15
+                      - cph-dgx-node2.humboldt.edu  # could not resolve github.com, 2026-10-30
+                      - cph-dgx-node4.humboldt.edu  # same, 2026-10-29 (joint-g099)
+                      - cph-dgx-node9.humboldt.edu  # same, 2026-10-29 (joint-g099)
       restartPolicy: Never
 """
 
@@ -537,9 +556,10 @@ def main():
                 + v.get("flags_of", {}).get(ds, ""), script=v.get("script", "run.py"),
                 runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
-                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-nec1020",
-                                     "local", "local-indep", "local-indep-large", "fedmid", "t3-dense",
-                                     "t3-oracle", "t3-thresh", "t3-fedmid", "t3-elastic", "t3-dense-only") else ""),
+                      if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-saved",
+                                     "head-nec1020", "local", "local-indep", "local-indep-large", "fedmid", "t3-dense",
+                                     "t3-oracle", "t3-thresh", "t3-fedmid", "t3-elastic", "t3-dense-only",
+                                     "t3-central") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),

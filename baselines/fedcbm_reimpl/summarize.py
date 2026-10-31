@@ -26,8 +26,8 @@ def main(root):
             cells += [f"{mode} {k}: {r['global_test']:.2f}" for mode, by in rec.get("prune", {}).items()
                       for k, r in by.items()]
             cells += [f"oracle {k}: {r['global_test']:.2f}@{r['nec']:.1f}" for k, r in rec.get("oracle", {}).items()]
-            cells += [f"{part} {k}: {r['global_test']:.2f}@{r['nec']:.1f}" for part in ("thresh", "fedmid", "elastic")
-                      for k, r in rec.get(part, {}).items()]
+            cells += [f"{part} {k}: {r['global_test']:.2f}@{r['nec']:.1f}" for part in ("thresh", "fedmid", "elastic", "central")
+                      for k, r in rec.get(part, {}).items() if k != "lam_ratio"]
             print(f"s{m['seed']} {p}: " + " | ".join(cells))
     runs = [m for m in runs if m not in t3_runs]
     if not runs:
