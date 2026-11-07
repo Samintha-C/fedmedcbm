@@ -276,6 +276,9 @@ def main():
     ap.add_argument("--check_rows", type=int, default=4096)
     ap.add_argument("--check_tol", type=float, default=1e-2)
     ap.add_argument("--acc_tol", type=float, default=0.005)
+    ap.add_argument("--save_heads", action="store_true",
+                    help="also save the dense heads to heads.pt (concept-space steering compares them with the "
+                         "sparse heads, and metrics.json has only their accuracy)")
     args = ap.parse_args()
     runs = dict(s.split("=", 1) for s in args.runs)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -296,6 +299,7 @@ def main():
            "parts": args.parts, "necs": args.necs, "prune_lrs": args.prune_lrs, "fedprox_mu": args.fedprox_mu,
            "mults": args.mults, "elastic_l2_ratio": args.elastic_l2_ratio, "refit_rounds": args.refit_rounds,
            "partitions": {}}
+    saved = {}  # {partition: {"fedavg" or "fedprox": (W, b)}}
     for p, iid, alpha in run.arms(args):
         r = loaded[p]
         ci = run.split_dataset_for_federated(d["train_ds"], args.num_clients, iid=iid, alpha=alpha, seed=args.seed)
@@ -326,6 +330,7 @@ def main():
             th = time.time()
             W, b, info = fedavg_dense(z, y, zv, yv, nk, clients, mu=mu)
             dense[name] = (W, b)
+            saved.setdefault(p, {})[name] = (W.cpu(), b.cpu())
             info.update(global_test=gacc(W, b), nec=nec(W), seconds=round(time.time() - th, 1))
             del info["val_by_round"]
             rec[name] = info
@@ -437,6 +442,8 @@ def main():
     out["total_seconds"] = round(time.time() - t0, 1)
     with open(os.path.join(save_dir, "metrics.json"), "w") as f:
         json.dump(out, f, indent=2)
+    if args.save_heads:
+        torch.save(saved, os.path.join(save_dir, "heads.pt"))
     print(f"[done] {save_dir}")
 
 

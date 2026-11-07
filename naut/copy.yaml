@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sc-rwx-copy-pod
+  namespace: wenglab-interpretable-ai
+spec:
+  containers:
+    - name: main
+      image: ubuntu:22.04
+      args: ["sleep", "21600"]
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "100m"
+          memory: "256Mi"
+      volumeMounts:
+        - name: sc-rwx-vol
+          mountPath: /sc-rwx-vol
+  volumes:
+    - name: sc-rwx-vol
+      persistentVolumeClaim:
+        claimName: sc-rwx-vol
+  restartPolicy: Never

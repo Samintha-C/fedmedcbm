@@ -54,6 +54,7 @@ Usage:
     (gen_jobs.py t3-thresh; gen_jobs.py t3-fedmid; gen_jobs.py t3-elastic) > baselines/fedcbm_reimpl/naut/t3-aggregators.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-dense-only  (filtered to the Jobs that had not run)
     python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-central > baselines/fedcbm_reimpl/naut/t3-central.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py t3-central-in > baselines/fedcbm_reimpl/naut/t3-central-in.yaml
 """
 
 import math
@@ -268,11 +269,25 @@ VARIANTS["t3-central"] = dict(_T3_BASE, job="t3-central", out="T3_CENTRAL",
                               flags_of={ds: _lam_flag("central_lams", dir_lams(ds), ds)
                                         + (_T3_NECS_LARGE if ds in T3_LARGE else "") for ds in FEDMID_LAMS},
                               note="# Table 3: the head rule on one client holding every row (centralized reference).\n")
+# t3-central's ImageNet bracket stopped short of the targets (mean NEC 8.4 and 42.1 at its largest lambda),
+# so ImageNet reruns higher up, centred from that run's NEC-lambda slope. New output root: the T3_CENTRAL
+# ImageNet runs stay on the volume, and this root replaces them in the table.
+VARIANTS["t3-central-in"] = dict(VARIANTS["t3-central"], job="t3-central-in", out="T3_CENTRAL_IN",
+                                 flags_of={"imagenet": " --central_lams 5:0.00075 20:0.00033"
+                                           " --central_mults 0.8 1.0 1.25 1.6" + _T3_NECS_LARGE},
+                                 datasets=("imagenet",),
+                                 note="# Table 3: centralized reference, ImageNet, with a bracket that reaches NEC 5 and 20.\n")
 # Dense rows only, for the large-dataset t3-dense Jobs that had not run (same names and output root):
 # cut + fine-tune left Table 3 (user, 2026-10-30).
 VARIANTS["t3-dense-only"] = dict(VARIANTS["t3-dense"], flags="--runs $RUNS --partitions dirichlet --parts dense",
                                  flags_of={}, datasets=T3_LARGE,
                                  note="# Table 3: dense FedAvg / FedProx heads only.\n")
+# The same dense heads with their weights saved, for concept-space steering (sparse vs dense heads on
+# one concept layer). Own output root, all four steering datasets.
+VARIANTS["t3-dense-saved"] = dict(VARIANTS["t3-dense-only"], job="t3-dense-saved", out="T3_DENSE_SAVED",
+                                  flags="--runs $RUNS --partitions dirichlet --parts dense --save_heads",
+                                  datasets=("cifar10", "cifar100", "places365", "imagenet"),
+                                  note="# Table 3's dense FedAvg / FedProx heads, weights saved to heads.pt (steering).\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -559,7 +574,7 @@ def main():
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-saved",
                                      "head-nec1020", "local", "local-indep", "local-indep-large", "fedmid", "t3-dense",
                                      "t3-oracle", "t3-thresh", "t3-fedmid", "t3-elastic", "t3-dense-only",
-                                     "t3-central") else ""),
+                                     "t3-central", "t3-central-in", "t3-dense-saved") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
