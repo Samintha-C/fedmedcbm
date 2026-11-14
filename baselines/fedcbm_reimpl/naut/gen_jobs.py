@@ -43,6 +43,7 @@ Usage:
     python baselines/fedcbm_reimpl/naut/gen_jobs.py head-nec1020 > baselines/fedcbm_reimpl/naut/ours-head-nec1020.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-refit > baselines/fedcbm_reimpl/naut/fedcbm-nec-refit.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py head-alpha > baselines/fedcbm_reimpl/naut/ours-head-alpha.yaml
+    python baselines/fedcbm_reimpl/naut/gen_jobs.py head-alpha-large > baselines/fedcbm_reimpl/naut/ours-head-alpha-large.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py nec-alpha > baselines/fedcbm_reimpl/naut/fedcbm-nec-alpha.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local > baselines/fedcbm_reimpl/naut/local-cbm.yaml
     python baselines/fedcbm_reimpl/naut/gen_jobs.py local-indep > baselines/fedcbm_reimpl/naut/local-cbm-indep.yaml
@@ -135,6 +136,16 @@ VARIANTS["head-alpha"] = dict(job="ours-head-alpha", out="OURS_HEAD_ALPHA", refc
                               datasets=("cifar10", "cifar100", "cub"),
                               flags="--runs $RUNS --supports own --refit_rounds 100" + _ALPHA_FLAGS,
                               note="# Ours (head rule) per client across Dirichlet alpha, on the alpha-sweep runs.\n")
+# head-alpha for Places365 / ImageNet (2026-11-14), so fig:dirichlet can show all five datasets on the head
+# rule. One GPU Job per arm: all five arms in one Job would take ~1.5 days on ImageNet (OURS_HEAD_OWN took
+# ~77 min per FedDualAvg fit there, 6 fits per arm) and save nothing until the end. The output path gains
+# the arm: OURS_HEAD_ALPHA/<ds>/s42/<arm>/<run>/metrics.json. The default 0.6 / 1 / 1.6 bracket is kept:
+# at one fixed lambda these runs' NEC moves little with alpha (Places365 3.3-4.1, ImageNet 5.6-6.8).
+ALPHA_ARMS = ["iid"] + [f"a{a:g}" for a in ALPHAS]
+VARIANTS["head-alpha-large"] = dict(VARIANTS["head-alpha"], datasets=("places365", "imagenet"), arms=ALPHA_ARMS,
+                                    flags="--runs $RUNS --supports own --refit_rounds 100",
+                                    note="# Ours (head rule) per client across Dirichlet alpha, Places365 / ImageNet, "
+                                         "one Job per arm.\n")
 VARIANTS["nec-alpha"] = dict(VARIANTS["nec-refit"], job="fedcbm-nec-alpha", out="FEDCBM_BALANCED_NEC_ALPHA",
                              seed_of=ALPHA_SWEEP_SEED, datasets=("cifar10", "cifar100", "cub"),
                              flags=VARIANTS["nec-refit"]["flags"] + _ALPHA_FLAGS,
@@ -282,12 +293,6 @@ VARIANTS["t3-central-in"] = dict(VARIANTS["t3-central"], job="t3-central-in", ou
 VARIANTS["t3-dense-only"] = dict(VARIANTS["t3-dense"], flags="--runs $RUNS --partitions dirichlet --parts dense",
                                  flags_of={}, datasets=T3_LARGE,
                                  note="# Table 3: dense FedAvg / FedProx heads only.\n")
-# The same dense heads with their weights saved, for concept-space steering (sparse vs dense heads on
-# one concept layer). Own output root, all four steering datasets.
-VARIANTS["t3-dense-saved"] = dict(VARIANTS["t3-dense-only"], job="t3-dense-saved", out="T3_DENSE_SAVED",
-                                  flags="--runs $RUNS --partitions dirichlet --parts dense --save_heads",
-                                  datasets=("cifar10", "cifar100", "places365", "imagenet"),
-                                  note="# Table 3's dense FedAvg / FedProx heads, weights saved to heads.pt (steering).\n")
 # Requests for sized=True variants, from measured use of the same scripts (NRP Prometheus,
 # 2026-10-14/15): CPU pods used 4-7 of 8 cores and <= 1.5 GiB; GPU pods ~1 core, 94-100% GPU,
 # peak RAM 12 GiB (ImageNet), 13-42 GiB (Places365). NRP: CPU 20-200%, RAM 20-150% of request.
@@ -376,9 +381,13 @@ def run_dirs(ds, posaware=False):
     return "\n                ".join(lines)
 
 
-def alpha_run_dirs(ds):
-    """$RUNS for the alpha-sweep runs (ALPHA_SWEEP_SEED): iid=... a0.05=... (keys as run.arms names them)."""
+def alpha_run_dirs(ds, arm=None):
+    """$RUNS for the alpha-sweep runs (ALPHA_SWEEP_SEED): iid=... a0.05=... (keys as run.arms names them).
+    arm: only that arm's run."""
     runs = [f"iid={MODELS}/{ds}/alphasweep/iid"] + [f"a{a:g}={MODELS}/{ds}/alphasweep/a{a}" for a in ALPHAS]
+    if arm is not None:
+        runs = [r for r in runs if r.startswith(f"{arm}=")]
+        assert len(runs) == 1, (ds, arm)
     return f'\n                RUNS="{" ".join(runs)}"'
 
 
@@ -563,28 +572,36 @@ def main():
         mem = v.get("mem_of", {}).get(ds, mem)
         cpu = v.get("cpu_of", {}).get(ds, cpu)
         groups =[[s] for s in seeds] if (v.get("sized") and not cpu_only) or v.get("per_seed") else [seeds]
-        for grp in groups:
+        for grp, arm in [(g, a) for g in groups for a in v.get("arms", [None])]:
+            # arm: one partition per Job. The later --partitions / --alphas override the template's.
+            arm_flags = ("" if arm is None else " --partitions iid" if arm == "iid"
+                         else f" --partitions dirichlet --alphas {arm[1:]}")
             job = JOB.format(
                 ds=ds, job=v["job"], out=v["out"],
-                flags=v["flags"] + (lam_targets_mid(ds) if variant == "head-nec1020" else
+                flags=v["flags"] + arm_flags + (lam_targets_mid(ds) if variant == "head-nec1020" else
                                     lam_targets(ds) if variant.startswith("head") or variant == "fedmid" else "")
                 + v.get("flags_of", {}).get(ds, ""), script=v.get("script", "run.py"),
-                runs=(alpha_run_dirs(ds) if v.get("alpha_runs") else
+                runs=(alpha_run_dirs(ds, arm) if v.get("alpha_runs") else
                       run_dirs(ds, posaware=variant == "head-posaware")
                       if variant in ("personal", "head", "head-posaware", "head-diag", "head-own", "head-saved",
                                      "head-nec1020", "local", "local-indep", "local-indep-large", "fedmid", "t3-dense",
                                      "t3-oracle", "t3-thresh", "t3-fedmid", "t3-elastic", "t3-dense-only",
-                                     "t3-central", "t3-central-in", "t3-dense-saved") else ""),
+                                     "t3-central", "t3-central-in") else ""),
                 cifar_in=cifar_in, cifar_out=cifar_out,
                 lfc=LFC_COMMIT, fcm=FCM_COMMIT, concepts=cfg["concepts"], bb=cfg["bb"],
                 val_split=pick("val_split", cfg["args"]), workers=pick("num_workers", cfg["args"]),
                 data=cfg["data"] or ": # no dataset setup needed", check=cfg["check"],
                 seeds=" ".join(map(str, grp)), nseeds=len(grp), refcheck=refcheck,
                 cpu=cpu, mem=mem, dshm=dshm)
-            if len(groups) > 1:  # one Job per seed
+            if len(groups) > 1 or arm:  # one Job per seed and/or arm
                 old = f"  name: {v['job']}-{ds}\n"
                 assert job.count(old) == 1
-                job = job.replace(old, f"  name: {v['job']}-{ds}-s{grp[0]}\n")
+                suffix = (f"-s{grp[0]}" if len(groups) > 1 else "") + (f"-{arm.replace('.', 'p')}" if arm else "")
+                job = job.replace(old, f"  name: {v['job']}-{ds}{suffix}\n")
+            if arm:  # each arm resumes on its own output directory
+                old = "                D=$OUT/s$SEED\n"
+                assert job.count(old) == 1
+                job = job.replace(old, f"                D=$OUT/s$SEED/{arm}\n")
             if cpu_only:
                 job = to_cpu(job, int(cpu))
             elif v.get("sized"):
